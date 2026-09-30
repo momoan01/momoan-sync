@@ -32,9 +32,10 @@ function makeProvider(
 	getSecretImpl: (key: string) => string | null,
 ) {
 	const getSecret = vi.fn(getSecretImpl);
+	const setSecret = vi.fn<(key: string, value: string) => void>();
 	const secretStore: ISecretStore = {
 		getSecret,
-		setSecret: vi.fn(),
+		setSecret,
 	};
 	const deps: BackendModuleProviderDeps = {
 		getSettings: () => settings,
@@ -47,7 +48,7 @@ function makeProvider(
 		sink: vi.fn(),
 	};
 	const module = moduleId === "googledrive" ? googleDriveModule : dropboxModule;
-	return { provider: new BackendModuleProvider(module, deps), getSecret };
+	return { provider: new BackendModuleProvider(module, deps), getSecret, setSecret };
 }
 
 describe("BackendModuleProvider — identity and target", () => {
@@ -70,7 +71,7 @@ describe("BackendModuleProvider — custom OAuth routing", () => {
 		const { provider, getSecret } = makeProvider(
 			"googledrive",
 			settings,
-			(key) => (key === "momoan-sync-googledrive-clientSecret" ? "CS" : null),
+			(key) => (key === "momoan-sync-googledrive-client-secret" ? "CS" : null),
 		);
 
 		await provider.prepare();
@@ -78,7 +79,7 @@ describe("BackendModuleProvider — custom OAuth routing", () => {
 		// The REFERENCE NAME is the physical key; the plugin never fabricates a
 		// `-token` key for a `secret_reference` field.
 		expect(getSecret).not.toHaveBeenCalledWith("CID");
-		expect(getSecret).toHaveBeenCalledWith("momoan-sync-googledrive-clientSecret");
+		expect(getSecret).toHaveBeenCalledWith("momoan-sync-googledrive-client-secret");
 		expect(getSecret).not.toHaveBeenCalledWith("air-sync-googledrive-customClientId-token");
 	});
 
@@ -107,7 +108,7 @@ describe("BackendModuleProvider — Google BYO credential preflight", () => {
 		expect(provider.unresolvedSecretReferences(["clientId", "customClientId", "customClientSecret"])).toEqual([]);
 		await provider.prepare();
 		expect(getSecret).not.toHaveBeenCalledWith("PUBLIC-CID");
-		expect(getSecret).toHaveBeenCalledWith("momoan-sync-googledrive-clientSecret");
+		expect(getSecret).toHaveBeenCalledWith("momoan-sync-googledrive-client-secret");
 	});
 
 	it("reports missing module-owned client secret independently of config", () => {
@@ -121,7 +122,7 @@ describe("BackendModuleProvider — Google BYO credential preflight", () => {
 		for (const authMode of [false, true]) {
 			const settings = settingsWith({ authMode, clientId: "CID" });
 			const { provider, getSecret } = makeProvider("googledrive", settings, (key) =>
-				key === "momoan-sync-googledrive-clientSecret" ? "SECRET" : null,
+				key === "momoan-sync-googledrive-client-secret" ? "SECRET" : null,
 			);
 			expect(provider.hasSettingsSecret("clientSecret")).toBe(true);
 			expect(getSecret).not.toHaveBeenCalledWith("air-sync-googledrive-clientSecret-token");
@@ -498,5 +499,35 @@ describe("BackendModuleProvider — a disposed connection is rebuilt for auth", 
 		} finally {
 			vi.unstubAllGlobals();
 		}
+	});
+});
+
+
+describe("Momoan Google SecretStorage physical IDs", () => {
+	it("writes valid module-owned IDs without persisting secret values in config", async () => {
+		const settings = settingsWith({ clientId: "PUBLIC-CID", redirectUri: "https://example.test/callback" });
+		const before = JSON.stringify(settings.backendData);
+		const stored = new Map<string, string>();
+		const { provider, getSecret, setSecret } = makeProvider("googledrive", settings, (id) => stored.get(id) ?? null);
+		const expected = {
+			clientSecret: "momoan-sync-googledrive-client-secret",
+			pendingCodeVerifier: "momoan-sync-googledrive-pending-code-verifier",
+			refresh: "momoan-sync-googledrive-refresh",
+			access: "momoan-sync-googledrive-access",
+		};
+		setSecret.mockImplementation((id, value) => {
+			if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) throw new Error("Invalid Obsidian SecretStorage ID");
+			stored.set(id, value);
+		});
+		for (const [logicalKey, physicalId] of Object.entries(expected)) {
+			const value = "device-only-" + logicalKey;
+			await provider.setSettingsSecret(logicalKey, value);
+			expect(setSecret).toHaveBeenCalledWith(physicalId, value);
+			expect(physicalId).toMatch(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
+			provider.hasSettingsSecret(logicalKey);
+			expect(getSecret).toHaveBeenCalledWith(physicalId);
+			expect(JSON.stringify(settings.backendData)).not.toContain(value);
+		}
+		expect(JSON.stringify(settings.backendData)).toBe(before);
 	});
 });

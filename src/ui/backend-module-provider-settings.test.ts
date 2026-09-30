@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { __ui } from "../__mocks__/obsidian";
+import { __ui, SecretComponent } from "../__mocks__/obsidian";
 import { BackendModuleSettingsRenderer } from "./backend-module-provider-settings";
 import type { BackendModuleProvider } from "../fs/modules/backend-module-provider";
 import type { BackendConnectionActions } from "../fs/settings-renderer";
@@ -226,4 +226,28 @@ describe("BackendModuleSettingsRenderer — Google production flow", () => {
 		__ui.buttons.find((button) => button.label === "Choose folder")?.click();
 		expect(startFolderPick).toHaveBeenCalledOnce();
 	});
+});
+
+
+it("resolves the Client Secret component reference before writing a module secret", () => {
+	let onChange: ((reference: string) => unknown) | undefined;
+	const component = new SecretComponent({}, container());
+	const spy = vi.spyOn(SecretComponent.prototype, "onChange").mockImplementation((callback) => {
+		onChange = callback;
+		return component;
+	});
+	try {
+		const setSettingsSecret = vi.fn().mockResolvedValue(undefined);
+		const getSecret = vi.fn().mockReturnValue("DEVICE-CLIENT-SECRET");
+		const provider = { type: "googledrive", getModule: () => googleDriveModule,
+			hasCredentials: () => false, setSettingsSecret } as unknown as BackendModuleProvider;
+		const settings = mockSettings({ backendType: "googledrive", backendData: {} });
+		new BackendModuleSettingsRenderer(provider).render(container(), settings,
+			() => Promise.resolve(), actionsSpy().actions, { secretStorage: { getSecret } } as never);
+		onChange?.("user-oauth-secret-name");
+		expect(getSecret).toHaveBeenCalledWith("user-oauth-secret-name");
+		expect(setSettingsSecret).toHaveBeenCalledWith("clientSecret", "DEVICE-CLIENT-SECRET");
+		expect(JSON.stringify(settings.backendData)).not.toContain("DEVICE-CLIENT-SECRET");
+		expect(JSON.stringify(settings.backendData)).not.toContain("user-oauth-secret-name");
+	} finally { spy.mockRestore(); }
 });

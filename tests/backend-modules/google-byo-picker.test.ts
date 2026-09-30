@@ -1,3 +1,4 @@
+import { resolveGoogleSecretId } from "../../src/fs/modules/google-secret-ids";
 function requireString(value: unknown): string {
 	if (typeof value !== "string") throw new Error("Expected string in authorization contract");
 	return value;
@@ -16,7 +17,7 @@ const CID = "byo-client.apps.googleusercontent.com";
 const CS = "device-client-secret";
 const TOKEN = { access_token: "DEVICE-ACCESS", refresh_token: "DEVICE-REFRESH", expires_in: 3600 };
 const FOLDER = { id: "folder-1", name: "Vault", mimeType: "application/vnd.google-apps.folder" };
-const physical = (id: string, key: string): string => "momoan-sync-" + id + "-" + key;
+const physical = (_id: string, key: string): string => resolveGoogleSecretId(key);
 
 function response(body: JsonValue): BackendHttpResponse {
 	const text = JSON.stringify(body);
@@ -31,7 +32,10 @@ function fixture(folder: JsonValue = FOLDER, failOpen = false) {
 	const sink = vi.fn();
 	const connection = createModuleConnection({
 		module: googleDriveModule, generation: 1, isCurrentGeneration: () => true,
-		secrets: { getSecret: (key) => secrets.get(key) ?? null, setSecret: (key, value) => { secrets.set(key, value); } },
+		secrets: { getSecret: (key) => secrets.get(key) ?? null, setSecret: (key, value) => {
+			if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(key)) throw new Error("Invalid Obsidian SecretStorage ID");
+			secrets.set(key, value);
+		} },
 		resolvePhysicalKey: physical, sink,
 		config: { read: () => config, write: (next) => { config = next; return Promise.resolve(); },
 			clear: () => { config = googleDriveModule.disconnectConfig!(config); return Promise.resolve(); } },

@@ -1,3 +1,4 @@
+import { resolveGoogleSecretId } from "./google-secret-ids";
 import { errorMessage, isJsonObject, toError } from "../../backend-api";
 import type {
 	BackendModule,
@@ -143,7 +144,7 @@ export class BackendModuleProvider implements IBackendProvider {
 		const legacy = createLegacyPhysicalKeyResolver(authMode);
 		const references = this.referenceFieldKeys();
 		return (moduleId, logicalKey) => {
-			if (moduleId === "googledrive") return "momoan-sync-" + moduleId + "-" + logicalKey;
+			if (moduleId === "googledrive") return resolveGoogleSecretId(logicalKey);
 			if (references.has(logicalKey)) {
 				const reference = this.configStore.read()[logicalKey];
 				return typeof reference === "string" ? reference : "";
