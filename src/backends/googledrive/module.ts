@@ -24,66 +24,36 @@ import { inspectGoogleDriveFolder, describeFetchedGoogleDriveFolderProblem } fro
 
 const SETTINGS: BackendSettingsDefinition = {
 	fields: [
-		{
-			key: "authMode",
-			label: "Use your own Google app (custom OAuth)",
-			type: "toggle",
-			defaultValue: false,
-		},
-		{ key: "remoteVaultFolderId", label: "Remote folder id", type: "text" },
-		{
-			key: "customClientId",
-			label: "Client ID secret name",
-			type: "secret_reference",
-			visibleWhen: { field: "authMode", equals: true },
-		},
-		{
-			key: "customClientSecret",
-			label: "Client secret secret name",
-			type: "secret_reference",
-			visibleWhen: { field: "authMode", equals: true },
-		},
-		{
-			key: "customScope",
-			label: "OAuth scope",
-			type: "text",
-			visibleWhen: { field: "authMode", equals: true },
-		},
-		{
-			key: "customRedirectUri",
-			label: "Redirect URI",
-			type: "text",
-			visibleWhen: { field: "authMode", equals: true },
-		},
+		{ key: "clientId", label: "Client ID", type: "text" },
+		{ key: "redirectUri", label: "Redirect URI", type: "text",
+			description: "Use the redirect URI registered for your own Google OAuth app." },
 	],
 };
 
 async function buildAuth(context: BackendRuntimeContext, config: Readonly<JsonObject>): Promise<IGoogleAuth> {
-	if (config.authMode === true) {
-		return new GoogleAuthDirect({
-			clientId: (await context.secrets.get("customClientId")) ?? "",
-			clientSecret: (await context.secrets.get("customClientSecret")) ?? "",
-			transport: createContextTransport(context.http),
-			scope: asString(config.customScope) || undefined,
-			redirectUri: asString(config.customRedirectUri) || undefined,
-			logger: context.logger,
-		});
-	}
-	return new GoogleAuth(createContextTransport(context.http), context.logger);
+	return new GoogleAuthDirect({
+		clientId: asString(config.clientId),
+		clientSecret: (await context.secrets.get("clientSecret")) ?? "",
+		transport: createContextTransport(context.http),
+		redirectUri: asString(config.redirectUri) || "obsidian://momoan-sync-auth",
+		logger: context.logger,
+	});
 }
 
 const auth: BackendAuth = {
 	credentialKeys: ["refresh", "access"],
 	start: async (context, config) => {
+		if (!asString(config.clientId) || !asString(config.redirectUri) || !(await context.secrets.get("clientSecret"))) {
+			throw new Error("Client ID, client secret and redirect URI are required.");
+		}
 		const google = await buildAuth(context, config);
 		const url = await google.getAuthorizationUrl();
 		await context.auth.openExternal(url);
 		const patch: JsonObject = {
-			authMode: config.authMode === true,
 			pendingAuthState: google.getAuthState() ?? "",
 		};
 		const verifier = google.getCodeVerifier();
-		if (verifier) patch.pendingCodeVerifier = verifier;
+		if (verifier) await context.secrets.set("pendingCodeVerifier", verifier);
 		return { set: patch };
 	},
 	complete: async (context, input, config) => {
@@ -91,24 +61,34 @@ const auth: BackendAuth = {
 		if (!google.getAuthState() && asString(config.pendingAuthState)) {
 			google.setAuthState(asString(config.pendingAuthState));
 		}
-		if (!google.getCodeVerifier() && asString(config.pendingCodeVerifier)) {
-			google.setCodeVerifier(asString(config.pendingCodeVerifier));
+		const verifier = await context.secrets.get("pendingCodeVerifier");
+		if (verifier) google.setCodeVerifier(verifier);
+		try {
+			await google.handleAuthCallback(parseAuthCallbackParams(input));
+		} finally {
+			await context.secrets.delete("pendingCodeVerifier");
 		}
-		await google.handleAuthCallback(parseAuthCallbackParams(input));
 		const tokens = google.getTokenState();
 		if (!tokens.refreshToken) {
 			throw new Error("The provider did not return a refresh token. Reconnect and consent again.");
 		}
 		await context.secrets.set("refresh", tokens.refreshToken);
 		await context.secrets.set("access", tokens.accessToken);
-		return { set: { accessTokenExpiry: tokens.accessTokenExpiry, pendingAuthState: "", pendingCodeVerifier: "" } };
+		return { set: { accessTokenExpiry: tokens.accessTokenExpiry, pendingAuthState: "" }, unset: ["pendingCodeVerifier"] };
 	},
 	revoke: async (context, config) => {
-		const refresh = await context.secrets.get("refresh");
-		if (!refresh) return;
-		const google = await buildAuth(context, config);
-		google.setTokens(refresh, (await context.secrets.get("access")) ?? "", 0);
-		await google.revokeToken();
+		try {
+			const refresh = await context.secrets.get("refresh");
+			if (refresh) {
+				const google = await buildAuth(context, config);
+				google.setTokens(refresh, (await context.secrets.get("access")) ?? "", 0);
+				await google.revokeToken();
+			}
+		} finally {
+			await context.secrets.delete("clientSecret");
+			await context.secrets.delete("pendingCodeVerifier");
+		}
+
 	},
 };
 
@@ -199,14 +179,10 @@ export const googleDriveModule: BackendModule = {
 	binding,
 	getTarget: resolveFolderTarget,
 	disconnectConfig: (config) => {
-		const bag: JsonObject = { authMode: config.authMode === true };
-		for (const key of ["customClientId", "customClientSecret", "customScope", "customRedirectUri"]) {
+		const bag: JsonObject = {};
+		for (const key of ["clientId", "redirectUri"]) {
 			const value = config[key];
-			if (typeof value === "string" && value !== "") bag[key] = value;
-		}
-		// Google custom has no Picker: a hand-typed folder id survives a reconnect.
-		if (config.authMode === true && typeof config.remoteVaultFolderId === "string") {
-			bag.remoteVaultFolderId = config.remoteVaultFolderId;
+			if (typeof value === "string") bag[key] = value;
 		}
 		return bag;
 	},

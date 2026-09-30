@@ -1,5 +1,5 @@
 import type { App } from "../platform/obsidian";
-import { Notice, Setting } from "../platform/obsidian";
+import { Notice, SecretComponent, Setting } from "../platform/obsidian";
 import type { AirSyncSettings } from "../settings";
 import { REMOTE_VAULT_ROOT } from "../backend-api";
 import type { JsonObject } from "../backend-api";
@@ -43,6 +43,18 @@ export class BackendModuleSettingsRenderer implements IBackendSettingsRenderer {
 		app: App,
 	): void {
 		const module = this.provider.getModule();
+
+		if (module.id === "googledrive") {
+			new Setting(containerEl).setName("Google connection setup").setDesc(
+				"Use your own Google app. Authorize each device separately. Credentials stay in the device key store.",
+			);
+			new Setting(containerEl).setName("Client secret").addComponent((controlEl) => {
+				new SecretComponent(app, controlEl).onChange((reference) => {
+					const value = reference ? app.secretStorage.getSecret(reference) : "";
+					void this.provider.setSettingsSecret("clientSecret", value ?? "");
+				});
+			});
+		}
 
 		if (module.settings && module.settings.fields.length > 0) {
 			// The settings tab owns the section heading ("{backend} connection"); this
@@ -138,6 +150,14 @@ export class BackendModuleSettingsRenderer implements IBackendSettingsRenderer {
 	): false | void {
 		const module = this.provider.getModule();
 		const config = settings.backendData as JsonObject;
+		if (module.id === "googledrive") {
+			if (!config.clientId || !config.redirectUri || !this.provider.hasSettingsSecret("clientSecret")) {
+				new Notice("Client ID, client secret and redirect address are required");
+				return false;
+			}
+			void actions.startAuth();
+			return;
+		}
 		if (config.authMode !== true) {
 			void actions.startAuth();
 			return;

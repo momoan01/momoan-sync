@@ -74,12 +74,17 @@ describe("backend module auth matrix", () => {
 		}
 	});
 
-	it("each module declares an authMode toggle defaulting to off", () => {
-		for (const moduleId of MANAGED_REMOTE_BACKEND_FAMILIES) {
+	it("retained OneDrive and Dropbox sources declare their legacy authMode toggle", () => {
+		for (const moduleId of ["onedrive", "dropbox"] as const) {
 			const field = REMOTE_BACKEND_MODULES[moduleId].settings?.fields.find((f) => f.key === "authMode");
 			expect(field, `${moduleId} declares authMode`).toBeDefined();
 			expect(field?.type).toBe("toggle");
 			expect(field?.defaultValue).toBe(false);
 		}
 	});
+});
+
+
+it("Google production settings expose only public BYO configuration", () => {
+	expect(REMOTE_BACKEND_MODULES.googledrive.settings?.fields.map((field) => field.key)).toEqual(["clientId", "redirectUri"]);
 });

@@ -460,8 +460,9 @@ export default defineConfig(
 		// `RemoteVaultDisplay.warning`.
 		// Re-pinned from 322 so prepare() validates the adapter's declared capabilities
 		// immediately after createAdapter, before the adapter reaches ManagedRemoteFs.
+		// Module-owned settings secrets stay at the existing connection boundary.
 		files: ["src/fs/modules/backend-module-provider.ts"],
-		rules: { "max-lines": ["error", { max: 328, skipBlankLines: true, skipComments: true }] },
+		rules: { "max-lines": ["error", { max: 340, skipBlankLines: true, skipComments: true }] },
 	},
 	{
 		// Re-pinned from 379 for `projectedIdentityKey`, the free function every rename

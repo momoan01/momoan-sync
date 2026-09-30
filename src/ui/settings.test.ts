@@ -34,6 +34,8 @@ describe("AirSyncSettingTab conflict strategy", () => {
 		tab.display();
 		const dropdown = __ui.dropdowns.find((item) => item.name === "Conflict strategy");
 
+		expect(plugin.settings.backendType).toBe("googledrive");
+		expect(__ui.dropdowns.some((item) => item.name === "Remote backend")).toBe(false);
 		expect(dropdown?.description).toContain("Prefer local applies only to conflicts");
 		expect(dropdown?.description).toContain("proven two-sided edits");
 		expect(dropdown?.description).toContain("preserves both versions");

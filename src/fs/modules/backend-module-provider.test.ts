@@ -60,25 +60,25 @@ describe("BackendModuleProvider — identity and target", () => {
 });
 
 describe("BackendModuleProvider — custom OAuth routing", () => {
-	it("Google custom resolves its client credentials as user-owned secret references", async () => {
+	it("Google reads its own secret namespace and public client ID", async () => {
 		const settings = settingsWith({
 			authMode: true,
 			remoteVaultFolderId: "FID",
-			customClientId: "my-client-secret",
-			customClientSecret: "my-client-secret-2",
+			clientId: "CID",
+			redirectUri: "https://example.test/callback",
 		});
 		const { provider, getSecret } = makeProvider(
 			"googledrive",
 			settings,
-			(key) => (key === "my-client-secret" ? "CID" : key === "my-client-secret-2" ? "CS" : null),
+			(key) => (key === "momoan-sync-googledrive-clientSecret" ? "CS" : null),
 		);
 
 		await provider.prepare();
 
 		// The REFERENCE NAME is the physical key; the plugin never fabricates a
 		// `-token` key for a `secret_reference` field.
-		expect(getSecret).toHaveBeenCalledWith("my-client-secret");
-		expect(getSecret).toHaveBeenCalledWith("my-client-secret-2");
+		expect(getSecret).not.toHaveBeenCalledWith("CID");
+		expect(getSecret).toHaveBeenCalledWith("momoan-sync-googledrive-clientSecret");
 		expect(getSecret).not.toHaveBeenCalledWith("air-sync-googledrive-customClientId-token");
 	});
 
@@ -100,54 +100,37 @@ describe("BackendModuleProvider — custom OAuth routing", () => {
 	});
 });
 
-describe("BackendModuleProvider — custom OAuth secret reference preflight", () => {
-	it("reports a non-empty reference whose secret is missing", () => {
-		const settings = settingsWith({
-			authMode: true,
-			customClientId: "missing-name",
-			customClientSecret: "my-client-secret-2",
-		});
-		const { provider } = makeProvider("googledrive", settings, (key) =>
-			key === "my-client-secret-2" ? "CS" : null,
-		);
-
-		expect(provider.unresolvedSecretReferences(["customClientId", "customClientSecret"])).toEqual([
-			"customClientId",
-		]);
+describe("BackendModuleProvider — Google BYO credential preflight", () => {
+	it("does not interpret the public client ID as a secret reference", async () => {
+		const settings = settingsWith({ clientId: "PUBLIC-CID", redirectUri: "https://example.test/callback", remoteVaultFolderId: "FID" });
+		const { provider, getSecret } = makeProvider("googledrive", settings, () => null);
+		expect(provider.unresolvedSecretReferences(["clientId", "customClientId", "customClientSecret"])).toEqual([]);
+		await provider.prepare();
+		expect(getSecret).not.toHaveBeenCalledWith("PUBLIC-CID");
+		expect(getSecret).toHaveBeenCalledWith("momoan-sync-googledrive-clientSecret");
 	});
 
-	it("reports no key when every declared reference resolves", () => {
-		const settings = settingsWith({
-			authMode: true,
-			customClientId: "my-client-secret",
-			customClientSecret: "my-client-secret-2",
-		});
-		const { provider } = makeProvider("googledrive", settings, (key) =>
-			key === "my-client-secret" ? "CID" : key === "my-client-secret-2" ? "CS" : null,
-		);
-
-		expect(
-			provider.unresolvedSecretReferences(["customClientId", "customClientSecret"]),
-		).toEqual([]);
+	it("reports missing module-owned client secret independently of config", () => {
+		const settings = settingsWith({ clientId: "CID", clientSecret: "not-a-secret-reference" });
+		const { provider, getSecret } = makeProvider("googledrive", settings, () => null);
+		expect(provider.hasSettingsSecret("clientSecret")).toBe(false);
+		expect(getSecret).not.toHaveBeenCalledWith("not-a-secret-reference");
 	});
 
-	it("leaves an empty reference to the required-value check and ignores non-reference keys", () => {
-		const settings = settingsWith({
-			authMode: true,
-			customClientId: "",
-			customClientSecret: "my-client-secret-2",
-		});
-		const { provider } = makeProvider("googledrive", settings, () => null);
-
-		expect(
-			provider.unresolvedSecretReferences(["customClientId", "customClientSecret", "not-a-reference"]),
-		).toEqual(["customClientSecret"]);
+	it("reads the client secret from the Momoan namespace for every legacy authMode", () => {
+		for (const authMode of [false, true]) {
+			const settings = settingsWith({ authMode, clientId: "CID" });
+			const { provider, getSecret } = makeProvider("googledrive", settings, (key) =>
+				key === "momoan-sync-googledrive-clientSecret" ? "SECRET" : null,
+			);
+			expect(provider.hasSettingsSecret("clientSecret")).toBe(true);
+			expect(getSecret).not.toHaveBeenCalledWith("air-sync-googledrive-clientSecret-token");
+		}
 	});
 
 	it("treats a Dropbox app key as a public value, never a secret reference", () => {
 		const settings = settingsWith({ authMode: true, customClientId: "PUBLIC-APP-KEY" });
 		const { provider } = makeProvider("dropbox", settings, () => null);
-
 		expect(provider.unresolvedSecretReferences(["customClientId"])).toEqual([]);
 	});
 });
@@ -302,39 +285,17 @@ describe("BackendModuleProvider — module-owned disconnect config", () => {
 });
 
 describe("BackendModuleProvider — disconnect config preservation", () => {
-	it("keeps custom Google credentials and its hand-typed folder id, dropping flow state", async () => {
-		const settings = settingsWith({
-			authMode: true,
-			remoteVaultFolderId: "FID",
-			customClientId: "my-client-secret",
-			customClientSecret: "my-client-secret-2",
-			customScope: "drive.file",
-			pendingAuthState: "STATE",
-		});
+	it("keeps public BYO settings and discards target and pending state", async () => {
+		const settings = settingsWith({ clientId: "CID", redirectUri: "https://example.test/callback", remoteVaultFolderId: "FID", pendingAuthState: "STATE" });
 		const { provider } = makeProvider("googledrive", settings, () => null);
-
 		await provider.disconnect(settings);
-
-		expect(settings.backendData).toEqual({
-			authMode: true,
-			customClientId: "my-client-secret",
-			customClientSecret: "my-client-secret-2",
-			customScope: "drive.file",
-			remoteVaultFolderId: "FID",
-		});
+		expect(settings.backendData).toEqual({ clientId: "CID", redirectUri: "https://example.test/callback" });
 	});
-
-	it("a built-in selection resets to authMode only", async () => {
-		const settings = settingsWith({
-			authMode: false,
-			remoteVaultFolderId: "FID",
-			pendingAuthState: "STATE",
-		});
+	it("does not preserve a legacy built-in selection", async () => {
+		const settings = settingsWith({ authMode: false, remoteVaultFolderId: "FID", pendingAuthState: "STATE" });
 		const { provider } = makeProvider("googledrive", settings, () => null);
-
 		await provider.disconnect(settings);
-
-		expect(settings.backendData).toEqual({ authMode: false });
+		expect(settings.backendData).toEqual({});
 	});
 });
 

@@ -5,11 +5,9 @@ import { BUILTIN_BACKEND_MODULES } from "../../src/fs/modules/builtin-modules";
 import { CORE_CHECKSUM_IDS, createChecksumRegistry } from "../../src/fs/modules/checksum-registry";
 
 describe("built-in backend modules", () => {
-	it("exports exactly the three canonical modules", () => {
+	it("exports only the Google production module", () => {
 		expect(BUILTIN_BACKEND_MODULES.map((module) => module.id).sort()).toEqual([
-			"dropbox",
 			"googledrive",
-			"onedrive",
 		]);
 	});
 
@@ -19,12 +17,12 @@ describe("built-in backend modules", () => {
 		}
 	});
 
-	it("registers all three through the validate→register path", () => {
+	it("registers Google through the validate→register path", () => {
 		const registry = new BackendModuleRegistry();
 		for (const module of BUILTIN_BACKEND_MODULES) {
 			expect(registry.register(module).ok, module.id).toBe(true);
 		}
-		expect([...registry.ids()].sort()).toEqual(["dropbox", "googledrive", "onedrive"]);
+		expect([...registry.ids()].sort()).toEqual(["googledrive"]);
 	});
 
 	it("never declares a legacy `-custom` alias as its id", () => {

@@ -108,21 +108,16 @@ describe("OneDrive auth.start client-id and authority selection", () => {
 	});
 });
 
-describe("Google Drive auth.start client-id selection", () => {
-	it("built-in mode opens the shipped Google app client id", async () => {
-		const url = await startedUrl(googleDriveModule, { authMode: false });
-		expect(clientId(url)).toBe(GOOGLE_DRIVE_AUTH.clientId);
-		expect(url.toString()).not.toContain(GOOGLE_CUSTOM_CLIENT_ID);
-	});
-
-	it("custom mode opens the custom client id resolved from SecretStorage", async () => {
-		const url = await startedUrl(
-			googleDriveModule,
-			{ authMode: true, customClientId: "GoogleClientIdSecret" },
-			{ customClientId: GOOGLE_CUSTOM_CLIENT_ID, customClientSecret: "custom-google-secret" },
-		);
-		expect(clientId(url)).toBe(GOOGLE_CUSTOM_CLIENT_ID);
-		expect(clientId(url)).not.toBe(GOOGLE_DRIVE_AUTH.clientId);
-		expect(url.toString()).not.toContain(GOOGLE_DRIVE_AUTH.clientId);
-	});
+describe("Google Drive production BYO auth", () => {
+	for (const authMode of [undefined, false, true]) {
+		it("uses BYO credentials regardless of legacy authMode=" + String(authMode), async () => {
+			const config: JsonObject = { clientId: GOOGLE_CUSTOM_CLIENT_ID, redirectUri: "https://example.test/callback" };
+			if (authMode !== undefined) config.authMode = authMode;
+			const url = await startedUrl(googleDriveModule, config, { clientSecret: "user-secret" });
+			expect(clientId(url)).toBe(GOOGLE_CUSTOM_CLIENT_ID);
+			expect(url.toString()).not.toContain(GOOGLE_DRIVE_AUTH.clientId);
+			expect(url.searchParams.get("scope")).toBe("https://www.googleapis.com/auth/drive.file");
+			expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+		});
+	}
 });

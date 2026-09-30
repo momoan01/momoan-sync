@@ -8,7 +8,7 @@ import {
 } from "../platform/obsidian";
 import type AirSyncPlugin from "../main";
 import type { ConflictStrategy } from "../sync/types";
-import { getAllBackendProviders, getBackendProvider } from "../fs/registry";
+import { getBackendProvider } from "../fs/registry";
 import { getBackendSettingsRenderer } from "./backend-settings";
 import { parseLines } from "../utils/parse-lines";
 import { isDotPrefixed } from "../utils/path";
@@ -63,29 +63,6 @@ export class AirSyncSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					})
 			);
-
-		// Backend selector
-		const backends = getAllBackendProviders();
-		if (backends.length > 1) {
-			new Setting(containerEl)
-				.setName("Remote backend")
-				.setDesc("The remote storage service to sync with.")
-				.addDropdown((dropdown) => {
-					for (const b of backends) {
-						dropdown.addOption(b.type, b.displayName);
-					}
-					dropdown
-						.setValue(this.plugin.settings.backendType)
-						.onChange(async (value) => {
-							if (this.plugin.settings.backendType !== value) {
-								// Full reset: clears all backend params + sweeps every
-								// backend's plugin tokens, so the new one starts clean.
-								await this.plugin.backendManager.switchBackend(value);
-							}
-							this.renderContent();
-						});
-				});
-		}
 
 		// --- Backend-specific settings (config + connection flow) ---
 		const provider = getBackendProvider(

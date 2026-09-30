@@ -1,10 +1,8 @@
 import type { BackendModule } from "../../backend-api";
 import { googleDriveModule } from "../../backends/googledrive/module";
-import { oneDriveModule } from "../../backends/onedrive/module";
-import { dropboxModule } from "../../backends/dropbox/module";
 
 /**
- * The single built-in import root for the three canonical backend modules.
+ * The single built-in import root for the Google Drive production module.
  *
  * Core registers these through the same validate→register path a future dynamic
  * loader uses (`BackendModuleRegistry`). `src/fs/registry.ts` is the production
@@ -14,6 +12,4 @@ import { dropboxModule } from "../../backends/dropbox/module";
  */
 export const BUILTIN_BACKEND_MODULES: readonly BackendModule[] = [
 	googleDriveModule,
-	oneDriveModule,
-	dropboxModule,
 ];

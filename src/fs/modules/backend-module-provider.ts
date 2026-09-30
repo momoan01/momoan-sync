@@ -142,6 +142,7 @@ export class BackendModuleProvider implements IBackendProvider {
 		const legacy = createLegacyPhysicalKeyResolver(authMode);
 		const references = this.referenceFieldKeys();
 		return (moduleId, logicalKey) => {
+			if (moduleId === "googledrive") return "momoan-sync-" + moduleId + "-" + logicalKey;
 			if (references.has(logicalKey)) {
 				const reference = this.configStore.read()[logicalKey];
 				return typeof reference === "string" ? reference : "";
@@ -164,7 +165,7 @@ export class BackendModuleProvider implements IBackendProvider {
 	private credentialsReady(authMode: LegacyAuthMode): boolean {
 		const keys = this.module.auth.credentialKeys;
 		if (keys.length === 0) return true;
-		const physical = createLegacyPhysicalKeyResolver(authMode);
+		const physical = this.physicalKeyResolver(authMode);
 		return keys.some((key) => Boolean(this.deps.secretStore.getSecret(physical(this.module.id, key))));
 	}
 
@@ -279,6 +280,16 @@ export class BackendModuleProvider implements IBackendProvider {
 			if (!this.deps.secretStore.getSecret(reference)) unresolved.push(key);
 		}
 		return unresolved;
+	}
+
+	/** Store settings credentials directly in the module SecretStorage namespace. */
+	async setSettingsSecret(key: string, value: string): Promise<void> {
+		await this.ensureConnection().context.secrets.set(key, value);
+	}
+
+	hasSettingsSecret(key: string): boolean {
+		const physical = this.physicalKeyResolver(authModeOf(this.configStore.read()));
+		return Boolean(this.deps.secretStore.getSecret(physical(this.module.id, key)));
 	}
 
 	getIdentity(_settings: AirSyncSettings): string | null {

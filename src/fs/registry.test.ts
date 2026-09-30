@@ -42,9 +42,9 @@ describe("backend module registry composition", () => {
 		});
 	});
 
-	it("registers exactly the three canonical module ids and no legacy alias", () => {
+	it("registers only Google Drive and no legacy alias", () => {
 		const types = getAllBackendProviders().map((p) => p.type).sort();
-		expect(types).toEqual([...MANAGED_REMOTE_BACKEND_FAMILIES].sort());
+		expect(types).toEqual(["googledrive"]);
 		for (const alias of ["googledrive-custom", "onedrive-custom", "dropbox-custom"]) {
 			expect(getAllBackendProviders().some((p) => p.type === alias)).toBe(false);
 		}
@@ -58,7 +58,7 @@ describe("backend module registry composition", () => {
 	// backend also ships the by-key clear. Pin it here.
 	it("a module provider ships clearCheckpointStore iff its FS carries a checkpoint", async () => {
 		const providers = getAllBackendProviders();
-		expect(providers.length).toBe(MANAGED_REMOTE_BACKEND_FAMILIES.length);
+		expect(providers.length).toBe(1);
 
 		for (const provider of providers) {
 			expect(provider.isConnected(settings), `isConnected false for "${provider.type}"`).toBe(true);
