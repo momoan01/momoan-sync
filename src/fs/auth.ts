@@ -8,6 +8,7 @@
  * AFTER the await instead of merging into a pre-await snapshot.
  */
 export interface IAuthProvider {
+	cancelAuth?(): Promise<void>;
 	startAuth(backendData: Record<string, unknown>): Promise<Record<string, unknown>>;
 	completeAuth(input: string, backendData: Record<string, unknown>): Promise<Record<string, unknown>>;
 }

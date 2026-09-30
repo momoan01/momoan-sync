@@ -72,7 +72,7 @@ export class BackendModuleSettingsRenderer implements IBackendSettingsRenderer {
 		const authed = this.provider.hasCredentials();
 		renderConnectionStatus(containerEl, {
 			connected: authed,
-			connectLabel: `Connect to ${module.displayName}`,
+			connectLabel: module.id === "googledrive" ? "Connect Google" : `Connect to ${module.displayName}`,
 			actions,
 			onConnect: () => this.guardCustomConnect(settings, actions),
 		});
@@ -98,6 +98,15 @@ export class BackendModuleSettingsRenderer implements IBackendSettingsRenderer {
 				folderId: target.id,
 				resolvePath: () => this.provider.getRemoteVaultDisplayPath(settings),
 			});
+			if (this.provider.picker) {
+				folderSetting.addButton((button) => button.setButtonText("Choose folder").onClick(() => void actions.startFolderPick()));
+			}
+			return;
+		}
+
+		if (module.id === "googledrive") {
+			folderSetting.setDesc("Choose a Google Drive folder to finish connecting this device.");
+			if (this.provider.picker) folderSetting.addButton((button) => button.setButtonText("Choose folder").setCta().onClick(() => void actions.startFolderPick()));
 			return;
 		}
 

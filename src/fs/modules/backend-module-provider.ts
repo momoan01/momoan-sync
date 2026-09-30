@@ -105,6 +105,7 @@ export class BackendModuleProvider implements IBackendProvider {
 		// persistence (generation-gated). These methods therefore return `{}`: the
 		// caller's merge is a no-op and the live bag is authoritative.
 		this.auth = {
+			cancelAuth: () => this.ensureConnection().cancelPending(),
 			startAuth: async () => {
 				this.ensureConnection();
 				await this.connection!.startAuth();
@@ -331,10 +332,7 @@ export class BackendModuleProvider implements IBackendProvider {
 	}
 
 	get picker(): WebFolderPicker | undefined {
-		const config = this.configStore.read();
 		if (!this.module.binding.beginPick || !this.module.binding.completePick) return undefined;
-		// Custom Google OAuth has no Picker: the user types a folder id instead.
-		if (authModeOf(config) !== "default") return undefined;
 		return {
 			startWebFolderPick: async () => {
 				const connection = this.ensureConnection();
@@ -411,7 +409,7 @@ export class BackendModuleProvider implements IBackendProvider {
 	/** Sweep this module's declared plugin-owned secrets under every auth-mode profile. */
 	clearPluginSecrets(): void {
 		for (const authMode of ["default", "custom"] as const) {
-			const physical = createLegacyPhysicalKeyResolver(authMode);
+			const physical = this.physicalKeyResolver(authMode);
 			for (const key of this.module.auth.credentialKeys) {
 				this.deps.secretStore.setSecret(physical(this.module.id, key), "");
 			}

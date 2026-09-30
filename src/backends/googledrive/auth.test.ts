@@ -419,7 +419,7 @@ describe("GoogleAuthDirect.handleAuthCallback", () => {
 		).rejects.toThrow("PKCE code verifier is missing");
 	});
 
-	it("carries the whole Google error body when token exchange fails", async () => {
+	it("does not expose provider response bodies that may contain credentials", async () => {
 		const err = new Error("Request failed, status 400");
 		Object.assign(err, {
 			status: 400,
@@ -440,14 +440,14 @@ describe("GoogleAuthDirect.handleAuthCallback", () => {
 
 		const thrown = auth.handleAuthCallback({ code: "code", state: "state" });
 		await expect(thrown).rejects.toThrow("Token exchange failed");
-		await expect(thrown).rejects.toThrow("redirect_uri_mismatch");
-		await expect(thrown).rejects.toThrow("Bad Request");
-		await expect(thrown).rejects.toThrow("developers.google.com");
+		await expect(thrown).rejects.not.toThrow("redirect_uri_mismatch");
+		await expect(thrown).rejects.not.toThrow("Bad Request");
+		await expect(thrown).rejects.not.toThrow("developers.google.com");
 
 		mockRequestUrl.mockRestore();
 	});
 
-	it("falls back to error message when no Google error body", async () => {
+	it("uses a safe exchange failure without forwarding transport details", async () => {
 		const mockRequestUrl = (await spyRequestUrl()).mockRejectedValue(
 			new Error("Network error")
 		);
@@ -459,7 +459,7 @@ describe("GoogleAuthDirect.handleAuthCallback", () => {
 
 		await expect(
 			auth.handleAuthCallback({ code: "code", state: "state" })
-		).rejects.toThrow("Token exchange failed: Network error");
+		).rejects.toThrow("Token exchange failed. Please reconnect.");
 
 		mockRequestUrl.mockRestore();
 	});

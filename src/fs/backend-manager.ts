@@ -318,6 +318,11 @@ export class BackendManager {
 		}
 	}
 
+	/** Cancel only the active device's temporary authorization state. */
+	async cancelBackendConnect(): Promise<void> {
+		await this.backendProvider?.auth.cancelAuth?.();
+	}
+
 	/** Complete the auth flow with a code/token from the user */
 	async completeBackendConnect(code: string): Promise<void> {
 		if (this.connecting) return;

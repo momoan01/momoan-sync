@@ -36,6 +36,9 @@ export interface BackendAuth {
 		config: Readonly<JsonObject>,
 	): Promise<JsonPatch>;
 
+	/** Discard temporary authorization proof and correlation on cancellation/failure. */
+	cancelPending?(context: BackendRuntimeContext, config: Readonly<JsonObject>): Promise<JsonPatch>;
+
 	/** Best-effort provider revocation before core clears local state. */
 	revoke?(context: BackendRuntimeContext, config: Readonly<JsonObject>): Promise<void>;
 }

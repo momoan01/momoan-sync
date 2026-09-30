@@ -32,6 +32,7 @@ export function correlateOAuthCallbackError(
 
 export interface OAuthProtocolEffects {
 	notify(message: string): void;
+	cancelAuth?(): void;
 	completeConnect(url: string): void;
 	completeFolderPick(url: string, params: Record<string, string | undefined>): void;
 }
@@ -54,7 +55,10 @@ export function handleOAuthProtocolCallback(
 	const callbackError = projectOAuthCallbackError(params.error);
 	if (callbackError) {
 		const correlated = correlateOAuthCallbackError(params, pendingState);
-		if (correlated) effects.notify(correlated.message);
+		if (correlated) {
+			effects.cancelAuth?.();
+			effects.notify(correlated.message);
+		}
 		return;
 	}
 	if (!params.access_token && !params.code) {

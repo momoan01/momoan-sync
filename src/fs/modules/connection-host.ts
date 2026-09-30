@@ -60,6 +60,7 @@ export interface ModuleConnection {
 	/** Folder names directly under an App-Folder root, for the core in-app picker. */
 	listAppRootFolders(): Promise<readonly string[]>;
 	resolveDefaultFolder(vaultName: string): Promise<BackendTarget | null>;
+	cancelPending(): Promise<void>;
 	revoke(): Promise<void>;
 	/** The ADR disconnect sequence; see {@link disconnectModule}. */
 	disconnect(): Promise<void>;
@@ -155,11 +156,19 @@ export function createModuleConnection(options: ModuleConnectionOptions): Module
 		}
 	};
 
-	const beginAuth = async (
-		run: () => Promise<JsonPatch>,
-	): Promise<boolean> => {
+	const cancelPending = async (): Promise<void> => {
+		if (!isLive() || !module.auth.cancelPending) return;
+		await commit(await module.auth.cancelPending(runtime.context, options.config.read()));
+	};
+
+	const beginAuth = async (run: () => Promise<JsonPatch>): Promise<boolean> => {
 		if (!isLive()) return false;
-		return commit(await run());
+		try {
+			return await commit(await run());
+		} catch (error) {
+			await cancelPending();
+			throw error;
+		}
 	};
 
 	const connection: ModuleConnection = {
@@ -176,16 +185,22 @@ export function createModuleConnection(options: ModuleConnectionOptions): Module
 				binding: module.binding,
 				context: runtime.context,
 				config: { read: () => options.config.read(), commit },
+			}).catch(async (error: unknown) => {
+				await cancelPending();
+				throw error;
 			}),
-		completePick: (params) =>
-			completeFolderPick(
-				{
-					binding: module.binding,
-					context: runtime.context,
-					config: { read: () => options.config.read(), commit },
-				},
-				params,
-			),
+		completePick: async (params) => {
+			try {
+				return await completeFolderPick(
+					{ binding: module.binding, context: runtime.context,
+						config: { read: () => options.config.read(), commit } },
+					params,
+				);
+			} catch (error) {
+				await cancelPending();
+				throw error;
+			}
+		},
 		listAppRootFolders: async () => {
 			if (!module.binding.listAppRootFolders) return [];
 			return module.binding.listAppRootFolders(runtime.context, options.config.read());
@@ -198,6 +213,7 @@ export function createModuleConnection(options: ModuleConnectionOptions): Module
 			);
 			return (await commit(result.patch)) ? result.target : null;
 		},
+		cancelPending,
 		revoke: async () => {
 			await module.auth.revoke?.(runtime.context, options.config.read());
 		},
@@ -212,6 +228,7 @@ export function createModuleConnection(options: ModuleConnectionOptions): Module
 			}),
 		dispose: async () => {
 			if (disposed) return;
+			await cancelPending();
 			disposed = true;
 			auth.cancelAll();
 			await runtime.dispose();

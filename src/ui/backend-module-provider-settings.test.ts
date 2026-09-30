@@ -13,6 +13,8 @@ vi.mock("obsidian");
 beforeEach(() => {
 	__ui.buttons = [];
 	__ui.notices = [];
+	__ui.texts = [];
+	__ui.dropdowns = [];
 });
 
 /** A container whose `createDiv()` returns a clearable child, as the renderer expects. */
@@ -107,8 +109,8 @@ describe("BackendModuleSettingsRenderer — container ownership", () => {
 describe("BackendModuleSettingsRenderer — unbound default folder", () => {
 	it("labels the default-folder CTA with the resolved default remote path", () => {
 		const provider = {
-			type: "googledrive",
-			getModule: () => googleDriveModule,
+			type: "fakebackend",
+			getModule: () => createFakeModule(),
 			hasCredentials: () => true,
 			getRemoteVaultDisplayPath: () => Promise.resolve(null),
 		} as unknown as BackendModuleProvider;
@@ -202,5 +204,26 @@ describe("BackendModuleSettingsRenderer — custom-app connect guard", () => {
 		expect(__ui.notices).toContain(
 			`The secret "missing-secret" for Client ID was not found in Obsidian's key store.`,
 		);
+	});
+});
+
+
+describe("BackendModuleSettingsRenderer — Google production flow", () => {
+	it("shows BYO settings and Choose folder without auth mode or backend choices", () => {
+		const startFolderPick = vi.fn().mockResolvedValue(undefined);
+		const provider = {
+			type: "googledrive", getModule: () => googleDriveModule, hasCredentials: () => true,
+			getRemoteVaultDisplayPath: () => Promise.resolve(null), picker: {},
+		} as unknown as BackendModuleProvider;
+		const settings = mockSettings({ backendType: "googledrive", backendData: {} });
+		new BackendModuleSettingsRenderer(provider).render(container(), settings, () => Promise.resolve(),
+			{ ...actionsSpy().actions, startFolderPick }, { vault: { getName: () => "Personal" } } as never);
+		expect(__ui.texts.map((field) => field.name)).toContain("Client ID");
+		expect(__ui.texts.map((field) => field.name)).toContain("Redirect URI");
+		expect(__ui.buttons.map((button) => button.label)).toContain("Choose folder");
+		expect(__ui.dropdowns.map((field) => field.name)).not.toContain("Remote backend");
+		expect(googleDriveModule.settings?.fields.map((field) => field.key)).toEqual(["clientId", "redirectUri"]);
+		__ui.buttons.find((button) => button.label === "Choose folder")?.click();
+		expect(startFolderPick).toHaveBeenCalledOnce();
 	});
 });

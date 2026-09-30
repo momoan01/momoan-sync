@@ -6,7 +6,6 @@ import {
 	BaseOAuthTokenManager,
 	buildOAuthState,
 	computeS256Challenge,
-	extractThrownErrorDetail,
 	generateRandomString,
 } from "../../backend-api/oauth-pkce";
 import { GOOGLE_DRIVE_AUTH, DEFAULT_CUSTOM_REDIRECT_URI } from "../shared/auth-config";
@@ -74,6 +73,10 @@ abstract class GoogleAuthBase extends BaseOAuthTokenManager implements IGoogleAu
 
 	setCodeVerifier(verifier: string): void {
 		this.codeVerifier = verifier;
+	}
+
+	protected clearCodeVerifier(): void {
+		this.codeVerifier = null;
 	}
 
 	abstract handleAuthCallback(params: Record<string, string | undefined>): Promise<void>;
@@ -242,8 +245,17 @@ export class GoogleAuthDirect extends GoogleAuthBase {
 		this.logger = options.logger;
 	}
 
-	async getAuthorizationUrl(): Promise<string> {
-		const state = this.generateState({ custom: true });
+	getAuthorizationUrl(): Promise<string> {
+		return this.buildAuthorizationUrl(false);
+	}
+
+	/** Google owns the top-level Picker and returns a code and selected folder. */
+	getFolderPickerAuthorizationUrl(): Promise<string> {
+		return this.buildAuthorizationUrl(true);
+	}
+
+	private async buildAuthorizationUrl(folderPick: boolean): Promise<string> {
+		const state = this.generateState(folderPick ? { custom: true, folderPick: true } : { custom: true });
 		const codeVerifier = generateRandomString(64);
 		this.setCodeVerifier(codeVerifier);
 		const codeChallenge = await computeS256Challenge(codeVerifier);
@@ -259,6 +271,11 @@ export class GoogleAuthDirect extends GoogleAuthBase {
 			code_challenge: codeChallenge,
 			code_challenge_method: "S256",
 		});
+		if (folderPick) {
+			params.set("trigger_onepick", "true");
+			params.set("allow_folder_selection", "true");
+			params.set("mimetypes", "application/vnd.google-apps.folder");
+		}
 		if (this.includeGrantedScopes) {
 			params.set("include_granted_scopes", "true");
 		}
@@ -271,21 +288,11 @@ export class GoogleAuthDirect extends GoogleAuthBase {
 	 * Sends code_verifier for PKCE verification.
 	 */
 	async handleAuthCallback(params: Record<string, string | undefined>): Promise<void> {
-		this.verifyAndClearState(params.state);
-		if (!params.code) {
-			throw new Error("Authorization code is missing from auth callback");
-		}
-		const codeVerifier = this.getCodeVerifier();
-		if (!codeVerifier) {
-			throw new Error("PKCE code verifier is missing. Please restart the authorization flow.");
-		}
-
-		this.logger?.debug("Exchanging authorization code", {
-			redirectUri: this.redirectUri,
-			codeLength: params.code.length,
-		});
-
 		try {
+			this.verifyAndClearState(params.state);
+			if (!params.code) throw new Error("Authorization code is missing from auth callback");
+			const codeVerifier = this.getCodeVerifier();
+			if (!codeVerifier) throw new Error("PKCE code verifier is missing. Please restart the authorization flow.");
 			const response = await this.transport.request({
 				url: GOOGLE_TOKEN_URL,
 				method: "POST",
@@ -298,17 +305,13 @@ export class GoogleAuthDirect extends GoogleAuthBase {
 					grant_type: "authorization_code",
 					code_verifier: codeVerifier,
 				}).toString(),
-			});
-
+			}).catch(() => { throw new Error("Token exchange failed. Please reconnect."); });
 			const token: unknown = response.json;
 			assertTokenResponse(token);
 			await this.storeTokenResponse(token);
+		} finally {
 			this.clearAuthState();
-			this.logger?.debug("Token exchange successful");
-		} catch (err) {
-			const detail = extractThrownErrorDetail(err);
-			this.logger?.error("Token exchange failed", { error: detail });
-			throw new Error(`Token exchange failed: ${detail}`);
+			this.clearCodeVerifier();
 		}
 	}
 

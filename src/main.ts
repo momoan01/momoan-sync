@@ -177,6 +177,7 @@ export default class AirSyncPlugin extends Plugin {
 		this.registerObsidianProtocolHandler("momoan-sync-auth", (params) => {
 			const pendingState = this.settings.backendData.pendingAuthState;
 			handleOAuthProtocolCallback(params, pendingState, {
+				cancelAuth: () => { void this.backendManager.cancelBackendConnect(); },
 				notify: (message) => { new Notice(message); },
 				completeConnect: (url) => { void this.backendManager.completeBackendConnect(url); },
 				completeFolderPick: (url, callbackParams) => {

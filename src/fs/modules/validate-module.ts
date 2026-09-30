@@ -110,6 +110,7 @@ function validateAuth(issues: Issues, module: Json): void {
 	validateFunction(issues, auth, "start", "auth.start", true);
 	validateFunction(issues, auth, "complete", "auth.complete", true);
 	validateFunction(issues, auth, "revoke", "auth.revoke", false);
+	validateFunction(issues, auth, "cancelPending", "auth.cancelPending", false);
 	validateCredentialKeys(issues, auth);
 }
 

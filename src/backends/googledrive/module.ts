@@ -10,8 +10,7 @@ import type {
 	RemoteBackendAdapter,
 } from "../../backend-api";
 import { BACKEND_MODULE_API_VERSION } from "../../backend-api";
-import { GoogleAuth, GoogleAuthDirect } from "./auth";
-import type { IGoogleAuth } from "./auth";
+import { GoogleAuthDirect } from "./auth";
 import { GoogleDriveClient } from "./client";
 import { GoogleDriveAdapter } from "./adapter";
 import { withAdapterState } from "../shared/adapter-state";
@@ -30,7 +29,7 @@ const SETTINGS: BackendSettingsDefinition = {
 	],
 };
 
-async function buildAuth(context: BackendRuntimeContext, config: Readonly<JsonObject>): Promise<IGoogleAuth> {
+async function buildAuth(context: BackendRuntimeContext, config: Readonly<JsonObject>): Promise<GoogleAuthDirect> {
 	return new GoogleAuthDirect({
 		clientId: asString(config.clientId),
 		clientSecret: (await context.secrets.get("clientSecret")) ?? "",
@@ -40,23 +39,46 @@ async function buildAuth(context: BackendRuntimeContext, config: Readonly<JsonOb
 	});
 }
 
+const PENDING_KEYS = ["pendingAuthState", "pendingFolderPickState", "pendingCodeVerifier", "pendingAuthExpiresAt"];
+const AUTH_LIFETIME_MS = 10 * 60 * 1000;
+
+function assertPendingFresh(config: Readonly<JsonObject>): void {
+	if (typeof config.pendingAuthExpiresAt !== "number" || Date.now() >= config.pendingAuthExpiresAt) {
+		throw new Error("Authorization expired. Please restart the connection flow.");
+	}
+}
+
+async function beginAuthorization(context: BackendRuntimeContext, config: Readonly<JsonObject>, folderPick: boolean): Promise<JsonPatch> {
+	if (!asString(config.clientId) || !asString(config.redirectUri) || !(await context.secrets.get("clientSecret"))) {
+		throw new Error("Client ID, client secret and redirect URI are required.");
+	}
+	const google = await buildAuth(context, config);
+	const url = folderPick ? await google.getFolderPickerAuthorizationUrl() : await google.getAuthorizationUrl();
+	const verifier = google.getCodeVerifier();
+	if (!verifier) throw new Error("PKCE code verifier is missing.");
+	await context.secrets.set("pendingCodeVerifier", verifier);
+	try {
+		await context.auth.openExternal(url);
+	} catch (error) {
+		await context.secrets.delete("pendingCodeVerifier");
+		throw error;
+	}
+	const state = google.getAuthState() ?? "";
+	return {
+		set: { pendingAuthState: state, pendingFolderPickState: folderPick ? state : "", pendingAuthExpiresAt: Date.now() + AUTH_LIFETIME_MS },
+		unset: ["pendingCodeVerifier"],
+	};
+}
+
 const auth: BackendAuth = {
 	credentialKeys: ["refresh", "access"],
-	start: async (context, config) => {
-		if (!asString(config.clientId) || !asString(config.redirectUri) || !(await context.secrets.get("clientSecret"))) {
-			throw new Error("Client ID, client secret and redirect URI are required.");
-		}
-		const google = await buildAuth(context, config);
-		const url = await google.getAuthorizationUrl();
-		await context.auth.openExternal(url);
-		const patch: JsonObject = {
-			pendingAuthState: google.getAuthState() ?? "",
-		};
-		const verifier = google.getCodeVerifier();
-		if (verifier) await context.secrets.set("pendingCodeVerifier", verifier);
-		return { set: patch };
+	start: (context, config) => beginAuthorization(context, config, false),
+	cancelPending: async (context) => {
+		await context.secrets.delete("pendingCodeVerifier");
+		return { unset: PENDING_KEYS };
 	},
 	complete: async (context, input, config) => {
+		assertPendingFresh(config);
 		const google = await buildAuth(context, config);
 		if (!google.getAuthState() && asString(config.pendingAuthState)) {
 			google.setAuthState(asString(config.pendingAuthState));
@@ -74,7 +96,7 @@ const auth: BackendAuth = {
 		}
 		await context.secrets.set("refresh", tokens.refreshToken);
 		await context.secrets.set("access", tokens.accessToken);
-		return { set: { accessTokenExpiry: tokens.accessTokenExpiry, pendingAuthState: "" }, unset: ["pendingCodeVerifier"] };
+		return { set: { accessTokenExpiry: tokens.accessTokenExpiry, pendingAuthState: "" }, unset: config.pendingFolderPickState ? ["pendingCodeVerifier"] : ["pendingCodeVerifier", "pendingAuthExpiresAt"] };
 	},
 	revoke: async (context, config) => {
 		try {
@@ -133,26 +155,27 @@ const binding: BackendBinding = {
 		const id = asString(resolution.backendUpdates.remoteVaultFolderId);
 		return { patch: { set: { remoteVaultFolderId: id } }, target: { id } };
 	},
-	beginPick: async (context, config): Promise<JsonPatch> => {
-		const google = await buildAuth(context, config);
-		if (!(google instanceof GoogleAuth)) {
-			throw new Error("Folder picking is only available with Air Sync's Google app.");
-		}
-		const url = await google.getFolderPickerAuthorizationUrl();
-		await context.auth.openExternal(url);
-		const state = google.getAuthState() ?? "";
-		return { set: { pendingAuthState: state, pendingFolderPickState: state } };
-	},
+	beginPick: (context, config) => beginAuthorization(context, config, true),
 	completePick: async (context, params, config): Promise<BindingResult> => {
+		assertPendingFresh(config);
 		const expected = asString(config.pendingFolderPickState);
 		if (!expected || params.state !== expected) throw new Error("State mismatch - possible CSRF attack");
-		const picked = (params.picked_file_ids ?? "").split(",").map((v) => v.trim()).filter(Boolean);
-		if (picked.length !== 1) throw new Error("Please select exactly one folder.");
+		const picked = (params.picked_file_ids ?? "").split(",").map((value) => value.trim());
+		if (picked.length !== 1 || !/^[A-Za-z0-9_-]+$/.test(picked[0] ?? "")) throw new Error("Please select exactly one folder.");
 		const id = picked[0]!;
-		const client = await buildClient(context, config);
+		if (config.pendingAuthState && !params.code) throw new Error("Authorization code is missing from folder callback");
+		// The folder protocol may carry the code itself; the auth protocol has already exchanged it.
+		const authPatch = params.code && config.pendingAuthState
+			? await auth.complete(context, "obsidian://momoan-sync-folder?" + new URLSearchParams(params).toString(), config)
+			: {};
+		const current = { ...config, ...authPatch.set };
+		const client = await buildClient(context, current);
 		const inspection = await inspectGoogleDriveFolder(client, id);
-		if (!inspection.usable) throw new Error("That folder is not usable. Re-pick it in the Google Picker.");
-		return { patch: { set: { remoteVaultFolderId: id, pendingFolderPickState: "" } }, target: { id } };
+		if (!inspection.usable || inspection.file.id !== id) throw new Error("That folder is not usable. Re-pick it in the Google Picker.");
+		return {
+			patch: { set: { ...authPatch.set, remoteVaultFolderId: id, remoteVaultFolderName: inspection.file.name }, unset: PENDING_KEYS },
+			target: { id },
+		};
 	},
 	getDisplayPath: async (context, config, target) => {
 		const client = await buildClient(context, config);
