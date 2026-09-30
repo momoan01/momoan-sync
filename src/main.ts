@@ -49,11 +49,13 @@ export default class AirSyncPlugin extends Plugin {
 		);
 
 		const deviceName = getDeviceName(Platform.isMobile, this.settings.vaultId);
+		const internalDir = `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
 		// vault.adapter is a structural superset of RawFsAdapter — no cast needed.
 		this.logger = new Logger(
 			this.app.vault.adapter,
 			() => this.settings,
 			deviceName,
+			internalDir,
 		);
 		this.logger.info("Plugin loaded", { deviceName, vaultId: this.settings.vaultId });
 
@@ -75,7 +77,11 @@ export default class AirSyncPlugin extends Plugin {
 
 		// Conflict-resolution audit history, written via the same raw adapter + device
 		// name as the logger (it persists to .airsync/conflicts/<device>.json).
-		this.conflictHistory = new ConflictHistory(this.logger.adapter, this.logger.sanitizedDeviceName);
+		this.conflictHistory = new ConflictHistory(
+			this.logger.adapter,
+			this.logger.sanitizedDeviceName,
+			`${internalDir}/conflicts`,
+		);
 
 		this.backendManager = new BackendManager({
 			getSettings: () => this.settings,
@@ -166,9 +172,9 @@ export default class AirSyncPlugin extends Plugin {
 		this.settingTab = new AirSyncSettingTab(this.app, this);
 		this.addSettingTab(this.settingTab);
 
-		// OAuth callback via obsidian://air-sync-auth?access_token=...&state=... or ?code=...&state=...
+		// OAuth callback via obsidian://momoan-sync-auth?access_token=...&state=... or ?code=...&state=...
 		// Google's top-level Picker also returns picked_file_ids on this callback.
-		this.registerObsidianProtocolHandler("air-sync-auth", (params) => {
+		this.registerObsidianProtocolHandler("momoan-sync-auth", (params) => {
 			const pendingState = this.settings.backendData.pendingAuthState;
 			handleOAuthProtocolCallback(params, pendingState, {
 				notify: (message) => { new Notice(message); },
@@ -179,10 +185,10 @@ export default class AirSyncPlugin extends Plugin {
 			});
 		});
 
-		// Web folder-picker result via obsidian://air-sync-folder. Backend-agnostic:
+		// Web folder-picker result via obsidian://momoan-sync-folder. Backend-agnostic:
 		// BackendManager routes to the active backend's completeWebFolderPick. Kept
 		// separate from auth — distinct payload, no sniffing dispatch needed.
-		this.registerObsidianProtocolHandler("air-sync-folder", (params) => {
+		this.registerObsidianProtocolHandler("momoan-sync-folder", (params) => {
 			void this.backendManager.completeBackendFolderPick(params);
 		});
 

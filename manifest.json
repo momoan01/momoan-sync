@@ -1,10 +1,9 @@
 {
-	"id": "air-sync",
-	"name": "Air Sync",
-	"version": "0.2.1",
+	"id": "momoan-sync",
+	"name": "Momoan Sync",
+	"version": "0.1.0",
 	"minAppVersion": "1.11.4",
-	"description": "Keep your vault in sync across devices without managing sync—sync only what changed, preserve conflicting edits, and use your own Google Drive, OneDrive, or Dropbox.",
-	"author": "Takehito Gondo",
-	"authorUrl": "https://github.com/takezoh",
+	"description": "Personal-use sync project focused on user-owned cloud data and conservative synchronization.",
+	"author": "Momoan",
 	"isDesktopOnly": false
 }

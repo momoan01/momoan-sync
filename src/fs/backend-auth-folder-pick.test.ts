@@ -35,7 +35,7 @@ function createContext(
 	const adapter = createLogAdapter();
 	const notify = vi.fn();
 	const context: BackendAuthFolderPickContext = {
-		input: "obsidian://air-sync-auth?code=abc",
+		input: "obsidian://momoan-sync-auth?code=abc",
 		params: { id: "FID", state: "STATE-1" },
 		settings: mockSettings({ enableLogging: true, logLevel: "debug" }),
 		auth: {

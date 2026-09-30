@@ -8,12 +8,12 @@
 
 /**
  * Direct deep link back to the in-plugin protocol handler — no relay page.
- * Shared by Dropbox and OneDrive: both register `obsidian://air-sync-auth` as a
+ * Shared by Dropbox and OneDrive: both register `obsidian://momoan-sync-auth` as a
  * redirect URI. Custom-scheme redirects are permitted for PKCE apps (the
  * authorization-code flow otherwise requires https/localhost), so the code can
  * return straight to Obsidian.
  */
-export const PLUGIN_REDIRECT_URI = "obsidian://air-sync-auth";
+export const PLUGIN_REDIRECT_URI = "obsidian://momoan-sync-auth";
 
 /** Air Sync auth relay server (confidential client; server-side token exchange). */
 const GOOGLE_AUTH_SERVER_URL = "https://auth-airsync.takezo.dev";
@@ -33,7 +33,7 @@ export const DEFAULT_CUSTOM_REDIRECT_URI = "https://airsync.takezo.dev/callback"
  *
  * PKCE means there is NO client secret anywhere — the `code_verifier` is the
  * ephemeral proof. Registered at https://www.dropbox.com/developers/apps with
- * `obsidian://air-sync-auth` as a redirect URI (Dropbox allows custom schemes for
+ * `obsidian://momoan-sync-auth` as a redirect URI (Dropbox allows custom schemes for
  * PKCE apps). The key is embedded so it connects with no per-user setup.
  */
 export const DROPBOX_AUTH = {
@@ -45,7 +45,7 @@ export const DROPBOX_AUTH = {
  * Public OAuth app for the Air Sync OneDrive app (Files.ReadWrite.AppFolder).
  *
  * The real Entra (Azure AD) application (client) id, registered at
- * https://entra.microsoft.com with `obsidian://air-sync-auth` as a redirect URI and
+ * https://entra.microsoft.com with `obsidian://momoan-sync-auth` as a redirect URI and
  * "Personal Microsoft accounts only" as the supported account type. PKCE means there
  * is NO client secret anywhere — the `code_verifier` is the ephemeral proof. The
  * contract tests pass a fake client id, so they are green regardless of this value.

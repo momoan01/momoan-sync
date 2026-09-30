@@ -43,7 +43,7 @@ export class Logger {
 	private getSettings: () => AirSyncSettings;
 	/**
 	 * Serializes flush()'s read-modify-write against the log file. Logger is the
-	 * sole writer of `.airsync/logs/...`, so this is the one place that has to hold
+	 * sole writer of the plugin log directory, so this is the one place that has to hold
 	 * the serialization: without it, two overlapping flush() calls each read the
 	 * same on-disk content before either writes, and whichever writes last clobbers
 	 * the other's lines — a lost update with no error, since a flush failure is
@@ -63,6 +63,7 @@ export class Logger {
 		adapter: RawFsAdapter,
 		getSettings: () => AirSyncSettings,
 		deviceName: string,
+		private readonly internalDir: string = ".airsync",
 	) {
 		this._adapter = adapter;
 		this.getSettings = getSettings;
@@ -148,7 +149,7 @@ export class Logger {
 			this.buffer = [];
 
 			const date = new Date().toISOString().slice(0, 10);
-			const logsDir = ".airsync/logs";
+			const logsDir = `${this.internalDir}/logs`;
 			const dir = `${logsDir}/${this._deviceName}`;
 			const filePath = `${dir}/${date}.log`;
 

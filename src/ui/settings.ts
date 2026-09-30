@@ -224,7 +224,7 @@ export class AirSyncSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Enable logging")
 			.setDesc(
-				"Write sync logs to .airsync/ in your vault for debugging."
+				"Write sync logs inside the private data directory for debugging."
 			)
 			.addToggle((toggle) =>
 				toggle

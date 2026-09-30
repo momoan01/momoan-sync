@@ -2,7 +2,6 @@ import type { RawFsAdapter } from "../fs/raw-fs";
 import { ensureDir } from "../fs/raw-fs";
 import type { ConflictRecord } from "./types";
 
-const CONFLICTS_DIR = ".airsync/conflicts";
 const MAX_RECORDS = 500;
 
 export class ConflictHistory {
@@ -10,9 +9,13 @@ export class ConflictHistory {
 	private filePath: string;
 
 	/** @param deviceName must be pre-sanitized (e.g. via Logger.sanitizedDeviceName) */
-	constructor(adapter: RawFsAdapter, deviceName: string) {
+	constructor(
+		adapter: RawFsAdapter,
+		deviceName: string,
+		private readonly conflictsDir: string = ".airsync/conflicts",
+	) {
 		this.adapter = adapter;
-		this.filePath = `${CONFLICTS_DIR}/${deviceName}.json`;
+		this.filePath = `${conflictsDir}/${deviceName}.json`;
 	}
 
 	async load(): Promise<ConflictRecord[]> {
@@ -36,7 +39,7 @@ export class ConflictHistory {
 			? combined.slice(combined.length - MAX_RECORDS)
 			: combined;
 
-		await ensureDir(this.adapter, CONFLICTS_DIR);
+		await ensureDir(this.adapter, this.conflictsDir);
 		await this.adapter.write(this.filePath, JSON.stringify(capped, null, 2));
 	}
 }
