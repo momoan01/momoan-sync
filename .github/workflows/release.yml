@@ -1,0 +1,47 @@
+name: Release
+
+on:
+    push:
+        tags:
+            - "*"
+
+permissions:
+    contents: write
+    id-token: write
+    attestations: write
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+
+            - uses: actions/setup-node@v6
+              with:
+                  node-version: 20
+
+            # package-lock.json is generated with npm 11; pin CI to the same major
+            # so optional peer deps (e.g. esbuild via vite 8) resolve identically.
+            - run: npm install -g npm@11
+
+            - run: npm ci
+
+            - run: npm run build
+              env:
+                  GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+                  GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+
+            - uses: actions/attest-build-provenance@v2
+              with:
+                  subject-path: |
+                      main.js
+                      manifest.json
+                      styles.css
+
+            - uses: softprops/action-gh-release@v2
+              with:
+                  draft: false
+                  files: |
+                      main.js
+                      manifest.json
+                      styles.css

@@ -1,0 +1,248 @@
+import { debounce, TFolder } from "../platform/obsidian";
+import type { EventRef, Workspace, Vault, TAbstractFile, TFile } from "../platform/obsidian";
+import type { IFileSystem } from "../fs/interface";
+import type { LocalChangeTracker } from "./local-tracker";
+
+const DEBOUNCE_MS = 5000;
+
+function trackScopedFolderRename(
+	folder: TFolder,
+	oldRoot: string,
+	isExcluded: (path: string) => boolean,
+	localTracker: LocalChangeTracker,
+): boolean {
+	const newPrefix = `${folder.path}/`;
+	const pending = [...folder.children];
+	let tracked = false;
+	while (pending.length > 0) {
+		const child = pending.pop()!;
+		if (child instanceof TFolder) {
+			pending.push(...child.children);
+			continue;
+		}
+		if (!child.path.startsWith(newPrefix)) continue;
+		const relative = child.path.substring(newPrefix.length);
+		const oldPath = relative ? `${oldRoot}/${relative}` : oldRoot;
+		const newExcluded = isExcluded(child.path);
+		const oldExcluded = isExcluded(oldPath);
+		if (newExcluded && oldExcluded) continue;
+		if (!newExcluded && !oldExcluded) {
+			localTracker.markRenamed(child.path, oldPath);
+		} else if (!newExcluded) {
+			localTracker.markDirty(child.path);
+		} else {
+			localTracker.markDirty(oldPath);
+		}
+		tracked = true;
+	}
+	return tracked;
+}
+
+export interface SyncOrchestrator {
+	runSync(): Promise<void>;
+	pullSingle(path: string): Promise<"untracked" | undefined>;
+	isSyncing(): boolean;
+}
+
+export interface SyncSchedulerDeps {
+	workspace: Workspace;
+	vault: Vault;
+	remoteFs: () => IFileSystem | null;
+	localTracker: LocalChangeTracker;
+	orchestrator: SyncOrchestrator;
+	isExcluded: (path: string) => boolean;
+	registerEvent: (ref: EventRef) => void;
+	registerWindowEvent: (type: keyof WindowEventMap, cb: () => void) => void;
+	registerDocumentEvent: (type: keyof DocumentEventMap, cb: () => void) => void;
+}
+
+export class SyncScheduler {
+	private deps: SyncSchedulerDeps;
+	private debouncedSync: ReturnType<typeof debounce>;
+	private destroyed = false;
+	/**
+	 * Whether the app has left the foreground since it was last in sync. A
+	 * foreground signal (focus / visibilitychange→visible) re-checks the remote
+	 * only when this is true — a genuine background→foreground (mobile) or
+	 * app-switch (desktop/tablet) return. It starts false: at cold start the
+	 * onLayoutReady catch-up sync already covers the initial foreground, so the
+	 * trailing foreground signal — the deferred-to-first-touch `focus` on mobile —
+	 * is NOT a return and must not fire a second, redundant sync. See ADR 0007.
+	 */
+	private departed = false;
+
+	constructor(deps: SyncSchedulerDeps) {
+		this.deps = deps;
+		this.debouncedSync = debounce(
+			() => {
+				if (!this.deps.remoteFs()) return;
+				void deps.orchestrator.runSync();
+			},
+			DEBOUNCE_MS,
+			true,
+		);
+	}
+
+	start(): void {
+		if (this.deps.workspace.layoutReady) {
+			this.wireAll();
+		} else {
+			// Defer event wiring until the vault index is loaded, so an early
+			// focus/visibility/online/vault event cannot trigger a sync against
+			// an incomplete local listing (getAllLoadedFiles under-reports).
+			this.deps.workspace.onLayoutReady(() => this.wireAll());
+		}
+	}
+
+	private wireAll(): void {
+		// onLayoutReady may fire after the plugin unloads; do not wire then.
+		if (this.destroyed) return;
+		this.wireVaultEvents();
+		this.wireOnlineEvent();
+		this.wireVisibilityEvent();
+		this.wireFocusEvent();
+		this.wireDepartureEvents();
+		this.wireFileOpenEvent();
+	}
+
+	destroy(): void {
+		this.destroyed = true;
+		this.debouncedSync.cancel();
+	}
+
+	/**
+	 * The NETWORK signal path (online): re-check now, unless no backend or a sync
+	 * is already running. The `isSyncing()` guard discards the request while a
+	 * sync is in flight — the in-flight cycle already performs the full re-scan a
+	 * signal asks for. It is load-bearing, NOT redundant with runSync's own lock
+	 * check: runSync's check sets `syncPending` (a re-run), this one suppresses it
+	 * for signals (ADR 0004). Foreground signals use triggerForegroundSync instead.
+	 */
+	private triggerSync(): void {
+		if (!this.deps.remoteFs()) return;
+		if (this.deps.orchestrator.isSyncing()) return;
+		void this.deps.orchestrator.runSync();
+	}
+
+	/**
+	 * The FOREGROUND signal path (focus / visibilitychange→visible). Re-checks the
+	 * remote only on a genuine return — after the app actually left the foreground
+	 * (`departed`). This drops the redundant cold-start signal (no departure since
+	 * the onLayoutReady catch-up sync) while still syncing every real resume, with
+	 * no timing window. If a sync is already in flight, return WITHOUT clearing
+	 * `departed`: that cycle may predate the departure, so a later signal must
+	 * still re-check — never miss a return (ADR 0007). The `departed` flag is
+	 * cleared only here, when we actually run the resume sync.
+	 */
+	private triggerForegroundSync(): void {
+		if (!this.deps.remoteFs()) return;
+		if (this.deps.orchestrator.isSyncing()) return;
+		if (!this.departed) return;
+		this.departed = false;
+		void this.deps.orchestrator.runSync();
+	}
+
+	// `focus` and `visibilitychange→visible` are BOTH wired on every platform —
+	// not redundant. `focus` is the only return signal for a desktop alt-tab AND
+	// a tablet split-view / Stage Manager app-switch: both keep the document
+	// `visible`, so visibilitychange never fires there. On a phone background,
+	// window focus is unreliable, so visibilitychange→visible is the dependable
+	// return signal. Each covers a case the other misses across iOS/Android/
+	// desktop, so neither can be dropped or platform-gated without losing a
+	// resume somewhere. The cost — a real resume firing both — is absorbed by
+	// triggerForegroundSync: the first clears `departed`, so the second is a
+	// no-op (and a sync in flight blocks both via isSyncing). See ADR 0007.
+	private wireFocusEvent(): void {
+		this.deps.registerWindowEvent("focus", () => this.triggerForegroundSync());
+	}
+
+	private wireVaultEvents(): void {
+		const { vault, localTracker, isExcluded } = this.deps;
+
+		const onVaultChange = (file: TAbstractFile) => {
+			if (!isExcluded(file.path)) {
+				localTracker.markDirty(file.path);
+				this.debouncedSync();
+			}
+		};
+
+		const onRename = (file: TAbstractFile, oldPath: string) => {
+			const newExcluded = isExcluded(file.path);
+			const oldExcluded = isExcluded(oldPath);
+			let tracked = false;
+			if (file instanceof TFolder) {
+				if (!newExcluded && !oldExcluded) {
+					localTracker.markFolderRenamed(file.path, oldPath);
+					tracked = true;
+				} else {
+					// A cross-scope folder edge must not carry an excluded root into the
+					// sync engine. Expand it at this boundary and retain only included
+					// file endpoints; excluded descendants disappear completely.
+					tracked = trackScopedFolderRename(file, oldPath, isExcluded, localTracker);
+				}
+			} else if (!newExcluded && !oldExcluded) {
+				localTracker.markRenamed(file.path, oldPath);
+				tracked = true;
+			} else if (!newExcluded) {
+				localTracker.markDirty(file.path);
+				tracked = true;
+			} else if (!oldExcluded) {
+				localTracker.markDirty(oldPath);
+				tracked = true;
+			}
+			if (tracked) this.debouncedSync();
+		};
+
+		this.deps.registerEvent(vault.on("create", onVaultChange));
+		this.deps.registerEvent(vault.on("modify", onVaultChange));
+		this.deps.registerEvent(vault.on("delete", onVaultChange));
+		this.deps.registerEvent(vault.on("rename", onRename));
+	}
+
+	private wireOnlineEvent(): void {
+		this.deps.registerWindowEvent("online", () => this.triggerSync());
+	}
+
+	// Paired with wireFocusEvent above (see that comment for why both exist).
+	private wireVisibilityEvent(): void {
+		this.deps.registerDocumentEvent("visibilitychange", () => {
+			// App-level visibility: read the main document (matching the focus/
+			// online listeners), not activeDocument — we want "Obsidian is
+			// foreground", not whichever popout happens to be focused.
+			if (document.visibilityState === "visible") {
+				this.triggerForegroundSync();
+			} else {
+				// Backgrounding (phone/tablet) is a departure — the next foreground
+				// signal is then a genuine return that should re-check.
+				this.departed = true;
+			}
+		});
+	}
+
+	// Departure boundary, OR'd with visibilitychange→hidden so a genuine return is
+	// never missed (a spurious departure only costs one extra re-check, never a
+	// stale miss). `blur` is the ONLY departure signal for a desktop alt-tab AND a
+	// tablet split-view / Stage Manager app-switch: both keep the document
+	// `visible`, so visibilitychange→hidden never fires there. Window-level blur
+	// fires on app focus loss — not on element focus or the soft keyboard — so it
+	// does not mark spurious departures during normal editing. (Focusing an
+	// Obsidian popout window does blur the main window → one harmless extra
+	// re-check on return; not worth distinguishing.) See ADR 0007.
+	private wireDepartureEvents(): void {
+		this.deps.registerWindowEvent("blur", () => {
+			this.departed = true;
+		});
+	}
+
+	private wireFileOpenEvent(): void {
+		const { workspace, orchestrator } = this.deps;
+
+		this.deps.registerEvent(
+			workspace.on("file-open", async (file: TFile | null) => {
+				if (!file) return;
+				const outcome = await orchestrator.pullSingle(file.path);
+				if (outcome === "untracked" && !this.destroyed) this.debouncedSync();
+			}),
+		);
+	}
+}

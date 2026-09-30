@@ -1,0 +1,337 @@
+import { Notice, Platform, Plugin, setIcon, setTooltip } from "./platform/obsidian";
+import { DEFAULT_SETTINGS, AirSyncSettings } from "./settings";
+import { liftActiveBackendData, normalizeBackendModuleSettings, normalizeConflictStrategy } from "./settings-normalize";
+import { getEffectiveSyncDotPaths } from "./config-sync";
+import { AirSyncSettingTab } from "./ui/settings";
+import { LocalFs } from "./fs/local/index";
+import { BackendManager } from "./fs/backend-manager";
+import { errorMessage } from "./backend-api";
+import { formatSyncAbortNotice } from "./sync/failure-notice";
+import { initRegistry } from "./fs/registry";
+import { CANONICAL_BACKEND_IDS, LEGACY_BACKEND_ALIASES } from "./fs/modules/validate-module";
+import { createChecksumRegistry } from "./fs/modules/checksum-registry";
+import type { ISecretStore } from "./fs/secret-store";
+import type { SyncStatus } from "./sync/orchestrator";
+import { SyncOrchestrator } from "./sync/orchestrator";
+import { SyncScheduler } from "./sync/scheduler";
+import { ScreenWakeLockManager } from "./sync/wake-lock";
+import { LocalChangeTracker } from "./sync/local-tracker";
+import { Logger, getDeviceName } from "./logging/logger";
+import { ConflictHistory } from "./sync/conflict-history";
+import { handleOAuthProtocolCallback } from "./fs/oauth-callback-error";
+
+export default class AirSyncPlugin extends Plugin {
+	settings!: AirSyncSettings;
+	private localFs: LocalFs | null = null;
+	backendManager!: BackendManager;
+	private statusBarEl: HTMLElement | null = null;
+	private syncStatus: SyncStatus = "not_connected";
+	private orchestrator!: SyncOrchestrator;
+	private scheduler!: SyncScheduler;
+	private wakeLock!: ScreenWakeLockManager;
+	private localTracker!: LocalChangeTracker;
+	private settingTab: AirSyncSettingTab | null = null;
+	/** The single checksum resolver shared by every stage of the sync pipeline. */
+	private readonly checksumRegistry = createChecksumRegistry();
+	private logger!: Logger;
+	private conflictHistory!: ConflictHistory;
+
+	async onload() {
+		const secretStore: ISecretStore = {
+			getSecret: (key) => this.app.secretStorage.getSecret(key),
+			setSecret: (key, value) => { this.app.secretStorage.setSecret(key, value); },
+		};
+
+		await this.loadSettings();
+
+		this.localFs = new LocalFs(this.app, () =>
+			getEffectiveSyncDotPaths(this.settings, this.app.vault.configDir)
+		);
+
+		const deviceName = getDeviceName(Platform.isMobile, this.settings.vaultId);
+		// vault.adapter is a structural superset of RawFsAdapter — no cast needed.
+		this.logger = new Logger(
+			this.app.vault.adapter,
+			() => this.settings,
+			deviceName,
+		);
+		this.logger.info("Plugin loaded", { deviceName, vaultId: this.settings.vaultId });
+
+		// Validate + register the built-in modules and build their production
+		// providers. Needs the logger (module log attribution) and settings.
+		initRegistry(secretStore, {
+			getSettings: () => this.settings,
+			saveSettings: () => this.saveSettings(),
+			getApp: () => this.app,
+			getLogger: () => this.logger,
+			getVaultName: () => this.app.vault.getName(),
+			platform: {
+				mobile: Platform.isMobile,
+			},
+			sink: (level, message, moduleId) => {
+				this.logger[level](message, { backend: moduleId });
+			},
+		});
+
+		// Conflict-resolution audit history, written via the same raw adapter + device
+		// name as the logger (it persists to .airsync/conflicts/<device>.json).
+		this.conflictHistory = new ConflictHistory(this.logger.adapter, this.logger.sanitizedDeviceName);
+
+		this.backendManager = new BackendManager({
+			getSettings: () => this.settings,
+			saveSettings: () => this.saveSettings(),
+			getApp: () => this.app,
+			getLogger: () => this.logger,
+			getVaultName: () => this.app.vault.getName(),
+			onConnected: () => {
+				this.syncStatus = "idle";
+				this.updateStatusBar();
+			},
+			onDisconnected: () => {
+				this.syncStatus = "not_connected";
+				this.updateStatusBar();
+			},
+			// A remote target was just bound mid-session — run the first sync now so
+			// files start transferring without waiting for an incidental
+			// foreground/vault/online event (issue #33). Routed through runSync (the
+			// wrapper), NOT orchestrator.runSync: the wrapper's try/catch resolves a
+			// failed first sync to a terminal "error" status, so the status bar never
+			// sticks at "Syncing…". Keep this pointed at runSync for that guarantee.
+			onRemoteBound: () => {
+				void this.runSync();
+			},
+			clearSyncBaseline: async () => {
+				await this.orchestrator?.clearSyncState();
+			},
+			notify: (message) => {
+				new Notice(message);
+			},
+			refreshSettingsDisplay: () => {
+				// Re-render the settings tab in place. renderContent() is the
+				// imperative renderer; we call it directly rather than the deprecated
+				// display() so this stays version-agnostic.
+				this.settingTab?.renderContent();
+			},
+		});
+
+		this.localTracker = new LocalChangeTracker();
+
+		this.wakeLock = new ScreenWakeLockManager({
+			isEnabled: () => Platform.isMobile && this.settings.screenWakeLockOnSync,
+			register: (cb) => this.register(cb),
+			registerDocumentEvent: (type, cb) => this.registerDomEvent(document, type, cb),
+			logger: this.logger,
+		});
+
+		this.orchestrator = new SyncOrchestrator({
+			getSettings: () => this.settings,
+			saveSettings: () => this.saveSettings(),
+			configDir: () => this.app.vault.configDir,
+			pluginId: () => this.manifest.id,
+			localFs: () => this.localFs,
+			remoteFs: () => this.backendManager.getRemoteFs(),
+			backendProvider: () => this.backendManager.getBackendProvider(),
+			checksumRegistry: this.checksumRegistry,
+			isMobile: () => Platform.isMobile,
+			onStatusChange: (status) => {
+				this.syncStatus = status;
+				this.updateStatusBar();
+				this.wakeLock.setActive(status === "syncing");
+			},
+			onProgress: (text) => {
+				this.statusBarEl?.setText(text);
+			},
+			notify: (message, durationMs) => {
+				new Notice(message, durationMs);
+			},
+			localTracker: this.localTracker,
+			logger: this.logger,
+			isBackendConnecting: () => this.backendManager.isConnecting(),
+			isLayoutReady: () => this.app.workspace.layoutReady,
+			recordConflicts: (records) => this.conflictHistory.append(records),
+		});
+
+		this.scheduler = new SyncScheduler({
+			workspace: this.app.workspace,
+			vault: this.app.vault,
+			remoteFs: () => this.backendManager.getRemoteFs(),
+			localTracker: this.localTracker,
+			orchestrator: this.orchestrator,
+			isExcluded: (path) => this.orchestrator.isExcluded(path),
+			registerEvent: (ref) => this.registerEvent(ref),
+			registerWindowEvent: (type, cb) => this.registerDomEvent(window, type, cb),
+			registerDocumentEvent: (type, cb) => this.registerDomEvent(document, type, cb),
+		});
+
+		this.settingTab = new AirSyncSettingTab(this.app, this);
+		this.addSettingTab(this.settingTab);
+
+		// OAuth callback via obsidian://air-sync-auth?access_token=...&state=... or ?code=...&state=...
+		// Google's top-level Picker also returns picked_file_ids on this callback.
+		this.registerObsidianProtocolHandler("air-sync-auth", (params) => {
+			const pendingState = this.settings.backendData.pendingAuthState;
+			handleOAuthProtocolCallback(params, pendingState, {
+				notify: (message) => { new Notice(message); },
+				completeConnect: (url) => { void this.backendManager.completeBackendConnect(url); },
+				completeFolderPick: (url, callbackParams) => {
+					void this.backendManager.completeBackendAuthFolderPick(url, callbackParams);
+				},
+			});
+		});
+
+		// Web folder-picker result via obsidian://air-sync-folder. Backend-agnostic:
+		// BackendManager routes to the active backend's completeWebFolderPick. Kept
+		// separate from auth — distinct payload, no sniffing dispatch needed.
+		this.registerObsidianProtocolHandler("air-sync-folder", (params) => {
+			void this.backendManager.completeBackendFolderPick(params);
+		});
+
+		// Initialize backend if configured
+		await this.backendManager.initBackend();
+
+		// Commands
+		this.addCommand({
+			id: "sync-now",
+			name: "Sync now",
+			callback: () => {
+				void this.runSync();
+			},
+		});
+
+		// Status bar: a clickable cloud icon triggers a manual sync, with the
+		// sync status shown as text beside it.
+		const syncTriggerEl = this.addStatusBarItem();
+		syncTriggerEl.addClass("mod-clickable");
+		setIcon(syncTriggerEl, "cloud");
+		// `top` so the tooltip clears the status bar at the bottom edge.
+		setTooltip(syncTriggerEl, "Sync now", { placement: "top" });
+		this.registerDomEvent(syncTriggerEl, "click", () => {
+			void this.runSync();
+		});
+
+		this.statusBarEl = this.addStatusBarItem();
+		this.updateStatusBar();
+
+		this.scheduler.start();
+
+		// Run one sync once the vault index is loaded. The scheduler defers its
+		// event wiring until then, and runSync() is gated on layoutReady, so this
+		// is the first sync of the session ("caught up on open").
+		this.app.workspace.onLayoutReady(() => void this.runSync());
+	}
+
+	onunload() {
+		void this.logger.flush();
+		this.backendManager.close();
+		this.scheduler.destroy();
+		this.orchestrator.close().catch((e) => {
+			this.logger.error("Failed to close orchestrator", { message: errorMessage(e) });
+		});
+	}
+
+	async loadSettings() {
+		this.settings = Object.assign(
+			{},
+			DEFAULT_SETTINGS,
+			(await this.loadData()) as Partial<AirSyncSettings>,
+		);
+
+		let needsSave = false;
+
+		// Normalize a legacy per-type backendData map to the single active-backend bag.
+		// The legacy six backend types are the only keys the old nested shape used, so
+		// they are the discriminator; the module registry is not built until later.
+		const legacyTypes = [...CANONICAL_BACKEND_IDS, ...Object.keys(LEGACY_BACKEND_ALIASES)];
+		if (liftActiveBackendData(this.settings, legacyTypes)) {
+			needsSave = true;
+		}
+
+		// Canonicalize a legacy `*-custom` selection onto its module id + authMode.
+		if (normalizeBackendModuleSettings(this.settings)) {
+			needsSave = true;
+		}
+
+		// Coerce a removed conflictStrategy (e.g. the retired "ask") to a valid one.
+		if (normalizeConflictStrategy(this.settings)) {
+			needsSave = true;
+		}
+
+		// Generate a stable vault ID on first load
+		if (!this.settings.vaultId) {
+			this.settings.vaultId = crypto.randomUUID();
+			needsSave = true;
+		}
+
+		if (needsSave) {
+			await this.saveData(this.settings);
+		}
+	}
+
+	async saveSettings() {
+		await this.saveData(this.settings);
+	}
+
+	async runSync(): Promise<void> {
+		if (this.orchestrator.isSyncing()) return;
+		try {
+			if (!this.localFs || !this.backendManager.getRemoteFs()) {
+				await this.backendManager.initBackend();
+				if (!this.localFs || !this.backendManager.getRemoteFs()) {
+					this.syncStatus = "not_connected";
+					this.updateStatusBar();
+					new Notice("Not connected to a remote backend");
+					return;
+				}
+			}
+			await this.orchestrator.runSync();
+		} catch (err) {
+			const msg = errorMessage(err);
+			this.syncStatus = "error";
+			this.updateStatusBar();
+			// A sync failure reports itself in the same structured clause as every other
+			// failure notice; the notice stays ungated so an abort is never hidden.
+			const provider = this.backendManager.getBackendProvider();
+			const classify = provider?.classifyError?.bind(provider);
+			new Notice(formatSyncAbortNotice(err, classify));
+			this.logger.error("Unhandled sync error", { error: msg });
+		}
+	}
+
+	/**
+	 * Discard the remote sync checkpoint and run a full reconcile. The next sync
+	 * sees no checkpoint (hasCheckpoint === false) and does a cold remote list ×
+	 * baseline join, recovering anything a previous interrupted sync left behind.
+	 *
+	 * Routes through the orchestrator (not runSync's is-syncing early-return) so
+	 * that, if a sync is already in flight, the request coalesces via syncPending
+	 * and a cold cycle still runs once the current one finishes — rather than
+	 * being silently dropped while the in-flight sync re-commits a checkpoint.
+	 */
+	async rescan(): Promise<void> {
+		// Discard the committed checkpoint (delta cursor + cache) and run a cold
+		// reconcile. The orchestrator performs the reset inside its sync mutex so it
+		// can't race an in-flight sync that holds the live FS cache (ADR 0001).
+		await this.orchestrator.rescan();
+	}
+
+	private updateStatusBar(): void {
+		if (!this.statusBarEl) return;
+		switch (this.syncStatus) {
+			case "idle":
+				this.statusBarEl.setText("Synced");
+				break;
+			case "syncing":
+				this.statusBarEl.setText("Syncing...");
+				break;
+			case "error":
+				this.statusBarEl.setText("Sync error");
+				break;
+			case "partial_error":
+				this.statusBarEl.setText("Synced (with errors)");
+				break;
+			case "not_connected":
+				this.statusBarEl.setText("Not connected");
+				break;
+		}
+	}
+}

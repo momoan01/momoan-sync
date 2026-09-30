@@ -1,0 +1,542 @@
+// Minimal mock of obsidian module for testing
+
+export function debounce<T extends (...args: unknown[]) => unknown>(
+	fn: T,
+	ms: number,
+	resetTimer = true,
+): T & { cancel: () => void } {
+	let timer: ReturnType<typeof setTimeout> | null = null;
+	const debounced = (...args: unknown[]) => {
+		if (resetTimer && timer) clearTimeout(timer);
+		if (resetTimer || !timer) {
+			timer = setTimeout(() => {
+				timer = null;
+				fn(...args);
+			}, ms);
+		}
+	};
+	debounced.cancel = () => {
+		if (timer) clearTimeout(timer);
+		timer = null;
+	};
+	return debounced as unknown as T & { cancel: () => void };
+}
+
+export const requestUrl = (_opts: unknown): Promise<unknown> => {
+	// Returns a REJECTED promise (not a synchronous throw) to match the real
+	// requestUrl contract — tests replace this via spyRequestUrl() before use.
+	return Promise.reject(new Error("requestUrl not mocked for this test"));
+};
+
+export class Notice {
+	constructor(message: string, _timeout?: number) {
+		__ui.notices.push(message);
+	}
+}
+
+export class SecretComponent {
+	constructor(_app: unknown, _containerEl: HTMLElement) {}
+	setValue(_value: string): this { return this; }
+	onChange(_callback: (value: string) => unknown): this { return this; }
+	setPlaceholder(_value: string): this { return this; }
+	setDisabled(_disabled: boolean): this { return this; }
+}
+
+/**
+ * Test hooks for driving Modal/Setting interactions without a DOM. Populated as
+ * the UI renders; reset these between tests.
+ */
+export const __ui: {
+	buttons: { name: string; label: string; click: () => void }[];
+	dropdowns: {
+		name: string;
+		description: string;
+		options: Array<{ value: string; display: string }>;
+		value: string;
+		change: (value: string) => unknown;
+	}[];
+	texts: {
+		name: string;
+		description: string;
+		value: string;
+		change: (value: string) => unknown;
+	}[];
+	toggles: {
+		name: string;
+		description: string;
+		value: boolean;
+		change: (value: boolean) => unknown;
+	}[];
+	lastModal: { close: () => void } | null;
+	notices: string[];
+} = { buttons: [], dropdowns: [], texts: [], toggles: [], lastModal: null, notices: [] };
+
+/** Minimal stand-in for Obsidian's augmented HTMLElement (createEl/empty). */
+class FakeEl {
+	children: FakeEl[] = [];
+	empty(): void {
+		this.children = [];
+	}
+	addClass(_cls: string): FakeEl {
+		return this;
+	}
+	createEl(_tag: string, _opts?: { text?: string; cls?: string }): FakeEl {
+		const el = new FakeEl();
+		this.children.push(el);
+		return el;
+	}
+}
+
+export class Modal {
+	app: unknown;
+	private _contentEl = new FakeEl();
+	constructor(app: unknown) {
+		this.app = app;
+	}
+	open() {
+		// Each open starts from a clean button list, so __ui.buttons always
+		// reflects only the currently-open modal (no accumulation across opens).
+		__ui.buttons = [];
+		__ui.lastModal = this;
+		(this as unknown as { onOpen?: () => void }).onOpen?.();
+	}
+	close() {
+		(this as unknown as { onClose?: () => void }).onClose?.();
+	}
+	get contentEl(): HTMLElement {
+		return this._contentEl as unknown as HTMLElement;
+	}
+}
+
+export class Setting {
+	settingEl = new FakeEl() as unknown as HTMLElement;
+	private _name = "";
+	private _description = "";
+	constructor(_containerEl: HTMLElement) {}
+	setName(name: string) {
+		this._name = name;
+		return this;
+	}
+	setDesc(desc: string | DocumentFragment) {
+		this._description = typeof desc === "string" ? desc : "";
+		return this;
+	}
+	setHeading() {
+		return this;
+	}
+	addButton(cb: (b: unknown) => unknown) {
+		let handler: () => void = () => {};
+		let label = "";
+		const btn = {
+			setButtonText: (text: string) => {
+				label = text;
+				return btn;
+			},
+			setCta: () => btn,
+			onClick: (h: () => void) => {
+				handler = h;
+				return btn;
+			},
+		};
+		cb(btn);
+		__ui.buttons.push({ name: this._name, label, click: () => handler() });
+		return this;
+	}
+	addText(cb: (t: unknown) => unknown) {
+		let value = "";
+		let handler: (next: string) => unknown = () => {};
+		const text = {
+			setPlaceholder: (_placeholder: string) => text,
+			setValue: (next: string) => {
+				value = next;
+				return text;
+			},
+			setDisabled: (_disabled: boolean) => text,
+			onChange: (next: (value: string) => unknown) => {
+				handler = next;
+				return text;
+			},
+		};
+		cb(text);
+		__ui.texts.push({
+			name: this._name,
+			description: this._description,
+			get value() { return value; },
+			change: (next: string) => handler(next),
+		});
+		return this;
+	}
+	addDropdown(cb: (d: unknown) => unknown) {
+		const options: Array<{ value: string; display: string }> = [];
+		let value = "";
+		let handler: (next: string) => unknown = () => {};
+		const dropdown = {
+			addOption: (optionValue: string, display: string) => {
+				options.push({ value: optionValue, display });
+				return dropdown;
+			},
+			setValue: (next: string) => {
+				value = next;
+				return dropdown;
+			},
+			setDisabled: (_disabled: boolean) => dropdown,
+			onChange: (next: (selected: string) => unknown) => {
+				handler = next;
+				return dropdown;
+			},
+		};
+		cb(dropdown);
+		__ui.dropdowns.push({
+			name: this._name,
+			description: this._description,
+			options,
+			get value() { return value; },
+			change: (next: string) => handler(next),
+		});
+		return this;
+	}
+	addToggle(cb: (t: unknown) => unknown) {
+		let value = false;
+		let handler: (next: boolean) => unknown = () => {};
+		const toggle = {
+			setValue: (next: boolean) => {
+				value = next;
+				return toggle;
+			},
+			setDisabled: (_disabled: boolean) => toggle,
+			onChange: (next: (value: boolean) => unknown) => {
+				handler = next;
+				return toggle;
+			},
+		};
+		cb(toggle);
+		__ui.toggles.push({
+			name: this._name,
+			description: this._description,
+			get value() { return value; },
+			change: (next: boolean) => handler(next),
+		});
+		return this;
+	}
+	addTextArea(_cb: (t: unknown) => unknown) {
+		return this;
+	}
+	addComponent(cb: (el: HTMLElement) => unknown) {
+		cb(new FakeEl() as unknown as HTMLElement);
+		return this;
+	}
+}
+
+export function setIcon(_parent: HTMLElement, _iconId: string): void {}
+export function setTooltip(_parent: HTMLElement, _tooltip: string | DocumentFragment): void {}
+
+export const Platform = {
+	isMobile: false,
+	isDesktop: true,
+	isDesktopApp: true,
+	isMobileApp: false,
+};
+
+export class TFile {
+	path: string;
+	stat: { size: number; mtime: number };
+	constructor(path: string, size = 0, mtime = 0) {
+		this.path = path;
+		this.stat = { size, mtime };
+	}
+}
+
+export class TFolder {
+	path: string;
+	// Immediate children, populated by getAbstractFileByPath so tests inspecting the
+	// Vault index can walk a folder's children.
+	children: (TFile | TFolder)[] = [];
+	constructor(path: string) {
+		this.path = path;
+	}
+}
+
+/** In-memory Vault mock for unit tests */
+export class Vault {
+	private files = new Map<
+		string,
+		{ type: "file" | "folder"; content?: ArrayBuffer; mtime?: number }
+	>();
+	adapter = {
+		exists: (path: string): Promise<boolean> => {
+			return Promise.resolve(this.files.has(path));
+		},
+		stat: (
+			path: string,
+		): Promise<{
+			type: "file" | "folder";
+			size: number;
+			mtime: number;
+		} | null> => {
+			const entry = this.files.get(path);
+			if (!entry) return Promise.resolve(null);
+			return Promise.resolve({
+				type: entry.type,
+				size: entry.content?.byteLength ?? 0,
+				mtime: entry.mtime ?? 0,
+			});
+		},
+		readBinary: async (path: string): Promise<ArrayBuffer> => {
+			const entry = this.files.get(path);
+			if (!entry || entry.type !== "file")
+				throw new Error(`File not found: ${path}`);
+			// Detach a copy: a real adapter reads fresh bytes off disk, so a
+			// caller mutating the result must not corrupt stored content.
+			return await Promise.resolve(
+				(entry.content ?? new ArrayBuffer(0)).slice(0),
+			);
+		},
+		list: (
+			dir: string,
+		): Promise<{ files: string[]; folders: string[] }> => {
+			const files: string[] = [];
+			const folders: string[] = [];
+			const prefix = dir === "" ? "" : dir + "/";
+			for (const [p, entry] of this.files) {
+				if (
+					p.startsWith(prefix) &&
+					!p.substring(prefix.length).includes("/")
+				) {
+					if (entry.type === "folder") folders.push(p);
+					else files.push(p);
+				}
+			}
+			return Promise.resolve({ files, folders });
+		},
+		writeBinary: (
+			path: string,
+			data: ArrayBuffer,
+			options?: { mtime?: number },
+		): Promise<void> => {
+			// Copy on store: a real adapter persists its own bytes, so a later
+			// mutation of the caller's buffer must not change stored content.
+			this.files.set(path, {
+				type: "file",
+				content: data.slice(0),
+				mtime: options?.mtime,
+			});
+			return Promise.resolve();
+		},
+		remove: (path: string): Promise<void> => {
+			this.files.delete(path);
+			return Promise.resolve();
+		},
+		mkdir: (path: string): Promise<void> => {
+			this.files.set(path, { type: "folder" });
+			return Promise.resolve();
+		},
+		rmdir: (path: string, _recursive?: boolean): Promise<void> => {
+			const prefix = path + "/";
+			const toDelete: string[] = [];
+			for (const key of this.files.keys()) {
+				if (key === path || key.startsWith(prefix)) {
+					toDelete.push(key);
+				}
+			}
+			for (const key of toDelete) {
+				this.files.delete(key);
+			}
+			return Promise.resolve();
+		},
+	};
+
+	getName(): string {
+		return "test-vault";
+	}
+
+	getAbstractFileByPath(path: string): TFile | TFolder | null {
+		// Real Obsidian excludes dot-prefixed paths from the vault index
+		if (path.startsWith(".")) return null;
+		const entry = this.files.get(path);
+		if (!entry) return null;
+		if (entry.type === "folder") {
+			const folder = new TFolder(path);
+			folder.children = this.immediateChildren(path);
+			return folder;
+		}
+		const f = new TFile(
+			path,
+			entry.content?.byteLength ?? 0,
+			entry.mtime ?? 0,
+		);
+		return f;
+	}
+
+	/**
+	 * Immediate (one-level) children of a folder as index-visible TFile/TFolder,
+	 * so `folder.children` mirrors the real Vault. Hidden paths stay excluded,
+	 * matching getAbstractFileByPath / getAllLoadedFiles.
+	 */
+	private immediateChildren(dir: string): (TFile | TFolder)[] {
+		const prefix = dir + "/";
+		const children: (TFile | TFolder)[] = [];
+		for (const [p, entry] of this.files) {
+			if (p.startsWith(".") || !p.startsWith(prefix)) continue;
+			// Keys are normalized (no trailing slash), so rest is never "" here;
+			// a "/" in it means a deeper descendant, not an immediate child.
+			if (p.substring(prefix.length).includes("/")) continue;
+			children.push(
+				entry.type === "folder"
+					? new TFolder(p)
+					: new TFile(
+							p,
+							entry.content?.byteLength ?? 0,
+							entry.mtime ?? 0,
+						),
+			);
+		}
+		return children;
+	}
+
+	async createFolder(path: string): Promise<TFolder> {
+		if (this.files.has(path)) {
+			throw new Error("Folder already exists.");
+		}
+		this.files.set(path, { type: "folder" });
+		// Stays async so the already-exists throw rejects.
+		return await Promise.resolve(new TFolder(path));
+	}
+
+	async readBinary(file: TFile): Promise<ArrayBuffer> {
+		const entry = this.files.get(file.path);
+		if (!entry || entry.type !== "file")
+			throw new Error(`File not found: ${file.path}`);
+		// Detach a copy each read, as a real Vault would (fresh bytes off disk).
+		return await Promise.resolve((entry.content ?? new ArrayBuffer(0)).slice(0));
+	}
+
+	createBinary(
+		path: string,
+		content: ArrayBuffer,
+		options?: { mtime?: number },
+	): Promise<TFile> {
+		// Copy on store so a later mutation of the caller's buffer can't change it.
+		this.files.set(path, {
+			type: "file",
+			content: content.slice(0),
+			mtime: options?.mtime,
+		});
+		return Promise.resolve(
+			new TFile(path, content.byteLength, options?.mtime ?? 0),
+		);
+	}
+
+	async modifyBinary(
+		file: TFile,
+		content: ArrayBuffer,
+		options?: { mtime?: number },
+	): Promise<void> {
+		const entry = this.files.get(file.path);
+		if (!entry || entry.type !== "file")
+			throw new Error(`File not found: ${file.path}`);
+		entry.content = content.slice(0); // copy on store (see createBinary)
+		if (options?.mtime !== undefined) entry.mtime = options.mtime;
+		// Real Obsidian mutates the live TFile's stat in place, so a caller holding
+		// the TFile (e.g. LocalFs.write's overwrite branch) reads the post-write
+		// size/mtime. Mirror that so the returned FileEntity isn't stale.
+		file.stat.size = content.byteLength;
+		if (options?.mtime !== undefined) file.stat.mtime = options.mtime;
+		// Stays async so the not-found throw rejects.
+		await Promise.resolve();
+	}
+
+	getAllLoadedFiles(): (TFile | TFolder)[] {
+		const result: (TFile | TFolder)[] = [];
+		for (const [path, entry] of this.files) {
+			// Real Obsidian excludes dot-prefixed paths from the vault index
+			if (path.startsWith(".")) continue;
+			if (entry.type === "folder") {
+				result.push(new TFolder(path));
+			} else {
+				result.push(
+					new TFile(
+						path,
+						entry.content?.byteLength ?? 0,
+						entry.mtime ?? 0,
+					),
+				);
+			}
+		}
+		return result;
+	}
+
+	async rename(file: TFile | TFolder, newPath: string): Promise<void> {
+		const oldPath = file.path;
+		const entry = this.files.get(oldPath);
+		if (!entry) throw new Error(`File not found: ${oldPath}`);
+		this.files.delete(oldPath);
+		this.files.set(newPath, entry);
+		// Folder rename: move every descendant so child paths stay coherent,
+		// exactly as the real Vault does (the single-entry move alone would orphan
+		// children and break LocalFs's folder-rename path).
+		const prefix = oldPath + "/";
+		for (const [p, e] of [...this.files]) {
+			if (p.startsWith(prefix)) {
+				this.files.delete(p);
+				this.files.set(newPath + "/" + p.substring(prefix.length), e);
+			}
+		}
+		// Stays async so the not-found throw rejects.
+		await Promise.resolve();
+	}
+}
+
+export class Workspace {
+	layoutReady = true;
+
+	onLayoutReady(cb: () => void): void {
+		if (this.layoutReady) cb();
+	}
+}
+
+export class App {
+	vault: Vault;
+	workspace: Workspace;
+	fileManager = {
+		// Real trashFile removes the file/folder from the vault. The previous no-op
+		// left deletions invisible to the index; route through the adapter so a
+		// LocalFs.delete actually drops the path (files via remove, folders
+		// recursively via rmdir). `this.vault` is set by the time this is called.
+		trashFile: async (file: TFile | TFolder) => {
+			if (file instanceof TFolder) {
+				await this.vault.adapter.rmdir(file.path, true);
+			} else {
+				await this.vault.adapter.remove(file.path);
+			}
+		},
+	};
+	constructor() {
+		this.vault = new Vault();
+		this.workspace = new Workspace();
+	}
+}
+
+export class PluginSettingTab {
+	app: unknown;
+	constructor(app: unknown, _plugin: unknown) {
+		this.app = app;
+	}
+	display() {}
+	get containerEl(): HTMLElement {
+		return document.createElement("div");
+	}
+}
+
+export class Plugin {
+	app = new App();
+	manifest = { id: "air-sync" };
+	loadData(): Promise<unknown> { return Promise.resolve({}); }
+	saveData(_data: unknown): Promise<void> { return Promise.resolve(); }
+	register(_callback: () => unknown): void {}
+	registerEvent(_ref: unknown): void {}
+	registerDomEvent(_el: unknown, _type: string, _callback: (event: unknown) => unknown): void {}
+	registerObsidianProtocolHandler(_action: string, _callback: (params: Record<string, string>) => unknown): void {}
+	addCommand(_command: unknown): void {}
+	addStatusBarItem(): HTMLElement { return new FakeEl() as unknown as HTMLElement; }
+	addSettingTab(_tab: unknown): void {}
+}

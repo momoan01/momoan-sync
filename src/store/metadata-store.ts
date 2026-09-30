@@ -1,0 +1,127 @@
+import { IDBHelper, sanitizeDbName } from "./idb-helper";
+import type { PathAuthority } from "../fs/types";
+
+const FILES_STORE = "files";
+const META_STORE = "meta";
+
+/**
+ * Bump whenever persisted file-record semantics require a cold cache rebuild.
+ *
+ * v5: a folder path can be made of several provider folders, carried as `merged`.
+ * A checkpoint written before that kept one of them and silently dropped the rest,
+ * with their contents; restoring it would leave those objects invisible for as long
+ * as the checkpoint stood, so it is rebuilt from a full scan instead.
+ *
+ * v6: the persisted record is the normalized `RemoteObject`; a cache written in an
+ * earlier (provider-native) encoding is invalid, so the store is dropped and
+ * recreated on open (no migration) — old records AND the old cursor disappear.
+ *
+ * v7: `RemoteObject.versionToken` became the provider's monotonic version
+ * (`googledrive:v:<version>`) for files AND directories; a v6 cache holds the old
+ * `googledrive:md5:<md5>:<size>` token, so every existing-file update compared a
+ * stale token against a fresh observation and failed closed as `target_changed`.
+ * A derived cache cannot be re-interpreted in place, so it is rebuilt by a full
+ * scan instead.
+ */
+export const METADATA_CACHE_VERSION = 7;
+
+export interface FileRecord<T> {
+	path: string;
+	file: T;
+	isFolder: boolean;
+	pathAuthority?: PathAuthority;
+	/** The other provider folders merged at this folder path, beside `file`. */
+	merged?: T[];
+}
+
+export interface MetadataStoreConfig {
+	dbNamePrefix: string;
+	version: number;
+}
+
+/** Persistent IndexedDB store for backend file metadata cache */
+export class MetadataStore<T> {
+	private helper: IDBHelper;
+
+	constructor(vaultId: string, config: MetadataStoreConfig) {
+		this.helper = new IDBHelper({
+			dbName: `${config.dbNamePrefix}-${sanitizeDbName(vaultId)}`,
+			version: config.version,
+			onUpgrade: (db, oldVersion) => {
+				// Cold start: on any schema version change, drop all stores and
+				// recreate. The cache is non-authoritative and fully re-derivable by a
+				// fullScan, so we never migrate it (matches SyncStateStore / CLAUDE.md).
+				if (oldVersion > 0) {
+					for (const name of Array.from(db.objectStoreNames)) {
+						db.deleteObjectStore(name);
+					}
+				}
+				if (!db.objectStoreNames.contains(FILES_STORE)) {
+					db.createObjectStore(FILES_STORE, { keyPath: "path" });
+				}
+				if (!db.objectStoreNames.contains(META_STORE)) {
+					db.createObjectStore(META_STORE, { keyPath: "key" });
+				}
+			},
+		});
+	}
+
+	async open(): Promise<void> {
+		await this.helper.open();
+	}
+
+	async close(): Promise<void> {
+		await this.helper.close();
+	}
+
+	/** Load all file records and meta entries */
+	async loadAll(): Promise<{ files: FileRecord<T>[]; meta: Map<string, string> }> {
+		return this.helper.runTransaction([FILES_STORE, META_STORE], "readonly", (tx) => {
+			const filesReq = tx.objectStore(FILES_STORE).getAll();
+			const metaReq = tx.objectStore(META_STORE).getAll();
+			return () => {
+				const files = filesReq.result as FileRecord<T>[];
+				const metaEntries = metaReq.result as { key: string; value: string }[];
+				const meta = new Map<string, string>();
+				for (const entry of metaEntries) {
+					meta.set(entry.key, entry.value);
+				}
+				return { files, meta };
+			};
+		});
+	}
+
+	/** Clear and bulk-write all records + meta (used after fullScan) */
+	async saveAll(files: FileRecord<T>[], meta: Map<string, string>): Promise<void> {
+		await this.helper.runTransaction([FILES_STORE, META_STORE], "readwrite", (tx) => {
+			const filesStore = tx.objectStore(FILES_STORE);
+			const metaStore = tx.objectStore(META_STORE);
+			filesStore.clear();
+			metaStore.clear();
+			for (const record of files) {
+				filesStore.put(record);
+			}
+			for (const [key, value] of meta) {
+				metaStore.put({ key, value });
+			}
+			return () => {};
+		});
+	}
+
+	/** Read a single meta value, or undefined if absent. */
+	async getMeta(key: string): Promise<string | undefined> {
+		return this.helper.runTransaction(META_STORE, "readonly", (tx) => {
+			const req = tx.objectStore(META_STORE).get(key);
+			return () => (req.result as { key: string; value: string } | undefined)?.value;
+		});
+	}
+
+	/** Clear all stores */
+	async clear(): Promise<void> {
+		await this.helper.runTransaction([FILES_STORE, META_STORE], "readwrite", (tx) => {
+			tx.objectStore(FILES_STORE).clear();
+			tx.objectStore(META_STORE).clear();
+			return () => {};
+		});
+	}
+}

@@ -1,0 +1,546 @@
+import tseslint from 'typescript-eslint';
+import obsidianmd from "eslint-plugin-obsidianmd";
+import globals from "globals";
+import { defineConfig, globalIgnores } from "eslint/config";
+
+const configRoot = decodeURIComponent(new URL(".", import.meta.url).pathname);
+
+// ---------------------------------------------------------------------------
+// Design-principle guards (see ARCHITECTURE.md "Design principles").
+//
+// These encode the architecture as lint rules so violations fail CI instead of
+// relying on review. Each restriction names the principle it enforces.
+//
+// flat-config note: rule options REPLACE (not merge) across config blocks, so
+// the more-specific blocks below re-declare the shared restrictions (AXIOS,
+// NODE_API, …) rather than expecting them to accumulate.
+// ---------------------------------------------------------------------------
+
+/** Bundled-only: axios is not bundled — use Obsidian's requestUrl(). */
+const AXIOS_IMPORT = {
+	name: "axios",
+	message: "Use Obsidian's requestUrl() — axios is not bundled into main.js.",
+};
+
+// `patterns[].regex` is tested against the literal import specifier, anchored as
+// written — unlike `group`, which uses gitignore semantics and would mis-match a
+// relative path like "../fs/types" on its "fs" segment.
+
+/** Mobile compatibility (isDesktopOnly: false): no Node/Electron APIs. */
+const NODE_API_IMPORTS = {
+	regex: "^(node:)?(fs|path|os|child_process|crypto|util|stream|electron)(/.*)?$",
+	message:
+		"Node/Electron APIs break mobile compatibility (isDesktopOnly: false). Use the Obsidian Vault API or browser globals instead.",
+};
+
+/** Principle #2 (swappable backends): backend-specific code stays inside fs/. */
+const BACKEND_SPECIFIC_IMPORTS = {
+	regex: "(^|/)googledrive(/|$)",
+	message:
+		"Design principle #2 (swappable backends): import backend-specific modules only via fs/registry.ts. Keep sync/, main.ts, store/, queue/, utils/ backend-agnostic.",
+};
+
+/** Principle #4 (pipeline as data): pure transforms must not touch I/O. */
+const FS_INTERFACE_IMPORT = {
+	regex: "(^|/)fs/interface$",
+	message:
+		"Design principle #4 (pipeline as data): pure transform modules must not depend on IFileSystem. Operate on the FileEntity/SyncRecord data passed in.",
+};
+
+/** Sync tests must select a filesystem role, not hand-author stronger path evidence. */
+const RAW_SYNC_MOCK_FS_IMPORT = {
+	name: "../__mocks__/sync-test-helpers",
+	importNames: ["createMockFs"],
+	message:
+		"Use createMockLocalFs() or createMockRemoteFs() so mutation path authority matches the producer role. The raw constructor is reserved for mock contract tests.",
+};
+
+/**
+ * The pure transform stages of the sync pipeline. Each is a deterministic
+ * `data → data` function (principle #4): no I/O, no clock, no randomness.
+ */
+const PURE_TRANSFORMS = [
+	"src/sync/decision-engine.ts",
+	"src/sync/change-compare.ts",
+	"src/sync/merge.ts",
+	"src/sync/plan-admission.ts",
+	"src/sync/plan-admission-address-contention.ts",
+	"src/sync/plan-admission-case-alias.ts",
+	"src/sync/plan-admission-graph.ts",
+	"src/sync/identity-component-decision.ts",
+	"src/sync/identity-component-report-family.ts",
+	"src/sync/identity-component-topology.ts",
+	"src/sync/local-rename-admission.ts",
+	"src/sync/optimize-local-renames.ts",
+	"src/sync/optimize-remote-renames.ts",
+];
+
+const ADMISSION_INTERNAL_IMPORTS = {
+	group: [
+		"**/decision-engine",
+		"**/identity-component-decision",
+		"**/identity-component-report-family",
+		"**/identity-component-topology",
+		"**/plan-admission-graph",
+		"**/plan-admission-address-contention",
+		"**/plan-admission-case-alias",
+		"**/local-rename-admission",
+		"**/optimize-local-renames",
+		"**/optimize-remote-renames",
+		"**/rename-optimizer",
+	],
+	message:
+		"Action construction, identity-component shaping, and policy are private to PlanAdmission; other production modules consume AuthorizedSyncPlan or the public Admission result.",
+};
+
+// no-restricted-syntax selectors -------------------------------------------
+
+/**
+ * Keep the vault index read centralized in LocalFs.list() so there is a single
+ * entry point. getAllLoadedFiles() is an in-memory snapshot that can under-report
+ * before the vault finishes loading; the layout-ready GATE that makes it safe lives
+ * in the orchestrator (runSync/shouldSync early-return until isLayoutReady), NOT in
+ * list() itself — see LocalFs.list()'s contract. This rule centralizes the read so
+ * that gate has a single thing to protect.
+ */
+const NO_GET_ALL_LOADED_FILES = {
+	selector: "CallExpression[callee.property.name='getAllLoadedFiles']",
+	message: "Read the vault index via LocalFs.list() — getAllLoadedFiles() is only allowed in src/fs/local/.",
+};
+
+/** Principle #4: a pure transform must be deterministic — no wall clock. */
+const NO_DATE_NOW = {
+	selector: "CallExpression[callee.object.name='Date'][callee.property.name='now']",
+	message:
+		"Design principle #4 (pipeline as data): pure transforms must be deterministic. Pass timestamps in as data; do not read Date.now() here.",
+};
+
+/** Principle #4: a pure transform must be deterministic — no randomness. */
+const NO_MATH_RANDOM = {
+	selector: "CallExpression[callee.object.name='Math'][callee.property.name='random']",
+	message:
+		"Design principle #4 (pipeline as data): pure transforms must be deterministic. No Math.random() — derive variation from the input.",
+};
+
+/**
+ * Submission-validator guard for manifest.json: the Obsidian Community Hub
+ * rejects the words "obsidian"/"plugin" in the name/description/id (redundant —
+ * implied by context). Matched on the typescript-eslint JSON AST: a Property
+ * whose key is one of those fields and whose string value contains the word.
+ */
+const NO_FORBIDDEN_MANIFEST_WORDS = {
+	selector:
+		"Property[key.value=/^(name|description|id)$/][value.value=/\\b(obsidian|plugin)\\b/i]",
+	message:
+		"The Obsidian submission validator rejects 'obsidian'/'plugin' in the manifest name, description, or id — it's implied by context. Remove the word.",
+};
+
+/**
+ * Cross-backend Electron-net guard: NEVER hand-set a `Content-Length` header on a
+ * requestUrl call. Obsidian's requestUrl (Electron `net`) derives Content-Length from
+ * the body; a manual one makes net throw `net::ERR_INVALID_ARGUMENT` at request time —
+ * a failure NO test layer reproduces (unit mocks requestUrl; the e2e shim is fetch,
+ * which silently drops the header). This already bit Google Drive (see the comment in
+ * googledrive/resumable-upload.ts) and then OneDrive's upload session. The header name
+ * contains a hyphen, so it is always a string-literal property key. Enforced repo-wide
+ * so the lesson can't be re-learned per backend.
+ */
+const NO_MANUAL_CONTENT_LENGTH = {
+	selector: "Property[key.value=/^content-length$/i]",
+	message:
+		"Do not set Content-Length manually — Obsidian's requestUrl (Electron net) computes it and throws net::ERR_INVALID_ARGUMENT when it is hand-set. Remove the header.",
+};
+
+export default defineConfig(
+	{
+		languageOptions: {
+			globals: {
+				...globals.browser,
+				process: "readonly",
+				// Obsidian augments the global scope with DOM helpers (obsidian.d.ts
+				// `declare global`). They are the sanctioned alternative to native
+				// document.createElement / createDocumentFragment (see the
+				// obsidianmd/prefer-create-el rule), so declare them as readonly
+				// globals for no-undef.
+				createEl: "readonly",
+				createDiv: "readonly",
+				createSpan: "readonly",
+				createSvg: "readonly",
+				createFragment: "readonly",
+			},
+			parserOptions: {
+				projectService: {
+					allowDefaultProject: [
+						'eslint.config.mts',
+						'lint-bot-repro-classifier.mjs',
+						'lint-bot-repro.mjs',
+						'lint-bot-repro.test.mjs',
+						'sync-admission-authority-guard.test.mjs',
+						'sync-state-ownership-guard.test.mjs',
+						'backend-module-boundary-guard.test.mjs',
+						'manifest.json',
+						'test-fixtures/lint-bot-repro/untyped-dependencies.d.ts',
+						'test-fixtures/lint-bot-repro/untyped-vitest.d.ts',
+						'vitest.config.ts'
+					],
+					// 11: ten long-standing default-project entries plus the
+					// backend-module boundary guard (.mjs is outside tsconfig include).
+					maximumDefaultProjectFileMatchCount_THIS_WILL_SLOW_DOWN_LINTING: 11,
+				},
+				tsconfigRootDir: configRoot,
+				extraFileExtensions: ['.json']
+			},
+		},
+	},
+	...obsidianmd.configs.recommended,
+	{
+		// Vitest runs these paths in Node, where browser/Obsidian DOM globals are
+		// not guaranteed. Keep the recommended browser rules enabled for shipped
+		// source while preserving every other lint rule for tests and mocks.
+		files: ["src/**/*.test.ts", "src/__mocks__/**/*.ts", "tests/**/*.ts"],
+		rules: {
+			"obsidianmd/prefer-window-timers": "off",
+			"obsidianmd/prefer-create-el": "off",
+		},
+	},
+	{
+		// Project-wide guards: documented conventions, now enforced.
+		files: ["src/**/*.ts", "tests/**/*.ts"],
+		rules: {
+			// CLAUDE.md "No async without await" — was documented but unset upstream.
+			"@typescript-eslint/require-await": "error",
+			"no-restricted-imports": [
+				"error",
+				{ paths: [AXIOS_IMPORT], patterns: [NODE_API_IMPORTS] },
+			],
+		},
+	},
+	{
+		// Vault-index read centralization (CLAUDE.md). LocalFs owns getAllLoadedFiles;
+		// __mocks__ provides the test double.
+		files: ["src/**/*.ts"],
+		ignores: ["src/fs/local/**", "src/__mocks__/**"],
+		rules: {
+			// NO_MANUAL_CONTENT_LENGTH is appended HERE (not a separate src/** block):
+			// flat-config rule options REPLACE rather than merge, so an overlapping
+			// later block setting no-restricted-syntax would silently drop these.
+			"no-restricted-syntax": ["error", NO_GET_ALL_LOADED_FILES, NO_MANUAL_CONTENT_LENGTH],
+		},
+	},
+	{
+		// Principle #2 (swappable backends): the backend-agnostic core must not
+		// import backend-specific modules. fs/registry.ts is the single wiring
+		// point; ui/ legitimately renders backend-specific settings.
+		files: [
+			"src/sync/**/*.ts",
+			"src/main.ts",
+			"src/store/**/*.ts",
+			"src/queue/**/*.ts",
+			"src/utils/**/*.ts",
+		],
+		rules: {
+			"no-restricted-imports": [
+				"error",
+				{ paths: [AXIOS_IMPORT], patterns: [NODE_API_IMPORTS, BACKEND_SPECIFIC_IMPORTS] },
+			],
+		},
+	},
+	{
+		// Principle #4 (pipeline as data): pure transforms — no I/O interface,
+		// no clock, no randomness. (Re-declares the broader bans because rule
+		// options replace rather than merge.)
+		files: PURE_TRANSFORMS,
+		rules: {
+			"no-restricted-imports": [
+				"error",
+				{
+					paths: [AXIOS_IMPORT],
+					patterns: [NODE_API_IMPORTS, BACKEND_SPECIFIC_IMPORTS, FS_INTERFACE_IMPORT],
+				},
+			],
+			"no-restricted-syntax": [
+				"error",
+				NO_GET_ALL_LOADED_FILES,
+				NO_DATE_NOW,
+				NO_MATH_RANDOM,
+				NO_MANUAL_CONTENT_LENGTH,
+			],
+		},
+	},
+	{
+		// The identity-component implementation is one private Admission boundary,
+		// not a reusable pre/post planning stage.
+		files: ["src/sync/**/*.ts"],
+		ignores: [
+			"src/sync/**/*.test.ts",
+			"src/sync/plan-admission.ts",
+			"src/sync/plan-admission-address-contention.ts",
+			"src/sync/identity-component-decision.ts",
+			"src/sync/identity-component-report-family.ts",
+			"src/sync/identity-component-topology.ts",
+			"src/sync/plan-admission-case-alias.ts",
+			"src/sync/local-rename-admission.ts",
+			"src/sync/optimize-local-renames.ts",
+			"src/sync/optimize-remote-renames.ts",
+		],
+		rules: {
+			"no-restricted-imports": [
+				"error",
+				{
+					paths: [AXIOS_IMPORT],
+					patterns: [NODE_API_IMPORTS, BACKEND_SPECIFIC_IMPORTS, ADMISSION_INTERNAL_IMPORTS],
+				},
+			],
+		},
+	},
+	{
+		// Producer-qualified path evidence: sync tests choose a local/remote role;
+		// only the dedicated mock contract may select authority directly.
+		files: ["src/sync/**/*.test.ts"],
+		rules: {
+			"no-restricted-imports": [
+				"error",
+				{
+					paths: [AXIOS_IMPORT, RAW_SYNC_MOCK_FS_IMPORT],
+					patterns: [NODE_API_IMPORTS, BACKEND_SPECIFIC_IMPORTS],
+				},
+			],
+		},
+	},
+	{
+		// Principle #7 (single responsibility per module). This cap is a PROMPT to
+		// consider a responsibility split, not a line-count target to minimize
+		// against — counting code lines only (comments/blanks excluded). When a file
+		// trips it: split a concept out if that's natural; if not (cohesive lines, or
+		// the split is its own task), add a files-scoped override below pinned at the
+		// file's size with a justifying comment. Do NOT contort code to shave lines.
+		// Tests/mocks/test-helpers are exempt — naturally longer, and not shipped.
+		files: ["src/**/*.ts"],
+		ignores: ["src/**/*.test.ts", "src/__mocks__/**", "src/**/test-helpers.ts"],
+		rules: {
+			"max-lines": ["error", { max: 300, skipBlankLines: true, skipComments: true }],
+		},
+	},
+	{
+		// Startup WARM acquisition: the durable record read now starts before the
+		// local listing is awaited, and one pass over that listing builds the
+		// observations, exact-entity map, observed-path set, and deletion path set.
+		// The sets exist only to feed the candidate loop a few lines below, so the
+		// pin keeps the acquisition step cohesive instead of splitting projections
+		// from their single use. Re-pinned from 312 for `includeCommittedBaselines`,
+		// which loads the committed row of an observed identity whose stored path the
+		// delta did not visit: a per-cycle acquisition concern that belongs beside the
+		// other entry-shaping steps, not in a separate module.
+		files: ["src/sync/change-detector.ts"],
+		rules: { "max-lines": ["error", { max: 328, skipBlankLines: true, skipComments: true }] },
+	},
+	{
+		// Per-file overrides above the 300 cap (known debt), each pinned at its
+		// current size so it cannot grow SILENTLY — the pin is a ratchet, not a
+		// reduction mandate. Ratchet down when a natural split presents itself;
+		// raise (re-pin) when a cohesive change needs it rather than forcing the
+		// count down with churn (see docs/code-enforcement.md §6).
+		// (googledrive/index.ts was here at 397; A1 lifted its cache/checkpoint
+		// machinery into fs/caching/, dropping it back under the standard 300 cap.)
+		files: ["src/backends/googledrive/auth.ts"],
+		rules: { "max-lines": ["error", { max: 337, skipBlankLines: true, skipComments: true }] },
+	},
+	{
+		// Re-pinned from 408: preparation/Admission publication, executor wiring, and
+		// finalization are the composition root's ordering contract. Priority scheduling
+		// adds coordination here while its policy and effects remain separate modules.
+		files: ["src/sync/orchestrator.ts"],
+		rules: { "max-lines": ["error", { max: 444, skipBlankLines: true, skipComments: true }] },
+	},
+	{
+		// Exact action effects, commitAction, terminal result publication, and their
+		// priority permit form one indivisible executor boundary. Keep that ordering
+		// visible here instead of hiding it behind a result-carrier abstraction.
+		files: ["src/sync/plan-executor.ts"],
+		rules: { "max-lines": ["error", { max: 334, skipBlankLines: true, skipComments: true }] },
+	},
+	{
+		// Re-pinned from 374 when `diffById`'s single loop gained the second half of its
+		// job: the same sweep that subtracts a displaced address also reports the moved
+		// object's projected identity on the pair it produces. Both facts are read off
+		// the one cache entry the loop already holds, so neither can move out without
+		// re-walking the cache. Earlier re-pin from 364, when the three producers of
+		// `RemoteDelta.deleted` got one attribution rule: two of them live here (the
+		// `hasFile` split over a drain's changed paths, and `diffById`'s vanished-id
+		// sweep) and the third feeds the first, so the rule they share has to sit where
+		// all three can be read against each other; moving either producer out would
+		// hide which absences the cycle is allowed to call deletions. Earlier re-pin
+		// from 326: cached lifecycle and detached priority observation share the
+		// backend-specific identity seams but not mutable cursor state. Keeping the
+		// capability assembly here makes that separation explicit; its algorithm is
+		// split out.
+		// Re-pinned from 380 for the full-scan path listing: the diagnostic belongs
+		// where the scan happens, and the sync layer's own diagnostics module is the
+		// wrong home for it — moving it there would mean handing the cache out past
+		// this class to log it.
+		// Re-pinned from 389 for the full scan's own contention channel. A scan is
+		// entered lazily from the path-level calls owned here, so the working-view field
+		// that carries its address-level facts out, and the drain that empties it, belong
+		// with the lifecycle that creates and clears them — beside the cursor and the
+		// scope fingerprint, which have exactly the same lifetime.
+		// Re-pinned from 397 for folders that share a path: the checkpoint restores a
+		// merged folder's other members from its one stored record, the cursor-expiry
+		// diff counts them live, `delete` removes every provider folder the vault folder
+		// is made of, and `list()` keeps the contentions its replay decided. Each is a
+		// lifecycle step this class already owns for the single-object case.
+		// Re-pinned from 402 so the cursor-expiry diff applies the same shared-path rule
+		// the incremental drain does — a folder leaving or joining a same-named one is
+		// its contents' moves, not a folder rename — and so an empty committed view
+		// still reports what its scan decided. Both are this class's own diff.
+		// Re-pinned from 411 for `downloadForPriority`: the priority path must surface
+		// a version-bound read's typed `target_changed`/`unverifiable` instead of the
+		// throw `downloadFile` uses for `IFileSystem.read`, and that outcome seam
+		// belongs beside the abstract download it refines. Re-pinned from 416 for the
+		// delta-contention bookkeeping `takeNamespaceContentions` hands to namespace
+		// reconciliation: the facts belong to the working view this class already owns
+		// and its lifecycle is the class's, so the split would be artificial.
+		// Re-pinned from 427 for the pre-delta view a mutating completion route hands
+		// the full-scan fallback, so the fallback diffs against the view before the
+		// partial apply instead of dropping the change it already applied. Re-pinned
+		// from 430 for the observed changed paths carried with it: a same-id, same-path
+		// content update the path↔id diff cannot re-derive is unioned back into
+		// `modified`, so the fallback never publishes an incomplete delta.
+		files: ["src/fs/caching/remote-fs.ts"],
+		rules: { "max-lines": ["error", { max: 440, skipBlankLines: true, skipComments: true }] },
+	},
+	{
+		// Re-pinned from under the 300 cap for the Dropbox content preconditions:
+		// `add` (exclusive create), `update(rev)` with `strict_conflict` (content CAS),
+		// the revision-bound download, and the fail-closed expected-evidence guard for
+		// move/delete are one cohesive provider-operation surface beside the
+		// case-only-rename mechanism already owned here. Re-pinned from 322 for the
+		// expected-identity guard shared by update/move/delete. Re-pinned from 330 for
+		// the `addressing: "provider_path"` declaration (API v3), which belongs on the
+		// adapter that reports provider_path locations.
+		files: ["src/backends/dropbox/adapter.ts"],
+		rules: { "max-lines": ["error", { max: 331, skipBlankLines: true, skipComments: true }] },
+	},
+	{
+		// Re-pinned from under the 300 cap for the fail-closed expected-evidence guard:
+		// Google Drive has no provider metadata precondition, so update/move/delete must
+		// still compare-before-mutate and reject an empty/mismatched expected identity or
+		// version before any provider call.
+		// Re-pinned from 308 for `listSubtreeById`: the optional identity-addressed
+		// subtree read core invokes to complete a delta when a folder newly enters the
+		// bound root. It is one provider fact read beside the adapter's other reads.
+		files: ["src/backends/googledrive/adapter.ts"],
+		rules: { "max-lines": ["error", { max: 313, skipBlankLines: true, skipComments: true }] },
+	},
+	{
+		// Re-pinned from 303 for the top-level Google Picker callback. The
+		// auth+folder operation itself lives in backend-auth-folder-pick.ts; this file
+		// retains only its connecting gate and lifecycle re-init because those must
+		// remain coordinated with every other bind/connect path owned here.
+		// Re-pinned from 341 for the connect-boundary usability gate: validating before
+		// createFs and, on rejection, returning the session to a disconnected state are
+		// one lifecycle step that must stay beside the connect/teardown logic owned here.
+		// Re-pinned from 369 for `createRemoteFs`: awaiting a backend module's async
+		// `prepare` before handing back its ready filesystem IS the connect-boundary
+		// acquisition step, and it stays beside the connect/teardown logic owned here.
+		files: ["src/fs/backend-manager.ts"],
+		rules: { "max-lines": ["error", { max: 373, skipBlankLines: true, skipComments: true }] },
+	},
+	{
+		// Core composition root for the module boundary: it owns the per-connection
+		// auth/binding host, the compatibility physical profiles, the in-app picker's
+		// list client, and the single ManagedRemoteFs the sync engine consumes. Splitting
+		// the profile/disconnect policy away from the connection lifecycle would hide
+		// which physical secret namespace a connection resolves, so the cohesive piece
+		// stays here.
+		// Re-pinned from 316 for `readBackendState`, which carries the adapter's
+		// non-authoritative auth state (a refreshed `accessTokenExpiry`) into the
+		// settings bag exactly as the legacy provider did; it belongs with the
+		// prepared adapter this class owns. Re-pinned from 319 for the bound-folder
+		// display warning passthrough, the module-side successor to the legacy
+		// `RemoteVaultDisplay.warning`.
+		// Re-pinned from 322 so prepare() validates the adapter's declared capabilities
+		// immediately after createAdapter, before the adapter reaches ManagedRemoteFs.
+		files: ["src/fs/modules/backend-module-provider.ts"],
+		rules: { "max-lines": ["error", { max: 328, skipBlankLines: true, skipComments: true }] },
+	},
+	{
+		// Re-pinned from 379 for `projectedIdentityKey`, the free function every rename
+		// producer reads a moved object's identity through. It is deliberately a free
+		// function over the already-public `toEntity`/`getFile` rather than a member —
+		// it must not become a subclass obligation, and it must not be able to reach
+		// the address functions — so it belongs beside the projection it wraps and
+		// nowhere else. Earlier pin at 379, when the cache became the single owner of
+		// "which cache path does this provider object get?". The pure part of that
+		// answer IS split out
+		// (claim-set-assignment.ts, alongside path-authority.ts); what stays here is
+		// index mutation — evicting an occupant, vacating a withheld claimant and
+		// announcing either — which cannot leave the class that owns the five maps
+		// without exporting them. Ratchet down if the id-chain path resolver
+		// (resolvePathFromCache/resolveFilePathCached/findRelevantParentId) later
+		// moves out to its own module; that is its own task, with public callers.
+		// Re-pinned from 386 for folders that share a path. Two provider-resolved
+		// folders deriving one address are one vault folder (the owner's rule), so a
+		// path can hold several folder objects: a sixth index beside the five above,
+		// which every mutation must keep consistent with the others in the same step —
+		// a merge seats one beside the representative, a removal promotes the next, and
+		// a move or tombstone takes one object's own subtree told apart by provider
+		// parentage rather than by path prefix. It is index mutation of exactly the
+		// kind this pin already keeps here, and cannot leave the class without
+		// exporting the maps. The delta-side placement that arbitrates each seat a move
+		// makes is the same: it has to read and write those maps between arbitrations.
+		// Re-pinned from 577 so that an eviction from a shared path names every folder it
+		// takes, as a full scan's claim-set assignment does. Split candidate, when an
+		// access seam to the maps exists: capture / detachAll / reseat / removeObject /
+		// subtreePaths are one concept — taking one object's subtree out and seating it
+		// again — and are the natural module to ratchet this back down with.
+		// Re-pinned from 589 so the plain seat refuses to re-key a shared path, the same
+		// way it refuses to relocate across one: it can return only one fact, and an
+		// eviction there takes several.
+		// Re-pinned from 595 for `objectById`: resolving a merged folder's exact member
+		// by id is a cache query beside `foldersAt`/`idsAt`, not a caller-side re-derivation.
+		// Re-pinned from 601 to hand the evicted occupant's own metadata back from the seat
+		// so the drain can re-seat it: the capture belongs where the eviction happens, beside
+		// the maps it reads, not in the caller.
+		files: ["src/fs/caching/metadata-cache.ts"],
+		rules: { "max-lines": ["error", { max: 605, skipBlankLines: true, skipComments: true }] },
+	},
+	{
+		// Lint manifest.json for the words the Obsidian submission validator
+		// HARD-rejects in name/description/id ("obsidian"/"plugin" — redundant,
+		// implied by context). The typescript-eslint parser turns .json into an
+		// ObjectExpression AST (hence the extraFileExtensions: ['.json'] /
+		// allowDefaultProject above), so no-restricted-syntax can match the
+		// offending property literal.
+		//
+		// We deliberately do NOT use obsidianmd/validate-manifest here: its
+		// descriptionFormat sub-check forbids parentheses (regex
+		// ^[A-Za-z0-9\s.,!?'"-]+$, same on master), which the actual dashboard
+		// ACCEPTS — our shipped "… (Google Drive, Dropbox)." passes the bot but
+		// would false-positive on that rule, and the rule has no options to
+		// disable just that sub-check. Matching the forbidden words directly
+		// keeps the local gate aligned with what the bot really blocks.
+		files: ["manifest.json"],
+		languageOptions: { parser: tseslint.parser },
+		rules: {
+			"no-restricted-syntax": ["error", NO_FORBIDDEN_MANIFEST_WORDS],
+		},
+	},
+	globalIgnores([
+		"node_modules",
+		"dist",
+		"coverage",
+		"esbuild.config.mjs",
+		"eslint.config.js",
+		"version-bump.mjs",
+		"versions.json",
+		"main.js",
+		".roost", // local agent/tooling git worktrees (not part of the plugin)
+		".agent-reactor", // ditto — agent-reactor's worktrees live here
+		".worktrees", // ditto — this repo's own delivery worktrees live here
+		// Opt-in real-cloud e2e harness (ADR 0003): local/manual only, never
+		// bundled. It deliberately uses Node APIs (fetch, fs, readline) and real
+		// network — forbidden in shipped src/ by the mobile-compat / restricted-
+		// globals rules — so it is exempt from the plugin lint here.
+		"e2e",
+	]),
+);

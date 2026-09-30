@@ -1,0 +1,146 @@
+import { errorMessage } from "../backend-api";
+import type { IFileSystem } from "../fs/interface";
+import type { Logger } from "../logging/logger";
+import { hasChanged, hasRemoteChanged } from "./change-compare";
+import type { LocalChangeTracker } from "./local-tracker";
+import type { LocalMutationBarrier } from "./local-mutation-barrier";
+import type { PriorityBatchTarget } from "./priority-batch-state";
+import type { SyncStateStore } from "./state";
+import { buildSyncRecord } from "./state-committer";
+import type { SyncAction, SyncRecord } from "./types";
+
+export type OpenedFilePriorityResult =
+	| "applied"
+	| "already_current"
+	| "untracked"
+	| "deferred_to_batch"
+	| "failed_retryable";
+
+interface OpenedFilePriorityContext {
+	path: string;
+	localFs: IFileSystem;
+	remoteFs: IFileSystem;
+	stateStore: SyncStateStore;
+	localTracker: LocalChangeTracker;
+	mutationBarrier: LocalMutationBarrier;
+	target: PriorityBatchTarget;
+	supersede(action: SyncAction, terminalRecord: SyncRecord): boolean;
+	invalidate(action: SyncAction): boolean;
+	invalidateCycle(): void;
+	requestNormalLifecycle(): void;
+	logger?: Logger;
+}
+
+/** One pull-only file-open operation. Provider facts and batch policy are supplied by their owners. */
+export async function syncOpenedFilePriority(
+	ctx: OpenedFilePriorityContext,
+): Promise<OpenedFilePriorityResult> {
+	try {
+		const expectedRecord = await ctx.stateStore.get(ctx.path);
+		if (!expectedRecord) return "untracked";
+		if (ctx.target.kind === "defer" || !ctx.remoteFs.priority) return deferToBatch(ctx);
+		const expectedGeneration = ctx.localTracker.generation(ctx.path);
+
+		const [localBefore, observed] = await Promise.all([
+			ctx.localFs.stat(ctx.path),
+			ctx.remoteFs.priority.observe({
+				path: ctx.path,
+				identityKey: expectedRecord.remoteIdentityKey,
+			}),
+		]);
+		if (!localBefore || localBefore.isDirectory || hasChanged(localBefore, expectedRecord)) {
+			invalidateTarget(ctx);
+			return "deferred_to_batch";
+		}
+		if (observed.kind !== "current" || observed.entity.isDirectory) {
+			invalidateTarget(ctx);
+			return "deferred_to_batch";
+		}
+
+		if (!hasRemoteChanged(observed.entity, expectedRecord)) {
+			const currentRecord = buildSyncRecord(localBefore, observed.entity, ctx.path);
+			// The captured row is both the correspondence this attempt continues and the
+			// occupant of its address; a remote identity that moved under it fails the
+			// first comparison and defers to the batch rather than replacing anything.
+			if (!await ctx.stateStore.compareAndPut(expectedRecord, currentRecord, expectedRecord)) {
+				invalidateTarget(ctx);
+				return "deferred_to_batch";
+			}
+			return supersedeTarget(ctx, currentRecord) ? "already_current" : deferToBatch(ctx);
+		}
+
+		const read = await ctx.remoteFs.priority.read(observed);
+		if (read.kind !== "content") {
+			invalidateTarget(ctx);
+			return "deferred_to_batch";
+		}
+
+		return ctx.mutationBarrier.run([ctx.path], async () => {
+			const [currentRecord, localNow] = await Promise.all([
+				ctx.stateStore.get(ctx.path),
+				ctx.localFs.stat(ctx.path),
+			]);
+			if (JSON.stringify(currentRecord) !== JSON.stringify(expectedRecord) ||
+				ctx.localTracker.generation(ctx.path) !== expectedGeneration ||
+				!localNow || localNow.isDirectory || hasChanged(localNow, expectedRecord)) {
+				invalidateTarget(ctx);
+				return "deferred_to_batch";
+			}
+
+			const localEntity = await ctx.localFs.write(ctx.path, read.content, observed.entity.mtime);
+			// Construction shares the commit's existing failure route: a remote entity the
+			// record layer's identity floor refuses is a baseline this attempt cannot take,
+			// not a cycle this attempt is not part of failing.
+			let nextRecord: SyncRecord | undefined;
+			try {
+				nextRecord = buildSyncRecord(localEntity, observed.entity, ctx.path);
+				if (!await ctx.stateStore.compareAndPut(expectedRecord, nextRecord, expectedRecord)) nextRecord = undefined;
+			} catch (error) {
+				nextRecord = undefined;
+				ctx.logger?.warn("file-open priority baseline commit failed", {
+					path: ctx.path,
+					message: errorMessage(error),
+				});
+			}
+			if (!nextRecord) {
+				ctx.localTracker.markDirty(ctx.path);
+				invalidateTarget(ctx);
+				return "deferred_to_batch";
+			}
+
+			if (!supersedeTarget(ctx, nextRecord)) {
+				ctx.localTracker.markDirty(ctx.path);
+				ctx.invalidateCycle();
+				return deferToBatch(ctx);
+			}
+			const postGeneration = ctx.localTracker.generation(ctx.path);
+			const localAfter = await ctx.localFs.stat(ctx.path);
+			if (localAfter && !hasChanged(localAfter, nextRecord)) {
+				ctx.localTracker.acknowledgePath(ctx.path, postGeneration);
+			}
+			return "applied";
+		});
+	} catch (error) {
+		ctx.logger?.warn("file-open priority attempt failed", {
+			path: ctx.path,
+			message: errorMessage(error),
+		});
+		ctx.requestNormalLifecycle();
+		return "failed_retryable";
+	}
+}
+
+function supersedeTarget(ctx: OpenedFilePriorityContext, terminalRecord: SyncRecord): boolean {
+	return ctx.target.kind !== "superseding" || ctx.supersede(ctx.target.action, terminalRecord);
+}
+
+function invalidateTarget(ctx: OpenedFilePriorityContext): void {
+	if (ctx.target.kind === "superseding") ctx.invalidate(ctx.target.action);
+	ctx.invalidateCycle();
+	ctx.requestNormalLifecycle();
+}
+
+function deferToBatch(ctx: OpenedFilePriorityContext): "deferred_to_batch" {
+	ctx.requestNormalLifecycle();
+	return "deferred_to_batch";
+}

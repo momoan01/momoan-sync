@@ -1,0 +1,3008 @@
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { executePlan, toConflictRecords, DESKTOP_TRANSFER_POOL, MOBILE_TRANSFER_POOL } from "./plan-executor";
+import type { ExecutionContext, ResolvedConflict } from "./plan-executor";
+import type { CandidateFact, ConflictAction, PathObservation, SyncAction, SyncRecord } from "./types";
+import { createMockLocalFs, createMockRemoteFs, type MockFileSystem, createMockStateStore, addFile, readText, deferred, flush } from "../__mocks__/sync-test-helpers";
+import { AuthError, classifyHttpError } from "../backend-api/error-classification";
+import { backendError } from "../backend-api";
+import { toBackendError, backendErrorFromStatus } from "../backends/shared/error-shape";
+import { classifyBackendError } from "../fs/modules/error-bridge";
+import { AdaptivePool } from "../backend-api/async-queue";
+import {
+	admitBatchObservation,
+	type AuthorizedSyncPlan,
+} from "./plan-admission";
+import { captureBatchObservation } from "./sync-cycle-planning";
+import { resolveConflict } from "./conflict-resolver";
+import { ContentProofError } from "./content-snapshot";
+import { PriorityCoordinator } from "./priority-coordinator";
+import { buildSyncRecord } from "./state-committer";
+import { insertConflictSuffix } from "./conflict";
+import { sha256 } from "../utils/hash";
+import { conflictContractViolation } from "./conflict-action-contract";
+import { createChecksumRegistry } from "../fs/modules/checksum-registry";
+
+const checksumRegistry = createChecksumRegistry();
+
+function makeCtx(
+	overrides: Partial<ExecutionContext> = {},
+): ExecutionContext {
+	const localFs = createMockLocalFs();
+	// This executor fixture models provider-resolved stat after writes. The
+	// requested-echo backend boundary is exercised in fact-first-execution.
+	const remoteFs = createMockRemoteFs("actual_resolved");
+	const stateStore = createMockStateStore();
+	return {
+		localFs,
+		remoteFs,
+		committer: {
+			stateStore: stateStore,
+			localFs,
+		},
+		classifyError: classifyHttpError,
+		transferPool: DESKTOP_TRANSFER_POOL,
+		// Test seams: instant sleep + deterministic jitter so retry tests don't burn time.
+		sleep: () => Promise.resolve(),
+		rng: () => 0,
+		...overrides,
+		checksumRegistry,
+	};
+}
+
+function trackIo<T extends object>(target: T, label: string, calls: string[]): T {
+	return new Proxy(target, {
+		get(value, key, receiver) {
+			const member: unknown = Reflect.get(value, key, receiver);
+			if (key === "checkpoint" && member && typeof member === "object") {
+				return trackIo(member, `${label}.checkpoint`, calls);
+			}
+			if (typeof member !== "function") return member;
+			const operation = member as (...args: unknown[]) => unknown;
+			return (...args: unknown[]) => {
+				calls.push(`${label}.${String(key)}`);
+				return operation.apply(value, args);
+			};
+		},
+	});
+}
+
+function spyOnConflictIo(ctx: ExecutionContext): string[] {
+	const calls: string[] = [];
+	ctx.localFs = trackIo(ctx.localFs, "localFs", calls);
+	ctx.remoteFs = trackIo(ctx.remoteFs, "remoteFs", calls);
+	ctx.committer = {
+		...ctx.committer,
+		localFs: ctx.committer.localFs
+			? trackIo(ctx.committer.localFs, "committer.localFs", calls)
+			: undefined,
+		stateStore: trackIo(ctx.committer.stateStore, "stateStore", calls),
+	};
+	return calls;
+}
+
+function expectNoConflictIo(calls: ReturnType<typeof spyOnConflictIo>): void {
+	expect(calls).toEqual([]);
+}
+
+function makeLocalWinAction(): ConflictAction {
+	const local = { path: "note.md", isDirectory: false, size: 5, mtime: 2, hash: "local" };
+	const remote = { path: "note.md", isDirectory: false, size: 6, mtime: 3, hash: "remote", identityKey: "R" };
+	const baseline: SyncRecord = {
+		path: "note.md", hash: "baseline", localMtime: 1, remoteMtime: 1,
+		localSize: 4, remoteSize: 4, remoteIdentityKey: "R", syncedAt: 1,
+	};
+	return {
+		action: "conflict", path: "note.md", local, remote, baseline,
+		protocol: { kind: "same_path" },
+		conflictPolicy: { mode: "local_win", strategy: "prefer_local" },
+	};
+}
+
+function preservationChild(hash: string, candidatePath: string) {
+	return {
+		source: {
+			side: "local" as const,
+			entity: {
+				path: "source.md", pathAuthority: "actual_resolved" as const,
+				isDirectory: false, size: 1, mtime: 1, hash,
+			},
+		},
+		content: { sha256: hash, size: 1 }, candidatePath,
+		expectedLocal: null, expectedRemote: null,
+		missingSides: ["local", "remote"] as const,
+		publication: { source: undefined, destination: undefined },
+	};
+}
+
+function makePlan(input: SyncAction[], orderedComponent = false): AuthorizedSyncPlan {
+	// Executor unit boundary: the caller supplies exact admitted inputs. Actual
+	// Admission-to-executor wiring is exercised below and in fact-first-execution.
+	// This fixture neither makes policy decisions nor refreshes raced snapshots.
+	let actions: SyncAction[] = input;
+	actions = actions.map((action) => action.publication || ("descendantRecords" in action && action.descendantRecords)
+		? action : { ...action, publication: {
+			source: action.baseline,
+			destination: action.baseline?.path === action.path ? action.baseline : undefined,
+		} });
+	const components = actions.map((action) => ({
+			kind: "authorized", actions: [action], evidence: [],
+			paths: [...new Set([action.path, action.local?.path, action.remote?.path,
+				action.baseline?.path, ...("oldPath" in action ? [action.oldPath] : [])]
+				.filter((path): path is string => path !== undefined))],
+		}));
+	return {
+		actions,
+		components: orderedComponent ? [{ kind: "authorized", actions, evidence: [],
+			paths: [...new Set(components.flatMap((component) => component.paths))] }] : components,
+	} as unknown as AuthorizedSyncPlan;
+}
+
+async function arrangeFreshRename(ctx: ExecutionContext) {
+	const localFs = ctx.localFs as MockFileSystem;
+	const remoteFs = ctx.remoteFs as MockFileSystem;
+	addFile(localFs, "new.md", "current", 2000);
+	addFile(remoteFs, "old.md", "baseline", 1000);
+	remoteFs.files.get("old.md")!.entity.identityKey = "R";
+	const local = (await localFs.stat("new.md"))!;
+	const remote = (await remoteFs.stat("old.md"))!;
+	const baseline: SyncRecord = {
+		path: "old.md", hash: remote.hash, localMtime: 1000, remoteMtime: 1000,
+		localSize: remote.size, remoteSize: remote.size, remoteIdentityKey: "R", syncedAt: 900,
+	};
+	const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+	stateStore.records.set("old.md", baseline);
+	const action: Extract<SyncAction, { action: "rename_remote" | "rename_local" }> = {
+		path: "new.md", oldPath: "old.md",
+		action: "rename_remote", local, remote, baseline,
+		publication: { source: baseline, destination: undefined },
+		content: { mode: "copy", read: { side: "local", entity: local }, write: { side: "remote", path: "new.md" } },
+	};
+	return { local, remoteFs, stateStore, baseline, action };
+}
+
+async function arrangeFreshConflict(ctx: ExecutionContext, withOccupant = false) {
+	const localFs = ctx.localFs as MockFileSystem;
+	const remoteFs = ctx.remoteFs as MockFileSystem;
+	addFile(localFs, "new.md", "local current", 2000);
+	const local = (await localFs.stat("new.md"))!;
+	addFile(remoteFs, "old.md", "remote changed", 1500).identityKey = "R";
+	const source = (await remoteFs.stat("old.md"))!;
+	const additional = withOccupant
+		? addFile(remoteFs, "new.md", "foreign occupant", 1400)
+		: undefined;
+	if (additional) additional.identityKey = "Y";
+	const baseline: SyncRecord = {
+		path: "old.md", hash: "baseline", localMtime: 1000, remoteMtime: 1000,
+		localSize: 8, remoteSize: 8, remoteIdentityKey: "R", syncedAt: 900,
+	};
+	const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+	stateStore.records.set("old.md", baseline);
+	const action: SyncAction = {
+		path: "new.md", action: "conflict", local, remote: source, baseline,
+		protocol: { kind: "same_path" }, conflictPolicy: { mode: "preserve", strategy: "duplicate" },
+		remoteIdentitySource: source,
+		...(additional ? { additionalRemote: (await remoteFs.stat("new.md"))! } : {}),
+		publication: { source: baseline, destination: undefined },
+	};
+	return { action, localFs, remoteFs, stateStore, baseline };
+}
+
+// Some suites spy on AdaptivePool.prototype (a global) — restore after each test
+// so the spy never leaks into another (vitest is not configured to auto-restore).
+afterEach(() => vi.restoreAllMocks());
+
+describe("executePlan", () => {
+	it("publishes an admitted Prefer-local win through the existing conflict route", async () => {
+		const ctx = makeCtx({});
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+		addFile(localFs, "note.md", "local", 2000);
+		addFile(remoteFs, "note.md", "remote", 3000);
+		const local = { ...(await localFs.stat("note.md"))!,
+			hash: await sha256(await localFs.read("note.md")) };
+		const remote = { ...(await remoteFs.stat("note.md"))!,
+			hash: await sha256(await remoteFs.read("note.md")) };
+		const baseline: SyncRecord = {
+			path: "note.md", hash: await sha256(new TextEncoder().encode("base").buffer), localMtime: 1000, remoteMtime: 1000,
+			localSize: 4, remoteSize: 4, remoteIdentityKey: "id:note.md", syncedAt: 1000,
+		};
+		stateStore.records.set("note.md", baseline);
+		const action: SyncAction = {
+			action: "conflict", path: "note.md", local, remote, baseline,
+			publication: { source: baseline, destination: baseline },
+			protocol: { kind: "same_path" },
+			conflictPolicy: { mode: "local_win", strategy: "prefer_local" },
+		};
+
+		const result = await executePlan(makePlan([action]), ctx);
+
+		expect(result.failed).toEqual([]);
+		expect(result.blocked).toEqual([]);
+		expect(readText(localFs, "note.md")).toBe("local");
+		expect(readText(remoteFs, "note.md")).toBe("local");
+		expect(await localFs.stat("note.conflict.md")).toBeNull();
+		expect(await remoteFs.stat("note.conflict.md")).toBeNull();
+		expect(stateStore.records.get("note.md")?.hash).toBe((await localFs.stat("note.md"))?.hash);
+	});
+
+	it("preserves the remote bytes when Admission rejects Prefer-local win for a compound component", async () => {
+		const ctx = makeCtx({});
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+		addFile(localFs, "note.md", "local", 2000);
+		addFile(remoteFs, "note.md", "remote", 3000);
+		const local = (await localFs.stat("note.md"))!;
+		const remote = (await remoteFs.stat("note.md"))!;
+		const baseline: SyncRecord = {
+			path: "note.md", hash: "base", localMtime: 1000, remoteMtime: 1000,
+			localSize: 4, remoteSize: 4, remoteIdentityKey: "id:note.md", syncedAt: 1000,
+		};
+		stateStore.records.set("note.md", baseline);
+		const action: SyncAction = {
+			action: "conflict", path: "note.md", local, remote, baseline,
+			publication: { source: baseline, destination: baseline },
+			protocol: { kind: "same_path" },
+			conflictPolicy: { mode: "preserve", strategy: "prefer_local" },
+		};
+
+		const result = await executePlan(makePlan([action]), ctx);
+
+		expect(result.failed).toEqual([]);
+		expect(readText(localFs, "note.md")).toBe("local");
+		expect(readText(remoteFs, "note.md")).toBe("local");
+		expect(readText(localFs, "note.conflict.md")).toBe("remote");
+		expect(readText(remoteFs, "note.conflict.md")).toBe("remote");
+		expect(stateStore.records.get("note.md")?.hash).toBe((await localFs.stat("note.md"))?.hash);
+	});
+
+	it("treats a missing Prefer-local disposition as a fatal plan invariant", async () => {
+		const fatal = vi.fn();
+		const ctx = makeCtx({onActionFatal: fatal });
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		const local = addFile(localFs, "note.md", "local", 2000);
+		const remote = addFile(remoteFs, "note.md", "remote", 3000);
+
+		const plan = makePlan([{
+			action: "conflict", path: "note.md", local, remote,
+			protocol: { kind: "same_path" },
+			conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" },
+		}]);
+		delete (plan.actions[0] as unknown as { conflictPolicy?: unknown }).conflictPolicy;
+		const io = spyOnConflictIo(ctx);
+		await expect(executePlan(plan, ctx)).rejects.toThrow("Conflict execution policy missing");
+		expect(fatal).toHaveBeenCalledOnce();
+		expectNoConflictIo(io);
+	});
+
+	it("treats an invalid Prefer-local disposition as a fatal plan invariant", async () => {
+		const fatal = vi.fn();
+		const ctx = makeCtx({onActionFatal: fatal });
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		const local = addFile(localFs, "note.md", "local", 2000);
+		const remote = addFile(remoteFs, "note.md", "remote", 3000);
+		const action = {
+			action: "conflict", path: "note.md", local, remote,
+			protocol: { kind: "same_path" }, conflictPolicy: { mode: "invalid", strategy: "prefer_local" },
+		} as unknown as SyncAction;
+		const io = spyOnConflictIo(ctx);
+
+		await expect(executePlan(makePlan([action]), ctx))
+			.rejects.toThrow("Conflict execution policy invalid");
+		expect(fatal).toHaveBeenCalledOnce();
+		expectNoConflictIo(io);
+	});
+
+	it("rejects a same-path Auto merge policy that was changed to preservation", async () => {
+		const fatal = vi.fn();
+		const ctx = makeCtx({ onActionFatal: fatal });
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		const local = addFile(localFs, "note.md", "local", 2000);
+		const remote = addFile(remoteFs, "note.md", "remote", 3000);
+		const action: ConflictAction = {
+			action: "conflict", path: "note.md", local, remote,
+			protocol: { kind: "same_path" },
+			conflictPolicy: { mode: "preserve", strategy: "auto_merge" },
+		};
+		const io = spyOnConflictIo(ctx);
+
+		await expect(executePlan(makePlan([action]), ctx))
+			.rejects.toThrow("Conflict policy is incompatible with same-path Auto merge");
+		expect(fatal).toHaveBeenCalledOnce();
+		expectNoConflictIo(io);
+	});
+
+	it("rejects an unproven local-win policy before filesystem I/O", async () => {
+		const fatal = vi.fn();
+		const ctx = makeCtx({ onActionFatal: fatal });
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		const local = addFile(localFs, "note.md", "local", 2000);
+		const remote = addFile(remoteFs, "note.md", "remote", 3000);
+		const action = {
+			action: "conflict", path: "note.md", local, remote,
+			protocol: { kind: "same_path" },
+			conflictPolicy: { mode: "local_win", strategy: "prefer_local" },
+		} as unknown as SyncAction;
+		const io = spyOnConflictIo(ctx);
+
+		await expect(executePlan(makePlan([action]), ctx))
+			.rejects.toThrow("Prefer-local local-win proof is missing or invalid");
+		expect(fatal).toHaveBeenCalledOnce();
+		expectNoConflictIo(io);
+	});
+
+	it.each([
+		["replacement identity", (action: ConflictAction) => {
+			action.remote!.identityKey = "replacement";
+		}],
+		["missing baseline", (action: ConflictAction) => delete action.baseline],
+		["baseline path override", (action: ConflictAction) => { action.baseline!.path = "other.md"; }],
+		["local path override", (action: ConflictAction) => { action.localPath = "other.md"; }],
+		["remote path override", (action: ConflictAction) => { action.remotePath = "other.md"; }],
+		["local entity path mismatch", (action: ConflictAction) => { action.local!.path = "other.md"; }],
+		["remote entity path mismatch", (action: ConflictAction) => { action.remote!.path = "other.md"; }],
+		["local directory", (action: ConflictAction) => { action.local!.isDirectory = true; }],
+		["remote directory", (action: ConflictAction) => { action.remote!.isDirectory = true; }],
+		["missing local hash", (action: ConflictAction) => { action.local!.hash = ""; }],
+		["missing remote hash", (action: ConflictAction) => { action.remote!.hash = ""; }],
+		["unchanged local hash", (action: ConflictAction) => { action.local!.hash = action.baseline!.hash; }],
+		["unchanged remote hash", (action: ConflictAction) => { action.remote!.hash = action.baseline!.hash; }],
+		["equal current hashes", (action: ConflictAction) => { action.remote!.hash = action.local!.hash; }],
+		["remote identity source", (action: ConflictAction) => { action.remoteIdentitySource = action.remote; }],
+		["additional remote endpoint", (action: ConflictAction) => { action.additionalRemote = action.remote; }],
+		["additional local endpoint", (action: ConflictAction) => { action.additionalLocal = action.local; }],
+	] as const)("rejects local-win with %s before every I/O capability", async (_name, mutate) => {
+		const ctx = makeCtx({ onActionFatal: vi.fn() });
+		const action = makeLocalWinAction();
+		mutate(action);
+		const io = spyOnConflictIo(ctx);
+
+		await expect(executePlan(makePlan([action]), ctx))
+			.rejects.toThrow("Prefer-local local-win proof is missing or invalid");
+		expectNoConflictIo(io);
+	});
+
+	it.each([
+		["auto_merge/prefer_local", { mode: "auto_merge", strategy: "prefer_local" }],
+		["auto_merge/duplicate", { mode: "auto_merge", strategy: "duplicate" }],
+		["local_win/auto_merge", { mode: "local_win", strategy: "auto_merge" }],
+		["local_win/duplicate", { mode: "local_win", strategy: "duplicate" }],
+		["unknown mode", { mode: "unknown", strategy: "prefer_local" }],
+		["unknown strategy", { mode: "preserve", strategy: "unknown" }],
+	] as const)("rejects invalid policy pair %s before every I/O capability", async (_name, conflictPolicy) => {
+		const ctx = makeCtx({ onActionFatal: vi.fn() });
+		const action = {
+			action: "conflict", path: "note.md", protocol: { kind: "same_path" }, conflictPolicy,
+		} as unknown as ConflictAction;
+		const io = spyOnConflictIo(ctx);
+
+		await expect(executePlan(makePlan([action]), ctx))
+			.rejects.toThrow("Conflict execution policy invalid");
+		expectNoConflictIo(io);
+	});
+
+	it("rejects a malformed preservation cover before a valid child can publish", async () => {
+		const ctx = makeCtx({ onActionFatal: vi.fn() });
+		const localFs = ctx.localFs as MockFileSystem;
+		addFile(localFs, "source.md", "source");
+		const source = { ...(await localFs.stat("source.md"))!,
+			hash: await sha256(await localFs.read("source.md")) };
+		const candidatePath = insertConflictSuffix("source.md", source.hash);
+		const action = {
+			action: "conflict", path: "source.md",
+			conflictPolicy: { mode: "preserve", strategy: "duplicate" },
+			protocol: {
+				kind: "preservation_cover", collisionWitnesses: [], candidatePaths: [candidatePath, "broken.md"],
+				preservedPaths: [], cleanup: [], children: [{
+					source: { side: "local", entity: source }, content: { sha256: source.hash, size: source.size },
+					candidatePath, expectedLocal: null, expectedRemote: null,
+					missingSides: ["local", "remote"], publication: { source: undefined, destination: undefined },
+				}, {}],
+			},
+		} as unknown as ConflictAction;
+		const io = spyOnConflictIo(ctx);
+
+		await expect(executePlan(makePlan([action]), ctx))
+			.rejects.toThrow("Conflict preservation protocol is malformed");
+		expectNoConflictIo(io);
+	});
+
+	it.each([
+		["reordered children", {
+			candidatePaths: [
+				insertConflictSuffix("source.md", "a".repeat(64)),
+				insertConflictSuffix("source.md", "b".repeat(64)),
+			],
+			children: [
+				preservationChild("b".repeat(64), insertConflictSuffix("source.md", "b".repeat(64))),
+				preservationChild("a".repeat(64), insertConflictSuffix("source.md", "a".repeat(64))),
+			],
+		}],
+		["invented candidate path", {
+			candidatePaths: ["invented.md"],
+			children: [preservationChild("a".repeat(64), "invented.md")],
+		}],
+		["candidate suffix for different content", {
+			candidatePaths: [insertConflictSuffix("source.md", "b".repeat(64))],
+			children: [preservationChild(
+				"a".repeat(64), insertConflictSuffix("source.md", "b".repeat(64)),
+			)],
+		}],
+		["non-SHA candidate suffix", {
+			candidatePaths: [insertConflictSuffix("source.md", "short")],
+			children: [preservationChild("short", insertConflictSuffix("source.md", "short"))],
+		}],
+		["reordered preserved paths", {
+			candidatePaths: [
+				insertConflictSuffix("source.md", "a".repeat(64)),
+				insertConflictSuffix("source.md", "b".repeat(64)),
+			],
+			preservedPaths: [
+				insertConflictSuffix("source.md", "b".repeat(64)),
+				insertConflictSuffix("source.md", "a".repeat(64)),
+			],
+			children: [],
+		}],
+		["source metadata that disagrees with captured content", {
+			candidatePaths: [insertConflictSuffix("source.md", "a".repeat(64))],
+			children: [{
+				...preservationChild("a".repeat(64), insertConflictSuffix("source.md", "a".repeat(64))),
+				source: {
+					side: "local" as const,
+					entity: {
+						path: "source.md", pathAuthority: "actual_resolved" as const,
+						isDirectory: false, size: 1, mtime: 1, hash: "b".repeat(64),
+					},
+				},
+			}],
+		}],
+		["source size that disagrees with captured content", {
+			candidatePaths: [insertConflictSuffix("source.md", "a".repeat(64))],
+			children: [{
+				...preservationChild("a".repeat(64), insertConflictSuffix("source.md", "a".repeat(64))),
+				source: {
+					side: "local" as const,
+					entity: {
+						path: "source.md", pathAuthority: "actual_resolved" as const,
+						isDirectory: false, size: 2, mtime: 1, hash: "a".repeat(64),
+					},
+				},
+			}],
+		}],
+		["existing destination metadata that disagrees with captured content", {
+			candidatePaths: [insertConflictSuffix("source.md", "a".repeat(64))],
+			children: [{
+				...preservationChild("a".repeat(64), insertConflictSuffix("source.md", "a".repeat(64))),
+				expectedLocal: {
+					path: insertConflictSuffix("source.md", "a".repeat(64)),
+					pathAuthority: "actual_resolved" as const,
+					isDirectory: false, size: 1, mtime: 1, hash: "b".repeat(64),
+				},
+				expectedRemote: null,
+				missingSides: ["remote"] as const,
+			}],
+		}],
+		["existing destination size that disagrees with captured content", {
+			candidatePaths: [insertConflictSuffix("source.md", "a".repeat(64))],
+			children: [{
+				...preservationChild("a".repeat(64), insertConflictSuffix("source.md", "a".repeat(64))),
+				expectedLocal: {
+					path: insertConflictSuffix("source.md", "a".repeat(64)),
+					pathAuthority: "actual_resolved" as const,
+					isDirectory: false, size: 2, mtime: 1, hash: "a".repeat(64),
+				},
+				expectedRemote: null,
+				missingSides: ["remote"] as const,
+			}],
+		}],
+		["directory destination for file content", {
+			candidatePaths: [insertConflictSuffix("source.md", "a".repeat(64))],
+			children: [{
+				...preservationChild("a".repeat(64), insertConflictSuffix("source.md", "a".repeat(64))),
+				expectedLocal: {
+					path: insertConflictSuffix("source.md", "a".repeat(64)),
+					pathAuthority: "actual_resolved" as const,
+					isDirectory: true, size: 1, mtime: 1, hash: "a".repeat(64),
+				},
+				expectedRemote: null,
+				missingSides: ["remote"] as const,
+			}],
+		}],
+	] as const)("rejects preservation cover with %s before every I/O capability", async (_name, protocol) => {
+		const ctx = makeCtx({ onActionFatal: vi.fn() });
+		const io = spyOnConflictIo(ctx);
+		const action = {
+			action: "conflict", path: "source.md",
+			conflictPolicy: { mode: "preserve", strategy: "duplicate" },
+			protocol: {
+				kind: "preservation_cover", collisionWitnesses: [], preservedPaths: [], cleanup: [],
+				...protocol,
+			},
+		} as unknown as ConflictAction;
+
+		await expect(executePlan(makePlan([action]), ctx))
+			.rejects.toThrow("Conflict preservation protocol is malformed");
+		expectNoConflictIo(io);
+	});
+
+	it.each(["duplicate", "prefer_local"] as const)(
+		"accepts a %s candidate-ordered published prefix followed by the remaining child", (strategy) => {
+		const published = insertConflictSuffix("source.md", "a".repeat(64));
+		const remaining = insertConflictSuffix("source.md", "b".repeat(64));
+		const action = {
+			action: "conflict", path: "source.md",
+			conflictPolicy: { mode: "preserve", strategy },
+			protocol: {
+				kind: "preservation_cover", collisionWitnesses: [],
+				candidatePaths: [published, remaining], preservedPaths: [published],
+				children: [preservationChild("b".repeat(64), remaining)], cleanup: [],
+			},
+		} as const;
+
+		expect(conflictContractViolation(action)).toBeUndefined();
+	});
+
+	it.each([
+		["missing protocol", {
+			action: "conflict", path: "note.md",
+			conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" },
+		}, "Conflict protocol missing or invalid"],
+		["non-preserving cover policy", {
+			action: "conflict", path: "note.md",
+			protocol: { kind: "preservation_cover", collisionWitnesses: [], candidatePaths: [],
+				preservedPaths: [], children: [], cleanup: [] },
+			conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" },
+		}, "Conflict policy is incompatible with preservation cover"],
+		["local-win cover policy", {
+			action: "conflict", path: "note.md",
+			protocol: { kind: "preservation_cover", collisionWitnesses: [], candidatePaths: [],
+				preservedPaths: [], children: [], cleanup: [] },
+			conflictPolicy: { mode: "local_win", strategy: "prefer_local" },
+		}, "Conflict policy is incompatible with preservation cover"],
+	] as const)("rejects %s before every filesystem and state operation", async (_name, malformed, message) => {
+		const fatal = vi.fn();
+		const ctx = makeCtx({ onActionFatal: fatal });
+		const io = spyOnConflictIo(ctx);
+
+		await expect(executePlan(makePlan([malformed as unknown as SyncAction]), ctx)).rejects.toThrow(message);
+		expect(fatal).toHaveBeenCalledOnce();
+		expectNoConflictIo(io);
+	});
+
+	it("publishes a completed push from its captured bytes when the local source disappears during the write", async () => {
+		const ctx = makeCtx();
+		const source = ctx.localFs as MockFileSystem;
+		const target = ctx.remoteFs as MockFileSystem;
+		addFile(source, "race.md", "original");
+		const snapshot = (await source.stat("race.md"))!;
+		const write = target.write.bind(target);
+		vi.spyOn(target, "write").mockImplementation(async (path, bytes, mtime) => {
+			const result = await write(path, bytes, mtime);
+			await source.delete("race.md");
+			return result;
+		});
+		const result = await executePlan(makePlan([{
+			action: "push", path: "race.md", local: snapshot,
+		}]), ctx);
+		expect(result.blocked).toEqual([]);
+		expect(result.succeeded).toHaveLength(1);
+		expect(await ctx.committer.stateStore.get("race.md")).toMatchObject({
+			hash: snapshot.hash, localSize: snapshot.size, remoteSize: snapshot.size,
+		});
+	});
+
+	it("does not reread a hashless local source after its captured push is written", async () => {
+		const ctx = makeCtx();
+		const source = ctx.localFs as MockFileSystem;
+		const target = ctx.remoteFs as MockFileSystem;
+		addFile(source, "race.md", "original");
+		const stat = source.stat.bind(source);
+		vi.spyOn(source, "stat").mockImplementation(async (path) => {
+			const entity = await stat(path);
+			return entity ? { ...entity, hash: "", remoteChecksum: undefined } : null;
+		});
+		const snapshot = (await source.stat("race.md"))!;
+		const read = vi.spyOn(source, "read");
+		const write = target.write.bind(target);
+		vi.spyOn(target, "write").mockImplementation(async (path, bytes, mtime) => {
+			const result = await write(path, bytes, mtime);
+			await source.write(path, new TextEncoder().encode("new local").buffer, mtime + 1);
+			return result;
+		});
+
+		const result = await executePlan(makePlan([{
+			action: "push", path: "race.md", local: snapshot,
+		}]), ctx);
+
+		expect(result.blocked).toEqual([]);
+		expect(result.succeeded).toHaveLength(1);
+		expect(read).toHaveBeenCalledOnce();
+		expect(await ctx.committer.stateStore.get("race.md")).toMatchObject({
+			localSize: snapshot.size, remoteSize: snapshot.size,
+		});
+	});
+
+	it("does not publish a push when the remote terminal corrupts the captured bytes", async () => {
+		const ctx = makeCtx();
+		const source = ctx.localFs as MockFileSystem;
+		const target = ctx.remoteFs as MockFileSystem;
+		addFile(source, "race.md", "original");
+		const snapshot = (await source.stat("race.md"))!;
+		const write = target.write.bind(target);
+		vi.spyOn(target, "write").mockImplementation(async (path, bytes, mtime) => {
+			const result = await write(path, bytes, mtime);
+			addFile(target, path, "corrupt!", mtime + 1);
+			return result;
+		});
+
+		const result = await executePlan(makePlan([{
+			action: "push", path: "race.md", local: snapshot,
+		}]), ctx);
+
+		expect(result.succeeded).toEqual([]);
+		expect(result.blocked).toHaveLength(1);
+		expect(await ctx.committer.stateStore.get("race.md")).toBeUndefined();
+	});
+
+	it("does not publish a push when its remote identity is replaced with the same captured bytes", async () => {
+		const ctx = makeCtx();
+		const source = ctx.localFs as MockFileSystem;
+		const target = ctx.remoteFs as MockFileSystem;
+		addFile(source, "race.md", "changed!");
+		addFile(target, "race.md", "original").identityKey = "R";
+		const local = (await source.stat("race.md"))!;
+		const remote = (await target.stat("race.md"))!;
+		const write = target.write.bind(target);
+		vi.spyOn(target, "write").mockImplementation(async (path, bytes, mtime) => {
+			const result = await write(path, bytes, mtime);
+			target.files.get(path)!.entity.identityKey = "replacement";
+			return result;
+		});
+
+		const result = await executePlan(makePlan([{
+			action: "push", path: "race.md", local, remote,
+		}]), ctx);
+
+		expect(result.succeeded).toEqual([]);
+		expect(result.blocked).toHaveLength(1);
+		expect(result.blocked[0]?.reason).toContain("Terminal remote identity changed");
+		expect(await ctx.committer.stateStore.get("race.md")).toBeUndefined();
+	});
+
+	it("does not publish a pull when its remote source disappears during the write", async () => {
+		const ctx = makeCtx();
+		const source = ctx.remoteFs as MockFileSystem;
+		const target = ctx.localFs as MockFileSystem;
+		addFile(source, "race.md", "original");
+		const snapshot = (await source.stat("race.md"))!;
+		const write = target.write.bind(target);
+		vi.spyOn(target, "write").mockImplementation(async (path, bytes, mtime) => {
+			const result = await write(path, bytes, mtime);
+			await source.delete("race.md");
+			return result;
+		});
+		const result = await executePlan(makePlan([{
+			action: "pull", path: "race.md", remote: snapshot,
+		}]), ctx);
+		expect(result.succeeded).toEqual([]);
+		expect(result.blocked).toHaveLength(1);
+		expect(await ctx.committer.stateStore.get("race.md")).toBeUndefined();
+	});
+
+	it("does not publish a pull when its remote source changes to same-size bytes during the write", async () => {
+		const ctx = makeCtx();
+		const source = ctx.remoteFs as MockFileSystem;
+		const target = ctx.localFs as MockFileSystem;
+		addFile(source, "race.md", "original");
+		const snapshot = (await source.stat("race.md"))!;
+		const write = target.write.bind(target);
+		vi.spyOn(target, "write").mockImplementation(async (path, bytes, mtime) => {
+			const result = await write(path, bytes, mtime);
+			await source.write(path, new TextEncoder().encode("modified").buffer, mtime + 1);
+			return result;
+		});
+
+		const result = await executePlan(makePlan([{
+			action: "pull", path: "race.md", remote: snapshot,
+		}]), ctx);
+
+		expect(result.succeeded).toEqual([]);
+		expect(result.blocked).toHaveLength(1);
+		expect(result.blocked[0]?.reason).toContain("Rename terminal bytes changed");
+		expect(readText(target, "race.md")).toBe("original");
+		expect(readText(source, "race.md")).toBe("modified");
+		expect(await ctx.committer.stateStore.get("race.md")).toBeUndefined();
+	});
+
+	it.each(["push", "pull"] as const)("rejects %s read bytes inconsistent with its admitted snapshot before writing", async (kind) => {
+		const ctx = makeCtx();
+		const source = (kind === "push" ? ctx.localFs : ctx.remoteFs) as MockFileSystem;
+		const target = kind === "push" ? ctx.remoteFs : ctx.localFs;
+		addFile(source, "race.md", "original");
+		const snapshot = (await source.stat("race.md"))!;
+		vi.spyOn(source, "read").mockResolvedValue(new TextEncoder().encode("modified").buffer);
+		const write = vi.spyOn(target, "write");
+		const result = await executePlan(makePlan([{
+			action: kind, path: "race.md", ...(kind === "push" ? { local: snapshot } : { remote: snapshot }),
+		}]), ctx);
+		expect(result.succeeded).toEqual([]);
+		expect(result.blocked).toHaveLength(1);
+		expect(write).not.toHaveBeenCalled();
+		expect(await ctx.committer.stateStore.get("race.md")).toBeUndefined();
+	});
+
+	describe("push", () => {
+		it("uploads local file to remote and commits state", async () => {
+			const ctx = makeCtx();
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "a.md", "content");
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+
+			const plan = makePlan([{
+				path: "a.md",
+				action: "push",
+				local: (await localFs.stat("a.md"))!,
+			}]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.succeeded).toHaveLength(1);
+			expect(result.failed).toHaveLength(0);
+			expect(remoteFs.files.has("a.md")).toBe(true);
+			expect(stateStore.records.has("a.md")).toBe(true);
+		});
+
+	});
+
+	describe("pull", () => {
+		it("downloads remote file to local and commits state", async () => {
+			const ctx = makeCtx();
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(remoteFs, "b.md", "remote content");
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+
+			const plan = makePlan([{
+				path: "b.md",
+				action: "pull",
+				remote: (await remoteFs.stat("b.md"))!,
+			}]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.succeeded).toHaveLength(1);
+			expect(result.failed).toHaveLength(0);
+			expect((ctx.localFs as MockFileSystem).files.has("b.md")).toBe(true);
+			expect(stateStore.records.has("b.md")).toBe(true);
+		});
+
+		it("skips provider I/O for an exact action superseded after permit acquisition", async () => {
+			const action: SyncAction = {
+				path: "b.md", action: "pull",
+				remote: { path: "b.md", isDirectory: false, size: 1, mtime: 2, hash: "" },
+			};
+			const plan = makePlan([action]);
+			const admittedAction = plan.actions[0]!;
+			const terminalRecord: SyncRecord = {
+				path: "b.md", hash: "new", localMtime: 2, remoteMtime: 2,
+				localSize: 1, remoteSize: 1, remoteIdentityKey: "remote-id", syncedAt: 2,
+			};
+			const ctx = makeCtx({
+				acquireActionPermit: () => Promise.resolve({ release: vi.fn() }),
+				beginAction: (candidate) => candidate === admittedAction ? { action: admittedAction, terminalRecord } : "run",
+			});
+			const read = vi.spyOn(ctx.remoteFs, "read");
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.superseded).toEqual([{ action: admittedAction, terminalRecord }]);
+			expect(result.succeeded).toEqual([]);
+			expect(read).not.toHaveBeenCalled();
+		});
+
+		it("holds the action permit through SyncRecord commit and result publication", async () => {
+			let released = false;
+			const order: string[] = [];
+			const ctx = makeCtx({
+				acquireActionPermit: () => Promise.resolve({ release: () => {
+					released = true;
+					order.push("release");
+				} }),
+				onProgress: () => { order.push("terminal-published"); },
+			});
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(remoteFs, "permit.md", "x");
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			const compareAndPut = stateStore.compareAndPut.bind(stateStore);
+			const put = vi.spyOn(stateStore, "compareAndPut")
+				.mockImplementation((expectedRow, record, expectedOccupant) => {
+					expect(released).toBe(false);
+					return compareAndPut(expectedRow, record, expectedOccupant);
+				});
+
+			const result = await executePlan(makePlan([{
+				path: "permit.md", action: "pull",
+				remote: (await remoteFs.stat("permit.md"))!,
+			}]), ctx);
+
+			expect(put).toHaveBeenCalledOnce();
+			expect(result.succeeded).toHaveLength(1);
+			expect(released).toBe(true);
+			expect(order).toEqual(["terminal-published", "release"]);
+		});
+
+		it("publishes a fatal terminal state before releasing its permit", async () => {
+			const order: string[] = [];
+			const ctx = makeCtx({
+				acquireActionPermit: () => Promise.resolve({ release: () => { order.push("release"); } }),
+				onActionFatal: () => { order.push("fatal-published"); },
+			});
+			addFile(ctx.remoteFs as MockFileSystem, "fatal.md", "x");
+			const remote = (await ctx.remoteFs.stat("fatal.md"))!;
+			vi.spyOn(ctx.remoteFs, "read").mockRejectedValue(new AuthError("expired", 401));
+
+			await expect(executePlan(makePlan([{
+				path: "fatal.md", action: "pull",
+				remote,
+			}]), ctx)).rejects.toThrow("expired");
+			expect(order).toEqual(["fatal-published", "release"]);
+		});
+
+		it("aborts the cycle on a plain structural auth shape from a remote read (no Error identity)", async () => {
+			const fatal = vi.fn();
+			const ctx = makeCtx({ onActionFatal: fatal });
+			addFile(ctx.remoteFs as MockFileSystem, "fatal-shape.md", "x");
+			const remote = (await ctx.remoteFs.stat("fatal-shape.md"))!;
+			// A separately bundled module throws a plain BackendErrorShape object;
+			// content capture wraps it, and the executor must still abort the cycle.
+			vi.spyOn(ctx.remoteFs, "read").mockRejectedValue(backendError("auth", "credentials expired"));
+
+			await expect(executePlan(makePlan([{
+				path: "fatal-shape.md", action: "pull",
+				remote,
+			}]), ctx)).rejects.toThrow("credentials expired");
+			expect(fatal).toHaveBeenCalledTimes(1);
+		});
+
+		it("retries and signals the transfer pool on a plain structural rate_limit shape from a remote read", async () => {
+			const noteSpy = vi.spyOn(AdaptivePool.prototype, "noteRateLimit");
+			const ctx = makeCtx({
+				classifyError: (err) => classifyBackendError(err) ?? classifyHttpError(err),
+			});
+			addFile(ctx.remoteFs as MockFileSystem, "throttled.md", "x");
+			const remote = (await ctx.remoteFs.stat("throttled.md"))!;
+			const readSpy = vi.spyOn(ctx.remoteFs, "read")
+				.mockRejectedValue(backendError("rate_limit", "slow down", { retryAfterMs: 1 }));
+
+			const result = await executePlan(makePlan([{
+				path: "throttled.md", action: "pull",
+				remote,
+			}]), ctx);
+
+			// Rate-limit (not a generic transient) is what drives the retry and the
+			// adaptive-pool signal; a wrapper that hid the plain shape would classify
+			// as transient and never signal.
+			expect(noteSpy).toHaveBeenCalled();
+			expect(readSpy).toHaveBeenCalledTimes(3);
+			expect(result.failed).toHaveLength(1);
+			// The safe provider diagnostic survives the final throw; it must not
+			// collapse to "[object Object]".
+			expect(result.failed[0]!.error.message).toBe("slow down");
+			// The applied classification is carried on the failure fact for the notice.
+			expect(result.failed[0]!.classification).toBe("rateLimit");
+		});
+
+		it("preserves a plain structural not_found message on the final failure", async () => {
+			const ctx = makeCtx({
+				classifyError: (err) => classifyBackendError(err) ?? classifyHttpError(err),
+			});
+			addFile(ctx.remoteFs as MockFileSystem, "missing.md", "x");
+			const remote = (await ctx.remoteFs.stat("missing.md"))!;
+			const readSpy = vi.spyOn(ctx.remoteFs, "read")
+				.mockRejectedValue(backendError("not_found", "the object is gone"));
+
+			const result = await executePlan(makePlan([{
+				path: "missing.md", action: "pull",
+				remote,
+			}]), ctx);
+
+			expect(readSpy).toHaveBeenCalledTimes(1); // notFound → no retry
+			expect(result.failed).toHaveLength(1);
+			expect(result.failed[0]!.error.message).toBe("the object is gone");
+			expect(result.failed[0]!.classification).toBe("notFound");
+		});
+
+		it("records the provider re-tagged kind for a 403 the classifier calls a rate limit", async () => {
+			// A Google Drive-style classifier: a 403 that is actually a rate limit is
+			// re-tagged so the notice and the retry policy agree.
+			const classifyError = vi.fn((err: unknown) => {
+				const status = (err as { status?: unknown } | null)?.status;
+				return status === 403 ? { kind: "rateLimit" as const } : classifyHttpError(err);
+			});
+			const ctx = makeCtx({ classifyError });
+			addFile(ctx.remoteFs as MockFileSystem, "gated.md", "x");
+			const remote = (await ctx.remoteFs.stat("gated.md"))!;
+			vi.spyOn(ctx.remoteFs, "read")
+				.mockRejectedValue(Object.assign(new Error("forbidden"), { status: 403 }));
+
+			const result = await executePlan(makePlan([{
+				path: "gated.md", action: "pull",
+				remote,
+			}]), ctx);
+
+			expect(result.failed).toHaveLength(1);
+			// The carried kind is the applied re-tag, not the neutral 403 permission default.
+			expect(result.failed[0]!.classification).toBe("rateLimit");
+			// The classification is carried from the retry site: recording the failure
+			// must not invoke the provider classifier a fourth time (it ran once per
+			// bounded retry attempt).
+			expect(classifyError).toHaveBeenCalledTimes(3);
+		});
+	});
+
+	describe("match", () => {
+		it("commits state without file I/O", async () => {
+			const ctx = makeCtx();
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			addFile(ctx.localFs as MockFileSystem, "c.md", "same");
+			addFile(ctx.remoteFs as MockFileSystem, "c.md", "same");
+			const local = (await ctx.localFs.stat("c.md"))!;
+			const remote = (await ctx.remoteFs.stat("c.md"))!;
+			const localRead = vi.spyOn(ctx.localFs, "read");
+			const remoteRead = vi.spyOn(ctx.remoteFs, "read");
+			const localStat = vi.spyOn(ctx.localFs, "stat");
+			const remoteStat = vi.spyOn(ctx.remoteFs, "stat");
+
+			const plan = makePlan([{ path: "c.md", action: "match", local, remote }]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.succeeded).toHaveLength(1);
+			expect(stateStore.records.has("c.md")).toBe(true);
+			expect(localRead).not.toHaveBeenCalled();
+			expect(remoteRead).not.toHaveBeenCalled();
+			expect(localStat).not.toHaveBeenCalled();
+			expect(remoteStat).not.toHaveBeenCalled();
+		});
+
+		it("publishes the admitted observation despite a later local edit", async () => {
+			const ctx = makeCtx();
+			addFile(ctx.localFs as MockFileSystem, "c.md", "original", 1000);
+			addFile(ctx.remoteFs as MockFileSystem, "c.md", "original", 1000);
+			const local = (await ctx.localFs.stat("c.md"))!;
+			const remote = (await ctx.remoteFs.stat("c.md"))!;
+			addFile(ctx.localFs as MockFileSystem, "c.md", "modified", 2000);
+			const result = await executePlan(makePlan([{ path: "c.md", action: "match", local, remote }]), ctx);
+			expect(result.blocked).toEqual([]);
+			expect(result.failed).toEqual([]);
+			expect(result.succeeded).toHaveLength(1);
+			expect(await ctx.committer.stateStore.get("c.md")).toMatchObject({ hash: local.hash, localMtime: 1000 });
+			expect(readText(ctx.localFs as MockFileSystem, "c.md")).toBe("modified");
+			expect(readText(ctx.remoteFs as MockFileSystem, "c.md")).toBe("original");
+		});
+
+		it("does not overwrite a newer SyncRecord when publishing an observation", async () => {
+			const ctx = makeCtx();
+			addFile(ctx.localFs as MockFileSystem, "c.md", "same");
+			addFile(ctx.remoteFs as MockFileSystem, "c.md", "same");
+			const local = (await ctx.localFs.stat("c.md"))!;
+			const remote = (await ctx.remoteFs.stat("c.md"))!;
+			const plan = makePlan([{ path: "c.md", action: "match", local, remote }]);
+			const newer = { ...buildSyncRecord(local, remote, "c.md"), hash: "newer" };
+			await ctx.committer.stateStore.put(newer);
+			const result = await executePlan(plan, ctx);
+			expect(result.succeeded).toEqual([]);
+			expect(result.failed.length + result.blocked.length).toBe(1);
+			expect(await ctx.committer.stateStore.get("c.md")).toEqual(newer);
+		});
+
+		it("retains endpoint verification and prefix blocking for ordered component matches", async () => {
+			const ctx = makeCtx();
+			const actions: SyncAction[] = [];
+			for (const path of ["folder/a.md", "folder/b.md"]) {
+				addFile(ctx.localFs as MockFileSystem, path, "original", 1000);
+				addFile(ctx.remoteFs as MockFileSystem, path, "original", 1000);
+				actions.push({ path, action: "match",
+					local: (await ctx.localFs.stat(path))!, remote: (await ctx.remoteFs.stat(path))! });
+			}
+			addFile(ctx.localFs as MockFileSystem, "folder/a.md", "modified", 2000);
+			const result = await executePlan(makePlan(actions, true), ctx);
+			expect(result.succeeded).toEqual([]);
+			expect(result.blocked.map(({ reason }) => reason)).toEqual([
+				"Endpoint changed before execution: folder/a.md", "component prefix did not publish",
+			]);
+			expect(await ctx.committer.stateStore.get("folder/a.md")).toBeUndefined();
+			expect(await ctx.committer.stateStore.get("folder/b.md")).toBeUndefined();
+		});
+	});
+
+	describe("delete_remote", () => {
+		it("deletes remote file and removes state record", async () => {
+			const ctx = makeCtx();
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(remoteFs, "d.md", "to delete");
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			stateStore.records.set("d.md", {
+				path: "d.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 9, remoteSize: 9, remoteIdentityKey: "id:d.md", syncedAt: 900,
+			});
+
+			const plan = makePlan([{ path: "d.md", action: "delete_remote",
+				remote: (await remoteFs.stat("d.md"))!, baseline: stateStore.records.get("d.md"),
+			}]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.succeeded).toHaveLength(1);
+			expect(remoteFs.files.has("d.md")).toBe(false);
+			expect(stateStore.records.has("d.md")).toBe(false);
+		});
+	});
+
+	describe("delete_local", () => {
+		it("deletes local file and removes state record", async () => {
+			const ctx = makeCtx();
+			const localFs = ctx.localFs as MockFileSystem;
+			addFile(localFs, "e.md", "to delete");
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			stateStore.records.set("e.md", {
+				path: "e.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 9, remoteSize: 9, remoteIdentityKey: "id:e.md", syncedAt: 900,
+			});
+
+			const plan = makePlan([{ path: "e.md", action: "delete_local",
+				local: (await localFs.stat("e.md"))!, baseline: stateStore.records.get("e.md"),
+			}]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.succeeded).toHaveLength(1);
+			expect(localFs.files.has("e.md")).toBe(false);
+			expect(stateStore.records.has("e.md")).toBe(false);
+		});
+	});
+
+	describe("empty-parent prune", () => {
+		it("deletes the remote ancestors an admitted delete emptied", async () => {
+			const ctx = makeCtx();
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(remoteFs, "notes/a.md", "x");
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			stateStore.records.set("notes/a.md", {
+				path: "notes/a.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 1, remoteSize: 1, remoteIdentityKey: "id:notes/a.md", syncedAt: 900,
+			});
+
+			const plan = makePlan([{ path: "notes/a.md", action: "delete_remote",
+				remote: (await remoteFs.stat("notes/a.md"))!, baseline: stateStore.records.get("notes/a.md"),
+				pruneEmptyAncestors: ["notes"],
+			}]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.succeeded).toHaveLength(1);
+			expect(remoteFs.files.has("notes/a.md")).toBe(false);
+			expect(remoteFs.files.has("notes")).toBe(false);
+		});
+
+		it("cascades deepest-first through every ancestor the removal emptied", async () => {
+			const ctx = makeCtx();
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(remoteFs, "a/b/c.md", "x");
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			stateStore.records.set("a/b/c.md", {
+				path: "a/b/c.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 1, remoteSize: 1, remoteIdentityKey: "id:a/b/c.md", syncedAt: 900,
+			});
+
+			const plan = makePlan([{ path: "a/b/c.md", action: "delete_remote",
+				remote: (await remoteFs.stat("a/b/c.md"))!, baseline: stateStore.records.get("a/b/c.md"),
+				pruneEmptyAncestors: ["a/b", "a"],
+			}]);
+
+			await executePlan(plan, ctx);
+
+			expect(remoteFs.files.has("a/b")).toBe(false);
+			expect(remoteFs.files.has("a")).toBe(false);
+		});
+
+		it("keeps a folder that still has a sibling, even a hidden or ignored one", async () => {
+			const ctx = makeCtx();
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(remoteFs, "notes/a.md", "x");
+			addFile(remoteFs, "notes/.keep", "keep");
+			addFile(remoteFs, "notes/ignored.log", "log");
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			stateStore.records.set("notes/a.md", {
+				path: "notes/a.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 1, remoteSize: 1, remoteIdentityKey: "id:notes/a.md", syncedAt: 900,
+			});
+
+			const plan = makePlan([{ path: "notes/a.md", action: "delete_remote",
+				remote: (await remoteFs.stat("notes/a.md"))!, baseline: stateStore.records.get("notes/a.md"),
+				pruneEmptyAncestors: ["notes"],
+			}]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.succeeded).toHaveLength(1);
+			expect(remoteFs.files.has("notes")).toBe(true);
+		});
+
+		it("deletes the local ancestors a propagated delete emptied", async () => {
+			const ctx = makeCtx();
+			const localFs = ctx.localFs as MockFileSystem;
+			addFile(localFs, "notes/a.md", "x");
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			stateStore.records.set("notes/a.md", {
+				path: "notes/a.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 1, remoteSize: 1, remoteIdentityKey: "id:notes/a.md", syncedAt: 900,
+			});
+
+			const plan = makePlan([{ path: "notes/a.md", action: "delete_local",
+				local: (await localFs.stat("notes/a.md"))!, baseline: stateStore.records.get("notes/a.md"),
+				pruneEmptyAncestors: ["notes"],
+			}]);
+
+			await executePlan(plan, ctx);
+
+			expect(localFs.files.has("notes/a.md")).toBe(false);
+			expect(localFs.files.has("notes")).toBe(false);
+		});
+
+		it("keeps the primary delete successful when the emptiness read fails", async () => {
+			const ctx = makeCtx();
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(remoteFs, "notes/a.md", "x");
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			stateStore.records.set("notes/a.md", {
+				path: "notes/a.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 1, remoteSize: 1, remoteIdentityKey: "id:notes/a.md", syncedAt: 900,
+			});
+			vi.spyOn(remoteFs, "hasChildren").mockRejectedValue(new Error("listing unavailable"));
+
+			const plan = makePlan([{ path: "notes/a.md", action: "delete_remote",
+				remote: (await remoteFs.stat("notes/a.md"))!, baseline: stateStore.records.get("notes/a.md"),
+				pruneEmptyAncestors: ["notes"],
+			}]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.succeeded).toHaveLength(1);
+			expect(result.failed).toHaveLength(0);
+			expect(remoteFs.files.has("notes/a.md")).toBe(false);
+			expect(remoteFs.files.has("notes")).toBe(true);
+		});
+
+		it("reads a shared directory at most once per cycle across actions", async () => {
+			const ctx = makeCtx();
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(remoteFs, "notes/a.md", "a");
+			addFile(remoteFs, "notes/b.md", "b");
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			for (const name of ["notes/a.md", "notes/b.md"]) {
+				stateStore.records.set(name, {
+					path: name, hash: "", localMtime: 1000, remoteMtime: 1000,
+					localSize: 1, remoteSize: 1, remoteIdentityKey: `id:${name}`, syncedAt: 900,
+				});
+			}
+			const hasChildren = vi.spyOn(remoteFs, "hasChildren");
+			const plan = makePlan([
+				{ path: "notes/a.md", action: "delete_remote",
+					remote: (await remoteFs.stat("notes/a.md"))!, baseline: stateStore.records.get("notes/a.md"),
+					pruneEmptyAncestors: ["notes"],
+				},
+				{ path: "notes/b.md", action: "delete_remote",
+					remote: (await remoteFs.stat("notes/b.md"))!, baseline: stateStore.records.get("notes/b.md"),
+					pruneEmptyAncestors: ["notes"],
+				},
+			]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.succeeded).toHaveLength(2);
+			expect(hasChildren.mock.calls.filter(([path]) => path === "notes")).toHaveLength(1);
+			expect(remoteFs.files.has("notes")).toBe(false);
+		});
+
+		it("skips reading the ancestors of a folder that is still occupied", async () => {
+			const ctx = makeCtx();
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(remoteFs, "a/b/c.md", "c");
+			addFile(remoteFs, "a/b/keep.md", "keep");
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			stateStore.records.set("a/b/c.md", {
+				path: "a/b/c.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 1, remoteSize: 1, remoteIdentityKey: "id:a/b/c.md", syncedAt: 900,
+			});
+			const hasChildren = vi.spyOn(remoteFs, "hasChildren");
+			const plan = makePlan([{ path: "a/b/c.md", action: "delete_remote",
+				remote: (await remoteFs.stat("a/b/c.md"))!, baseline: stateStore.records.get("a/b/c.md"),
+				pruneEmptyAncestors: ["a/b", "a"],
+			}]);
+
+			await executePlan(plan, ctx);
+
+			// `a/b` is occupied by keep.md, so it and its ancestor `a` are kept and `a`
+			// is never read: a kept directory proves every ancestor occupied.
+			expect(hasChildren.mock.calls.map(([path]) => path)).toEqual(["a/b"]);
+			expect(remoteFs.files.has("a/b/keep.md")).toBe(true);
+			expect(remoteFs.files.has("a")).toBe(true);
+		});
+
+		it("keeps the cycle clean when the emptied directory delete fails", async () => {
+			const ctx = makeCtx();
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(remoteFs, "notes/a.md", "x");
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			stateStore.records.set("notes/a.md", {
+				path: "notes/a.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 1, remoteSize: 1, remoteIdentityKey: "id:notes/a.md", syncedAt: 900,
+			});
+			const originalDelete = remoteFs.delete.bind(remoteFs);
+			vi.spyOn(remoteFs, "delete").mockImplementation(async (path) => {
+				if (path === "notes") throw new Error("delete refused");
+				return originalDelete(path);
+			});
+			const plan = makePlan([{ path: "notes/a.md", action: "delete_remote",
+				remote: (await remoteFs.stat("notes/a.md"))!, baseline: stateStore.records.get("notes/a.md"),
+				pruneEmptyAncestors: ["notes"],
+			}]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.succeeded).toHaveLength(1);
+			expect(result.failed).toHaveLength(0);
+			expect(remoteFs.files.has("notes/a.md")).toBe(false);
+			expect(remoteFs.files.has("notes")).toBe(true);
+		});
+	});
+
+	describe("rename_remote", () => {
+		it("does not commit an unbaselined case-alias rename when content races after the move", async () => {
+			const ctx = makeCtx();
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "case.md", "same");
+			addFile(remoteFs, "Case.md", "same").identityKey = "R";
+			const local = (await localFs.stat("case.md"))!;
+			const remote = (await remoteFs.stat("Case.md"))!;
+			const evidence = [
+				{
+					kind: "alias" as const, side: "local" as const,
+					requestedPath: "Case.md", resolvedPath: "case.md",
+				},
+			];
+			const observations: PathObservation[] = [
+				{ kind: "alias", side: "local", requestedPath: "Case.md", resolvedPath: "case.md", entity: local },
+				{ kind: "exact", side: "local", requestedPath: "case.md", entity: local },
+				{ kind: "exact", side: "remote", requestedPath: "Case.md", entity: remote },
+				{ kind: "absent", side: "remote", requestedPath: "case.md", authority: "stat" },
+			];
+			const plan = admitBatchObservation(captureBatchObservation(
+				[{ path: "Case.md", remote }, { path: "case.md", local }], evidence, observations,
+				{ isConfiguredScopeCompatible: () => true, byEndpoint: new Map([["Case.md", "included"], ["case.md", "included"]]) },
+				"executor-test",
+			)).executable;
+			const rename = remoteFs.rename.bind(remoteFs);
+			vi.spyOn(remoteFs, "rename").mockImplementation(async (oldPath, newPath) => {
+				await rename(oldPath, newPath);
+				addFile(localFs, "case.md", "raced");
+			});
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.blocked).toHaveLength(1);
+			expect(result.succeeded).toEqual([]);
+			expect((ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>)
+				.records.size).toBe(0);
+		});
+
+		it("runs an admitted fresh rename-write as one commit-last action", async () => {
+			const ctx = makeCtx();
+			const { local, remoteFs, stateStore, action } = await arrangeFreshRename(ctx);
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.failed).toEqual([]);
+			expect(readText(remoteFs, "new.md")).toBe("current");
+			expect(remoteFs.files.has("old.md")).toBe(false);
+			expect(stateStore.records.has("old.md")).toBe(false);
+			expect(stateStore.records.get("new.md")?.hash).toBe(local.hash);
+		});
+
+		it("does not retry or commit after a partial fresh rename-write failure", async () => {
+			const ctx = makeCtx();
+			const { remoteFs, stateStore, baseline, action } = await arrangeFreshRename(ctx);
+			const write = vi.spyOn(remoteFs, "write").mockRejectedValue(new Error("write failed"));
+			const rename = vi.spyOn(remoteFs, "rename");
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.failed).toHaveLength(1);
+			expect(rename).toHaveBeenCalledTimes(1);
+			expect(write).toHaveBeenCalledTimes(1);
+			expect(stateStore.records.get("old.md")).toEqual(baseline);
+			expect(stateStore.records.has("new.md")).toBe(false);
+		});
+
+		it("blocks before a rename-write overwrites an occupant that appears after the rename", async () => {
+			const ctx = makeCtx();
+			const { remoteFs, stateStore, baseline, action } = await arrangeFreshRename(ctx);
+			const rename = remoteFs.rename.bind(remoteFs);
+			vi.spyOn(remoteFs, "rename").mockImplementation(async (oldPath, newPath) => {
+				await rename(oldPath, newPath);
+				addFile(remoteFs, newPath, "latent occupant", 3000).identityKey = "X";
+			});
+			const write = vi.spyOn(remoteFs, "write");
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.blocked).toHaveLength(1);
+			expect(result.failed).toEqual([]);
+			expect(write).not.toHaveBeenCalled();
+			expect(readText(remoteFs, "new.md")).toBe("latent occupant");
+			expect(stateStore.records.get("old.md")).toEqual(baseline);
+			expect(stateStore.records.has("new.md")).toBe(false);
+		});
+
+		it("rechecks a same-metadata remote checksum change before rename execution", async () => {
+			const ctx = makeCtx();
+			const { remoteFs, stateStore, baseline, action } = await arrangeFreshRename(ctx);
+			baseline.remoteChecksum = { algo: "md5", value: "Q0" };
+			action.remote!.remoteChecksum = { algo: "md5", value: "Q0" };
+			const remote = remoteFs.files.get("old.md")!.entity;
+			remote.remoteChecksum = { algo: "md5", value: "Q1" };
+			remote.hash = "";
+			const rename = vi.spyOn(remoteFs, "rename");
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.blocked).toHaveLength(1);
+			expect(result.failed).toEqual([]);
+			expect(rename).not.toHaveBeenCalled();
+			expect(stateStore.records.get("old.md")).toEqual(baseline);
+			expect(stateStore.records.has("new.md")).toBe(false);
+		});
+
+		it.each(["observe", "verify", "commit"] as const)(
+			"leaves the old baseline after the fresh %s boundary fails",
+			async (boundary) => {
+				const ctx = makeCtx();
+				const { remoteFs, stateStore, baseline, action } = await arrangeFreshRename(ctx);
+				const rename = vi.spyOn(remoteFs, "rename");
+				if (boundary === "observe") {
+					const original = remoteFs.stat.bind(remoteFs);
+					let destinationStats = 0;
+					vi.spyOn(remoteFs, "stat").mockImplementation((path) => {
+						if (path === "new.md" && ++destinationStats === 2) {
+							return Promise.reject(new Error("observe failed"));
+						}
+						return original(path);
+					});
+				} else if (boundary === "verify") {
+					const original = remoteFs.stat.bind(remoteFs);
+					vi.spyOn(remoteFs, "stat").mockImplementation(async (path) => {
+						const entity = await original(path);
+						return path === "new.md" && entity ? { ...entity, hash: "", remoteChecksum: undefined } : entity;
+					});
+					vi.spyOn(remoteFs, "read").mockRejectedValue(new Error("verify failed"));
+				} else {
+					vi.spyOn(stateStore, "compareAndPut").mockRejectedValue(new Error("commit failed"));
+				}
+
+				const result = await executePlan(makePlan([action]), ctx);
+
+				expect(result.failed).toHaveLength(1);
+				expect(rename).toHaveBeenCalledTimes(1);
+				expect(stateStore.records.get("old.md")).toEqual(baseline);
+				expect(stateStore.records.has("new.md")).toBe(false);
+				expect(remoteFs.files.has("old.md")).toBe(false);
+			},
+		);
+
+		it("renames remote file and commits state at new path", async () => {
+			const ctx = makeCtx();
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "new.md", "content");
+			addFile(remoteFs, "old.md", "content");
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			stateStore.records.set("old.md", {
+				path: "old.md", hash: "h1", localMtime: 1000, remoteMtime: 1000,
+				localSize: 7, remoteSize: 7, remoteIdentityKey: "id:old.md", syncedAt: 900,
+			});
+
+			const plan = makePlan([{
+				path: "new.md",
+				action: "rename_remote",
+				oldPath: "old.md",
+				local: (await localFs.stat("new.md"))!,
+				remote: (await remoteFs.stat("old.md"))!,
+				baseline: stateStore.records.get("old.md"),
+				content: { mode: "equal" },
+			}]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.succeeded).toHaveLength(1);
+			expect(result.failed).toHaveLength(0);
+			expect(remoteFs.files.has("new.md")).toBe(true);
+			expect(remoteFs.files.has("old.md")).toBe(false);
+			expect(stateStore.records.has("new.md")).toBe(true);
+			expect(stateStore.records.has("old.md")).toBe(false);
+		});
+
+	});
+
+	describe("rename_remote with isFolder", () => {
+		it("renames folder on remote and rewrites descendant sync records", async () => {
+			const ctx = makeCtx();
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+
+			// Set up: folder A with 2 files on remote, folder B with same files locally
+			addFile(remoteFs, "A/f1.md", "content1");
+			addFile(remoteFs, "A/f2.md", "content2");
+			addFile(localFs, "B/f1.md", "content1");
+			addFile(localFs, "B/f2.md", "content2");
+			for (const name of ["f1.md", "f2.md"]) stateStore.records.set(`A/${name}`,
+				buildSyncRecord((await localFs.stat(`B/${name}`))!, (await remoteFs.stat(`A/${name}`))!, `A/${name}`));
+
+			const plan = makePlan([{
+				path: "B",
+				action: "rename_remote",
+				oldPath: "A",
+				isFolder: true,
+				local: (await localFs.stat("B"))!, remote: (await remoteFs.stat("A"))!,
+				descendantRecords: ["f1.md", "f2.md"].map((name) => ({
+					oldPath: `A/${name}`, newPath: `B/${name}`,
+					source: stateStore.records.get(`A/${name}`), destination: undefined,
+				})),
+				descendants: [
+					{ oldPath: "A/f1.md", newPath: "B/f1.md" },
+					{ oldPath: "A/f2.md", newPath: "B/f2.md" },
+				],
+			}]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.succeeded).toHaveLength(1);
+			expect(result.failed).toHaveLength(0);
+			// Remote folder was renamed
+			expect(remoteFs.files.has("B/f1.md")).toBe(true);
+			expect(remoteFs.files.has("B/f2.md")).toBe(true);
+			expect(remoteFs.files.has("A/f1.md")).toBe(false);
+			expect(remoteFs.files.has("A/f2.md")).toBe(false);
+			// Descendant sync records were rewritten
+			expect(stateStore.records.has("A/f1.md")).toBe(false);
+			expect(stateStore.records.has("A/f2.md")).toBe(false);
+			expect(stateStore.records.has("B/f1.md")).toBe(true);
+			expect(stateStore.records.has("B/f2.md")).toBe(true);
+		});
+	});
+
+	describe("cleanup", () => {
+		it("removes state record without file I/O", async () => {
+			const ctx = makeCtx();
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			stateStore.records.set("f.md", {
+				path: "f.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 0, remoteSize: 0, remoteIdentityKey: "id:f.md", syncedAt: 900,
+			});
+
+			const plan = makePlan([{ path: "f.md", action: "cleanup", baseline: stateStore.records.get("f.md") }]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.succeeded).toHaveLength(1);
+			expect(stateStore.records.has("f.md")).toBe(false);
+		});
+	});
+
+	describe("conflict", () => {
+		it("publishes every preservation-cover version without mutating originals", async () => {
+			const ctx = makeCtx({});
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "case.md", "local");
+			addFile(remoteFs, "Case.md", "remote");
+			const local = (await localFs.stat("case.md"))!;
+			const remote = (await remoteFs.stat("Case.md"))!;
+			const localCandidate = insertConflictSuffix("Case.md", local.hash);
+			const remoteCandidate = insertConflictSuffix("Case.md", remote.hash);
+			const action: SyncAction = {
+				action: "conflict", path: "Case.md",
+				conflictPolicy: { mode: "preserve", strategy: "duplicate" }, protocol: {
+					kind: "preservation_cover", collisionWitnesses: [], candidatePaths: [localCandidate, remoteCandidate], preservedPaths: [], cleanup: [], children: [
+						{ source: { side: "local", entity: local }, content: { sha256: local.hash, size: local.size },
+							candidatePath: localCandidate, expectedLocal: null, expectedRemote: null,
+							missingSides: ["local", "remote"], publication: { source: undefined, destination: undefined } },
+						{ source: { side: "remote", entity: remote }, content: { sha256: remote.hash, size: remote.size },
+							candidatePath: remoteCandidate, expectedLocal: null, expectedRemote: null,
+							missingSides: ["local", "remote"], publication: { source: undefined, destination: undefined } },
+					],
+				},
+			};
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.failed).toEqual([]);
+			expect(result.blocked).toEqual([]);
+			expect(readText(localFs, "case.md")).toBe("local");
+			expect(readText(remoteFs, "Case.md")).toBe("remote");
+			expect(readText(remoteFs, localCandidate)).toBe("local");
+			expect(readText(localFs, remoteCandidate)).toBe("remote");
+			expect(await ctx.committer.stateStore.get(localCandidate)).toBeDefined();
+			expect(await ctx.committer.stateStore.get(remoteCandidate)).toBeDefined();
+			expect(result.conflicts).toHaveLength(1);
+		});
+
+		it("accepts an admitted candidate alias and writes only the missing side", async () => {
+			const ctx = makeCtx({});
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "case.md", "local");
+			const source = (await localFs.stat("case.md"))!;
+			const candidatePath = insertConflictSuffix("Case.md", source.hash);
+			const resolvedPath = candidatePath.toLowerCase();
+			addFile(localFs, resolvedPath, "local");
+			const expectedLocal = (await localFs.stat(resolvedPath))!;
+			const exactLocalStat = localFs.stat.bind(localFs);
+			vi.spyOn(localFs, "stat").mockImplementation((path) =>
+				path === candidatePath ? exactLocalStat(resolvedPath) : exactLocalStat(path));
+			const action: SyncAction = {
+				action: "conflict", path: "Case.md",
+				conflictPolicy: { mode: "preserve", strategy: "duplicate" }, protocol: {
+					kind: "preservation_cover", collisionWitnesses: [], candidatePaths: [candidatePath], preservedPaths: [], cleanup: [], children: [{
+						source: { side: "local", entity: source },
+						content: { sha256: source.hash, size: source.size },
+						candidatePath, expectedLocal, expectedRemote: null,
+						missingSides: ["remote"], publication: { source: undefined, destination: undefined },
+					}],
+				},
+			};
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.failed).toEqual([]);
+			expect(result.blocked).toEqual([]);
+			expect(readText(localFs, resolvedPath)).toBe("local");
+			expect(readText(remoteFs, candidatePath)).toBe("local");
+			expect(await ctx.committer.stateStore.get(candidatePath)).toBeDefined();
+		});
+
+		it("executes an admitted three-version collision cover end to end", async () => {
+			const ctx = makeCtx({});
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "case.md", "local");
+			addFile(localFs, "third.md", "third");
+			addFile(remoteFs, "Case.md", "remote").identityKey = "R";
+			const local = (await localFs.stat("case.md"))!;
+			const third = (await localFs.stat("third.md"))!;
+			const remote = (await remoteFs.stat("Case.md"))!;
+			const candidatePaths = [local, third, remote].map((entity) => insertConflictSuffix("Case.md", entity.hash));
+			const candidateObservations: PathObservation[] = candidatePaths.flatMap((requestedPath) =>
+				(["local", "remote"] as const).map((side) => ({
+					kind: "absent" as const, side, requestedPath, authority: "stat" as const,
+				})));
+			const observations: PathObservation[] = [
+				{ kind: "alias", side: "local", requestedPath: "Case.md", resolvedPath: "case.md", entity: local },
+				{ kind: "exact", side: "local", requestedPath: "case.md", entity: local },
+				{ kind: "exact", side: "local", requestedPath: "third.md", entity: third },
+				{ kind: "exact", side: "remote", requestedPath: "Case.md", entity: remote },
+				{ kind: "absent", side: "remote", requestedPath: "case.md", authority: "stat" },
+				{ kind: "absent", side: "remote", requestedPath: "third.md", authority: "stat" },
+			];
+			const candidateFacts: CandidateFact[] = candidatePaths.map((requestedPath) => ({
+				requestedPath,
+				local: candidateObservations.find((item) => item.side === "local" && item.requestedPath === requestedPath)!,
+				remote: candidateObservations.find((item) => item.side === "remote" && item.requestedPath === requestedPath)!,
+				baseline: null,
+			}));
+			const evidence = [
+				{ kind: "alias" as const, side: "local" as const, requestedPath: "Case.md", resolvedPath: "case.md" },
+				{ kind: "rename" as const, side: "local" as const, oldPath: "Case.md", newPath: "third.md",
+					isFolder: false, authority: "reported" as const },
+				{ kind: "rename" as const, side: "remote" as const, oldPath: "case.md", newPath: "third.md",
+					isFolder: false, authority: "reported" as const },
+			];
+			const paths = ["Case.md", "case.md", "third.md", ...candidatePaths];
+			const admitted = admitBatchObservation(captureBatchObservation(
+				[{ path: "Case.md", remote }, { path: "case.md", local }, { path: "third.md", local: third }],
+				evidence, observations,
+				{ isConfiguredScopeCompatible: () => true,
+					byEndpoint: new Map(paths.map((path) => [path, "included" as const])) },
+				"three-version-executor-test", undefined, candidateFacts,
+			));
+
+			expect(admitted.failures).toEqual([]);
+			const result = await executePlan(admitted.executable, ctx);
+
+			expect(result.failed).toEqual([]);
+			expect(result.blocked).toEqual([]);
+			expect(candidatePaths.map((path) => readText(localFs, path))).toEqual(["local", "third", "remote"]);
+			expect(candidatePaths.map((path) => readText(remoteFs, path))).toEqual(["local", "third", "remote"]);
+			const records = await Promise.all(candidatePaths.map((path) => ctx.committer.stateStore.get(path)));
+			expect(records.every((record) => record !== undefined)).toBe(true);
+			expect(result.conflicts[0]?.resolution.duplicatePaths).toEqual(candidatePaths);
+			expect(result.conflicts[0]?.resolution.duplicatePath).toBe(candidatePaths[0]);
+		});
+
+		it("retains a published cover prefix when a later destination appears", async () => {
+			const ctx = makeCtx({});
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "case.md", "local");
+			addFile(remoteFs, "Case.md", "remote");
+			const local = (await localFs.stat("case.md"))!;
+			const remote = (await remoteFs.stat("Case.md"))!;
+			const localCandidate = insertConflictSuffix("Case.md", local.hash);
+			const remoteCandidate = insertConflictSuffix("Case.md", remote.hash);
+			const action: SyncAction = { action: "conflict", path: "Case.md",
+				conflictPolicy: { mode: "preserve", strategy: "duplicate" }, protocol: {
+				kind: "preservation_cover", collisionWitnesses: [], candidatePaths: [localCandidate, remoteCandidate], preservedPaths: [], cleanup: [], children: [
+					{ source: { side: "local", entity: local }, content: { sha256: local.hash, size: local.size }, candidatePath: localCandidate, expectedLocal: null, expectedRemote: null, missingSides: ["local", "remote"], publication: { source: undefined, destination: undefined } },
+					{ source: { side: "remote", entity: remote }, content: { sha256: remote.hash, size: remote.size }, candidatePath: remoteCandidate, expectedLocal: null, expectedRemote: null, missingSides: ["local", "remote"], publication: { source: undefined, destination: undefined } },
+				],
+			} };
+			const originalWrite = remoteFs.write.bind(remoteFs);
+			vi.spyOn(remoteFs, "write").mockImplementation(async (path, content, mtime) => {
+				const written = await originalWrite(path, content, mtime);
+				if (path === localCandidate) addFile(localFs, remoteCandidate, "foreign");
+				return written;
+			});
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.blocked).toHaveLength(1);
+			expect(await ctx.committer.stateStore.get(localCandidate)).toBeDefined();
+			expect(await ctx.committer.stateStore.get(remoteCandidate)).toBeUndefined();
+			expect(readText(localFs, remoteCandidate)).toBe("foreign");
+			expect(result.conflicts).toHaveLength(1);
+			expect(result.conflicts[0]?.resolution.duplicatePath).toBe(localCandidate);
+			expect(result.conflicts[0]?.resolution.duplicatePaths).toEqual([localCandidate]);
+		});
+
+		it("preserves then rotates the tracked identity and returns terminal proof", async () => {
+			const ctx = makeCtx({});
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			addFile(localFs, "new.md", "local current", 2000);
+			const local = (await localFs.stat("new.md"))!;
+			addFile(remoteFs, "old.md", "remote changed", 1500).identityKey = "R";
+			const source = (await remoteFs.stat("old.md"))!;
+			const baseline: SyncRecord = {
+				path: "old.md", hash: "baseline", localMtime: 1000, remoteMtime: 1000,
+				localSize: 8, remoteSize: 8, remoteIdentityKey: "R", syncedAt: 900,
+			};
+			stateStore.records.set("old.md", baseline);
+			const action: SyncAction = {
+				path: "new.md", action: "conflict", local, remote: source, baseline,
+				protocol: { kind: "same_path" },
+				conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" },
+				remoteIdentitySource: source,
+				publication: { source: baseline, destination: undefined },
+			};
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.failed).toEqual([]);
+			expect(result.blocked).toEqual([]);
+			expect(readText(remoteFs, "new.md")).toBe("local current");
+			expect(readText(remoteFs, "new.conflict.md")).toBe("remote changed");
+			expect(remoteFs.files.has("old.md")).toBe(false);
+			expect(remoteFs.files.get("new.md")?.entity.identityKey).toBe("R");
+			expect(result.succeeded[0]?.terminalProof).toBeDefined();
+			expect(result.conflicts[0]?.terminalProof).toBe(
+				result.succeeded[0]?.terminalProof,
+			);
+			expect(stateStore.records.get("new.md")?.remoteIdentityKey).toBe("R");
+		});
+
+		it("blocks incomplete preservation coverage before any original-path effect", async () => {
+			const ctx = makeCtx({});
+			const { action, localFs, remoteFs, stateStore, baseline } = await arrangeFreshConflict(ctx);
+			const localWrite = vi.spyOn(localFs, "write");
+			const remoteWrite = vi.spyOn(remoteFs, "write");
+			const remoteDelete = vi.spyOn(remoteFs, "delete");
+			const remoteRename = vi.spyOn(remoteFs, "rename");
+			ctx.conflictResolver = () => Promise.resolve({
+				action: "duplicated", targetContent: new TextEncoder().encode("local current").buffer,
+				targetMtime: 2000, verifiedOutputs: [],
+			});
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.blocked).toHaveLength(1);
+			expect(result.failed).toEqual([]);
+			expect(localWrite).not.toHaveBeenCalled();
+			expect(remoteWrite).not.toHaveBeenCalled();
+			expect(remoteDelete).not.toHaveBeenCalled();
+			expect(remoteRename).not.toHaveBeenCalled();
+			expect(stateStore.records.get("old.md")).toEqual(baseline);
+			expect(stateStore.records.has("new.md")).toBe(false);
+		});
+
+		it("blocks when rename reports success but the source remains", async () => {
+			const ctx = makeCtx({});
+			const { action, remoteFs, stateStore, baseline } = await arrangeFreshConflict(ctx);
+			vi.spyOn(remoteFs, "rename").mockResolvedValue(undefined);
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.blocked).toHaveLength(1);
+			expect(result.failed).toEqual([]);
+			expect(remoteFs.files.has("old.md")).toBe(true);
+			expect(stateStore.records.get("old.md")).toEqual(baseline);
+			expect(stateStore.records.has("new.md")).toBe(false);
+		});
+
+		it("blocks terminal identity mismatch without committing", async () => {
+			const ctx = makeCtx({});
+			const { action, remoteFs, stateStore } = await arrangeFreshConflict(ctx);
+			const originalRename = remoteFs.rename.bind(remoteFs);
+			vi.spyOn(remoteFs, "rename").mockImplementation(async (oldPath, newPath) => {
+				await originalRename(oldPath, newPath);
+				remoteFs.files.get(newPath)!.entity.identityKey = "wrong";
+			});
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.blocked).toHaveLength(1);
+			expect(result.failed).toEqual([]);
+			expect(stateStore.records.has("new.md")).toBe(false);
+		});
+
+		it("blocks terminal byte mismatch without committing", async () => {
+			const ctx = makeCtx({});
+			const { action, remoteFs, stateStore } = await arrangeFreshConflict(ctx);
+			const write = remoteFs.write.bind(remoteFs);
+			vi.spyOn(remoteFs, "write").mockImplementation((path, content, mtime) => write(path,
+				path === "new.md" ? new TextEncoder().encode("x".repeat(content.byteLength)).buffer : content, mtime));
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.blocked).toHaveLength(1);
+			expect(stateStore.records.has("new.md")).toBe(false);
+		});
+
+		it("blocks when tracked R changes after preservation and before destructive effects", async () => {
+			const ctx = makeCtx({});
+			const { action, remoteFs, stateStore, baseline } = await arrangeFreshConflict(ctx, true);
+			const rename = vi.spyOn(remoteFs, "rename");
+			const deleteTarget = vi.spyOn(remoteFs, "delete");
+			ctx.conflictResolver = async (resolverCtx, strategy) => {
+				const resolution = await resolveConflict(resolverCtx, strategy);
+				await remoteFs.write("old.md", new TextEncoder().encode("new R version").buffer, 3000);
+				return resolution;
+			};
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.blocked).toHaveLength(1);
+			expect(result.failed).toEqual([]);
+			expect(rename).not.toHaveBeenCalled();
+			expect(deleteTarget).not.toHaveBeenCalled();
+			expect(stateStore.records.get("old.md")).toEqual(baseline);
+			expect(readText(remoteFs, "old.md")).toBe("new R version");
+			expect(readText(remoteFs, "new.conflict.md")).toBe("remote changed");
+		});
+
+		it("blocks when destination Y changes after preservation and before deletion", async () => {
+			const ctx = makeCtx({});
+			const { action, remoteFs, stateStore, baseline } = await arrangeFreshConflict(ctx, true);
+			const rename = vi.spyOn(remoteFs, "rename");
+			const deleteTarget = vi.spyOn(remoteFs, "delete");
+			ctx.conflictResolver = async (resolverCtx, strategy) => {
+				const resolution = await resolveConflict(resolverCtx, strategy);
+				await remoteFs.write("new.md", new TextEncoder().encode("new Z version").buffer, 3000);
+				return resolution;
+			};
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.blocked).toHaveLength(1);
+			expect(result.failed).toEqual([]);
+			expect(rename).not.toHaveBeenCalled();
+			expect(deleteTarget).not.toHaveBeenCalled();
+			expect(stateStore.records.get("old.md")).toEqual(baseline);
+			expect(readText(remoteFs, "new.md")).toBe("new Z version");
+			expect(readText(remoteFs, "new.conflict-2.md")).toBe("foreign occupant");
+		});
+
+		it("does not invent tracked identity authority for a foreign-only target", async () => {
+			const ctx = makeCtx({});
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "new.md", "local current", 2000);
+			const local = (await localFs.stat("new.md"))!;
+			const foreign = addFile(remoteFs, "new.md", "foreign", 1500);
+			foreign.identityKey = "Y";
+			const baseline: SyncRecord = {
+				path: "old.md", hash: "baseline", localMtime: 1000, remoteMtime: 1000,
+				localSize: 8, remoteSize: 8, syncedAt: 900,
+				remoteIdentityKey: "R",
+			};
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			stateStore.records.set("old.md", baseline);
+			const action: SyncAction = {
+				path: "new.md", action: "conflict", local, remote: (await remoteFs.stat("new.md"))!, baseline,
+				protocol: { kind: "same_path" },
+				conflictPolicy: { mode: "preserve", strategy: "duplicate" },
+				publication: { source: baseline, destination: undefined },
+			};
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.failed).toEqual([]);
+			expect(result.blocked).toEqual([]);
+			expect(readText(remoteFs, "new.conflict.md")).toBe("foreign");
+			expect(readText(remoteFs, "new.md")).toBe("local current");
+			expect(remoteFs.files.get("new.md")?.entity.identityKey).not.toBe("R");
+			expect(result.succeeded[0]?.terminalProof).toBeDefined();
+		});
+
+		it("converges a vacant target when the tracked remote identity is absent", async () => {
+			const ctx = makeCtx({});
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "new.md", "local current", 2000);
+			const local = (await localFs.stat("new.md"))!;
+			const baseline: SyncRecord = {
+				path: "old.md", hash: "baseline", localMtime: 1000, remoteMtime: 1000,
+				localSize: 8, remoteSize: 8, remoteIdentityKey: "R", syncedAt: 900,
+			};
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			stateStore.records.set("old.md", baseline);
+			const action: SyncAction = {
+				path: "new.md", action: "conflict", local, baseline,
+				protocol: { kind: "same_path" },
+				conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" },
+				publication: { source: baseline, destination: undefined },
+			};
+
+			const result = await executePlan(makePlan([action]), ctx);
+
+			expect(result.failed).toEqual([]);
+			expect(result.blocked).toEqual([]);
+			expect(readText(remoteFs, "new.md")).toBe("local current");
+			expect(remoteFs.files.has("old.md")).toBe(false);
+			expect(stateStore.records.has("old.md")).toBe(false);
+			expect(stateStore.records.has("new.md")).toBe(true);
+			expect(result.succeeded[0]?.terminalProof).toBeDefined();
+		});
+
+		it.each(["delete", "rename", "local_write", "remote_write", "terminal_read"] as const)(
+			"does not commit, retry, or roll back after the %s cut fails",
+			async (cut) => {
+				const ctx = makeCtx({});
+				const { action, localFs, remoteFs, stateStore, baseline } =
+					await arrangeFreshConflict(ctx, true);
+				const originalLocalWrite = localFs.write.bind(localFs);
+				const originalRemoteWrite = remoteFs.write.bind(remoteFs);
+				const originalRemoteRead = remoteFs.read.bind(remoteFs);
+				const deleteSpy = vi.spyOn(remoteFs, "delete");
+				const renameSpy = vi.spyOn(remoteFs, "rename");
+				if (cut === "delete") deleteSpy.mockRejectedValue(new Error("delete cut"));
+				if (cut === "rename") renameSpy.mockRejectedValue(new Error("rename cut"));
+				const localWrite = vi.spyOn(localFs, "write").mockImplementation((path, bytes, mtime) =>
+					cut === "local_write" && path === "new.md"
+						? Promise.reject(new Error("local write cut"))
+						: originalLocalWrite(path, bytes, mtime));
+				const remoteWrite = vi.spyOn(remoteFs, "write").mockImplementation((path, bytes, mtime) =>
+					cut === "remote_write" && path === "new.md"
+						? Promise.reject(new Error("remote write cut"))
+						: originalRemoteWrite(path, bytes, mtime));
+				const originalStat = remoteFs.stat.bind(remoteFs);
+				vi.spyOn(remoteFs, "stat").mockImplementation(async (path) => {
+					const entity = await originalStat(path);
+					return cut === "terminal_read" && path === "new.md" && entity &&
+						remoteWrite.mock.calls.some(([written]) => written === path)
+						? { ...entity, hash: "", remoteChecksum: undefined } : entity;
+				});
+				vi.spyOn(remoteFs, "read").mockImplementation((path) =>
+					cut === "terminal_read" && path === "new.md" && remoteWrite.mock.calls.some(([written]) => written === path)
+						? Promise.reject(new Error("terminal read cut"))
+						: originalRemoteRead(path));
+
+				const result = await executePlan(makePlan([action]), ctx);
+
+				expect(result.failed).toHaveLength(1);
+				expect(result.succeeded).toEqual([]);
+				expect(stateStore.records.get("old.md")).toEqual(baseline);
+				expect(stateStore.records.has("new.md")).toBe(false);
+				expect(deleteSpy.mock.calls.filter(([path]) => path === "new.md")).toHaveLength(1);
+				expect(renameSpy).toHaveBeenCalledTimes(cut === "delete" ? 0 : 1);
+				expect(localWrite.mock.calls.filter(([path]) => path === "new.md").length).toBeLessThanOrEqual(1);
+				expect(remoteWrite.mock.calls.filter(([path]) => path === "new.md").length).toBeLessThanOrEqual(1);
+				if (cut === "local_write" || cut === "remote_write" || cut === "terminal_read") {
+					expect(remoteFs.files.has("old.md")).toBe(false);
+				}
+			},
+		);
+
+		it("fails fast on a resolver invariant contradiction", async () => {
+			const fatal = vi.fn();
+			const ctx = makeCtx({onActionFatal: fatal });
+			const { action } = await arrangeFreshConflict(ctx);
+			ctx.conflictResolver = () => Promise.resolve({
+				action: "duplicated",
+				verifiedOutputs: [{
+					role: "primary", path: "new.conflict.md", sourcePath: "old.md",
+					sourceEntity: action.remote!, sourceContent: new ArrayBuffer(0),
+				}],
+			});
+
+			await expect(executePlan(makePlan([action]), ctx)).rejects.toThrow(
+				"Fresh resolver omitted target content",
+			);
+			expect(fatal).toHaveBeenCalledOnce();
+		});
+
+		it("publishes and aborts through the existing auth path for typed resolver auth failure", async () => {
+			const fatal = vi.fn();
+			const ctx = makeCtx({onActionFatal: fatal });
+			const { action, stateStore } = await arrangeFreshConflict(ctx);
+			const auth = new AuthError("expired", 401);
+			ctx.conflictResolver = () => Promise.reject(new ContentProofError(
+				"external_auth_failure", "source unreadable", { cause: auth },
+			));
+
+			await expect(executePlan(makePlan([action]), ctx)).rejects.toBe(auth);
+			expect(fatal).toHaveBeenCalledWith(expect.anything(), auth);
+			expect(stateStore.records.has("new.md")).toBe(false);
+		});
+
+		it("resolves conflict and records it in both succeeded and conflicts arrays", async () => {
+			const ctx = makeCtx({});
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "g.md", "local version");
+			addFile(remoteFs, "g.md", "remote version");
+
+			const plan = makePlan([{
+				path: "g.md",
+				action: "conflict",
+				protocol: { kind: "same_path" },
+				conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" },
+				local: (await localFs.stat("g.md"))!,
+				remote: (await remoteFs.stat("g.md"))!,
+			}]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.conflicts).toHaveLength(1);
+			expect(result.succeeded).toHaveLength(1);
+			expect(result.failed).toHaveLength(0);
+		});
+
+		it("records conflict in failed array when resolveConflict throws a non-Auth error", async () => {
+			const ctx = makeCtx({});
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "err.md", "local version");
+			addFile(remoteFs, "err.md", "remote version");
+
+			// Fail the first required preservation read. Compound conflicts are not retried.
+			vi.spyOn(localFs, "read").mockRejectedValue(new Error("I/O error"));
+
+			const plan = makePlan([{
+				path: "err.md",
+				action: "conflict",
+				protocol: { kind: "same_path" },
+				conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" },
+				local: (await localFs.stat("err.md"))!,
+				remote: (await remoteFs.stat("err.md"))!,
+			}]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.failed).toHaveLength(1);
+			expect(result.failed[0]!.action.path).toBe("err.md");
+			expect(result.conflicts).toHaveLength(0);
+			expect(result.succeeded).toHaveLength(0);
+		});
+	});
+
+	describe("error isolation", () => {
+		it("records failed action and continues processing remaining actions", async () => {
+			const ctx = makeCtx();
+			const localFs = ctx.localFs as MockFileSystem;
+			addFile(localFs, "good.md", "good content");
+			addFile(localFs, "missing.md", "unreadable");
+			const read = localFs.read.bind(localFs);
+			vi.spyOn(localFs, "read").mockImplementation((path) => path === "missing.md"
+				? Promise.reject(new Error("read failed")) : read(path));
+
+			const plan = makePlan([
+				{
+					path: "missing.md",
+					action: "push",
+					local: (await localFs.stat("missing.md"))!,
+				},
+				{
+					path: "good.md",
+					action: "push",
+					local: (await localFs.stat("good.md"))!,
+				},
+			]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.failed).toHaveLength(1);
+			expect(result.failed[0]!.action.path).toBe("missing.md");
+			expect(result.succeeded).toHaveLength(1);
+			expect(result.succeeded[0]!.action.path).toBe("good.md");
+		});
+
+		it("waits for scheduled transfer siblings before propagating AuthError", async () => {
+			let aborted = false;
+			const fatal = vi.fn().mockImplementation(() => { aborted = true; });
+			const ctx = makeCtx({
+				onActionFatal: fatal,
+				beginAction: () => aborted ? "invalidated" : "run",
+				transferPool: { min: 1, start: 2, max: 2, rampAfter: 100 },
+			});
+			const authErr = new AuthError("Unauthorized", 401);
+			let releaseSibling!: () => void;
+			const siblingGate = new Promise<void>((resolve) => { releaseSibling = resolve; });
+
+			const localFs = ctx.localFs as MockFileSystem;
+			// Use path-based logic so the correct file triggers AuthError regardless of concurrency order
+			for (const path of ["auth-fail.md", "other.md", "queued.md"]) addFile(localFs, path, "");
+			const read = vi.spyOn(localFs, "read").mockImplementation((path: string) => {
+				if (path === "auth-fail.md") return Promise.reject(authErr);
+				return siblingGate.then(() => new ArrayBuffer(0));
+			});
+
+			const plan = makePlan([
+				{
+					path: "auth-fail.md",
+					action: "push",
+					local: (await localFs.stat("auth-fail.md"))!,
+				},
+				{
+					path: "other.md",
+					action: "push",
+					local: (await localFs.stat("other.md"))!,
+				},
+				{
+					path: "queued.md",
+					action: "push",
+					local: (await localFs.stat("queued.md"))!,
+				},
+			]);
+
+			const execution = executePlan(plan, ctx);
+			let rejected = false;
+			void execution.catch(() => { rejected = true; });
+			await vi.waitFor(() => expect(fatal).toHaveBeenCalledWith(expect.anything(), authErr));
+			expect(rejected).toBe(false);
+
+			releaseSibling();
+			await expect(execution).rejects.toBe(authErr);
+			expect(read).not.toHaveBeenCalledWith("queued.md");
+		});
+
+		it("preserves the first structural rejection across nested sibling settlement", async () => {
+			const ctx = makeCtx();
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			const localFs = ctx.localFs as MockFileSystem;
+			addFile(remoteFs, "first.md", "first");
+			addFile(remoteFs, "slow.md", "slow");
+			addFile(localFs, "second.md", "second");
+			const first = new AuthError("first", 401);
+			const second = new AuthError("second", 401);
+			let signalFirst!: () => void;
+			const firstObserved = new Promise<void>((resolve) => { signalFirst = resolve; });
+			let releaseSlow!: () => void;
+			const slow = new Promise<void>((resolve) => { releaseSlow = resolve; });
+			const remoteDelete = remoteFs.delete.bind(remoteFs);
+			vi.spyOn(remoteFs, "delete").mockImplementation((path) => {
+				if (path === "first.md") {
+					signalFirst();
+					return Promise.reject(first);
+				}
+				return slow.then(() => remoteDelete(path));
+			});
+			vi.spyOn(localFs, "delete").mockImplementation(() =>
+				firstObserved.then(() => Promise.reject(second)));
+
+			const execution = executePlan(makePlan([
+				{ path: "first.md", action: "delete_remote", remote: (await remoteFs.stat("first.md"))! },
+				{ path: "slow.md", action: "delete_remote", remote: (await remoteFs.stat("slow.md"))! },
+				{ path: "second.md", action: "delete_local", local: (await localFs.stat("second.md"))! },
+			]), ctx);
+			await firstObserved;
+			await Promise.resolve();
+			releaseSlow();
+
+			await expect(execution).rejects.toBe(first);
+		});
+
+		it("aborts the cycle on AuthError during a remote delete (structural phase)", async () => {
+			const ctx = makeCtx();
+			const authErr = new AuthError("Unauthorized", 401);
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(remoteFs, "del1.md", "content");
+			addFile(remoteFs, "del2.md", "content");
+			// Path-based so the AuthError is deterministic regardless of pool order.
+			// Deletes are pooled now, so a sibling may already have started — we assert
+			// only that the AuthError propagates and aborts, NOT sibling survival.
+			const origDelete = remoteFs.delete.bind(remoteFs);
+			vi.spyOn(remoteFs, "delete").mockImplementation((path: string) => {
+				if (path === "del1.md") return Promise.reject(authErr);
+				return origDelete(path);
+			});
+
+			const plan = makePlan([
+				{ path: "del1.md", action: "delete_remote", remote: (await remoteFs.stat("del1.md"))! },
+				{ path: "del2.md", action: "delete_remote", remote: (await remoteFs.stat("del2.md"))! },
+			]);
+
+			await expect(executePlan(plan, ctx)).rejects.toThrow(AuthError);
+		});
+
+		it("aborts the cycle on AuthError during a local delete (structural phase)", async () => {
+			const ctx = makeCtx();
+			const authErr = new AuthError("Unauthorized", 401);
+			const localFs = ctx.localFs as MockFileSystem;
+			addFile(localFs, "del1.md", "content");
+			addFile(localFs, "del2.md", "content");
+			const origDelete = localFs.delete.bind(localFs);
+			vi.spyOn(localFs, "delete").mockImplementation((path: string) => {
+				if (path === "del1.md") return Promise.reject(authErr);
+				return origDelete(path);
+			});
+
+			const plan = makePlan([
+				{ path: "del1.md", action: "delete_local", local: (await localFs.stat("del1.md"))! },
+				{ path: "del2.md", action: "delete_local", local: (await localFs.stat("del2.md"))! },
+			]);
+
+			await expect(executePlan(plan, ctx)).rejects.toThrow(AuthError);
+		});
+
+		it("aborts the cycle on AuthError during a conflict (conflict phase)", async () => {
+			const order: string[] = [];
+			const ctx = makeCtx({
+				acquireActionPermit: () => Promise.resolve({ release: () => { order.push("release"); } }),
+				onActionFatal: () => { order.push("fatal-published"); },
+			});
+			const authErr = new AuthError("Unauthorized", 401);
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "c1.md", "local");
+			addFile(remoteFs, "c1.md", "remote");
+			addFile(localFs, "c2.md", "local2");
+			addFile(remoteFs, "c2.md", "remote2");
+			vi.spyOn(localFs, "stat").mockRejectedValueOnce(authErr);
+
+			const plan = makePlan([
+				{
+					path: "c1.md",
+					action: "conflict",
+					protocol: { kind: "same_path" },
+					conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" },
+					local: { path: "c1.md", isDirectory: false, size: 5, mtime: 2000, hash: "l" },
+					remote: { path: "c1.md", isDirectory: false, size: 6, mtime: 1500, hash: "r" },
+				},
+				{
+					path: "c2.md",
+					action: "conflict",
+					protocol: { kind: "same_path" },
+					conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" },
+					local: { path: "c2.md", isDirectory: false, size: 6, mtime: 2000, hash: "l2" },
+					remote: { path: "c2.md", isDirectory: false, size: 7, mtime: 1500, hash: "r2" },
+				},
+			]);
+
+			await expect(executePlan(plan, ctx)).rejects.toThrow(AuthError);
+			expect(order).toEqual(["fatal-published", "release"]);
+		});
+
+		it("logs error for failed individual action", async () => {
+			const errorSpy = vi.fn();
+			const ctx = makeCtx({
+				logger: {
+					debug: vi.fn(),
+					info: vi.fn(),
+					warn: vi.fn(),
+					error: errorSpy,
+				} as unknown as ExecutionContext["logger"],
+			});
+
+			addFile(ctx.localFs as MockFileSystem, "no-such-file.md", "unreadable");
+			const local = (await ctx.localFs.stat("no-such-file.md"))!;
+			vi.spyOn(ctx.localFs, "read").mockRejectedValue(new Error("read failed"));
+			const plan = makePlan([{
+				path: "no-such-file.md",
+				action: "push",
+				local,
+			}]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.failed).toHaveLength(1);
+			expect(errorSpy).toHaveBeenCalled();
+		});
+	});
+
+	describe("phase scheduling", () => {
+		it("drains running priority before a component and excludes queued priority from its prefix", async () => {
+			const coordinator = new PriorityCoordinator();
+			const gate = deferred();
+			const order: string[] = [];
+			const prior = coordinator.enqueue("prior", async () => {
+				await gate.promise;
+				order.push("prior");
+			});
+			const ctx = makeCtx({ acquireActionPermit: () => coordinator.acquireNormalPermit() });
+			const { action } = await arrangeFreshRename(ctx);
+			const rename = ctx.remoteFs.rename.bind(ctx.remoteFs);
+			let late: Promise<void> | undefined;
+			vi.spyOn(ctx.remoteFs, "rename").mockImplementation(async (from, to) => {
+				order.push("rename");
+				late = coordinator.enqueue("late", () => {
+					order.push("late");
+					return Promise.resolve();
+				});
+				await rename(from, to);
+			});
+			ctx.beginAction = (action) => {
+				if (action.action === "cleanup") order.push("cleanup");
+				return "run";
+			};
+			const run = executePlan(makePlan([
+				action,
+				{ action: "cleanup", path: "old.md" },
+			], true), ctx);
+			await flush();
+			expect(order).toEqual([]);
+			gate.resolve();
+			await prior;
+			const result = await run;
+			await late;
+			expect(result.failed).toEqual([]);
+			expect(order).toEqual(["prior", "rename", "cleanup", "late"]);
+		});
+
+		it("preserves an admitted component prefix through publication before cleanup", async () => {
+			const ctx = makeCtx();
+			const { action, stateStore } = await arrangeFreshRename(ctx);
+			const order: string[] = [];
+			ctx.beginAction = (action) => {
+				if (action.action === "cleanup") {
+					expect(stateStore.records.has("new.md")).toBe(true);
+					expect(stateStore.records.has("old.md")).toBe(false);
+				}
+				order.push(action.action); return "run";
+			};
+			const plan = makePlan([
+				action,
+				{ action: "cleanup", path: "old.md" },
+			], true);
+			const result = await executePlan(plan, ctx);
+			expect(result.failed).toEqual([]);
+			expect(order).toEqual(["rename_remote", "cleanup"]);
+		});
+
+		it("does not start a component suffix after prefix failure", async () => {
+			const ctx = makeCtx();
+			const { action, remoteFs } = await arrangeFreshRename(ctx);
+			vi.spyOn(remoteFs, "write").mockRejectedValue(new Error("prefix write failed"));
+			const begin = vi.fn(() => "run" as const);
+			ctx.beginAction = begin;
+			const plan = makePlan([
+				action,
+				{ action: "cleanup", path: "missing.md" },
+			], true);
+			const result = await executePlan(plan, ctx);
+			expect(result.failed).toHaveLength(1);
+			expect(begin).toHaveBeenCalledTimes(1);
+			expect(result.blocked.map((item) => item.action.action)).toEqual(["cleanup"]);
+		});
+
+		it("settles independent transfers before serial work in admitted component order", async () => {
+			const order: string[] = [];
+			const ctx = makeCtx({});
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+
+			addFile(localFs, "push.md", "push");
+			addFile(localFs, "conflict.md", "local");
+			addFile(remoteFs, "conflict.md", "remote");
+			addFile(remoteFs, "rr-old.md", "rr"); // rename_remote source (remote lane)
+			addFile(localFs, "rr-new.md", "rr");
+			addFile(remoteFs, "dr.md", "dr");      // delete_remote (remote lane)
+			addFile(localFs, "rl-old.md", "rl");   // rename_local source (local lane)
+			addFile(remoteFs, "rl-new.md", "rl");
+			addFile(localFs, "dl.md", "dl");       // delete_local (local lane)
+			await stateStore.put(buildSyncRecord((await localFs.stat("rr-new.md"))!, (await remoteFs.stat("rr-old.md"))!, "rr-old.md"));
+			await stateStore.put(buildSyncRecord((await localFs.stat("rl-old.md"))!, (await remoteFs.stat("rl-new.md"))!, "rl-old.md"));
+
+			const origLocalRead = localFs.read.bind(localFs);
+			vi.spyOn(localFs, "read").mockImplementation((path: string) => {
+				if (path === "push.md") order.push("push");
+				if (path === "conflict.md") order.push("conflict");
+				return origLocalRead(path);
+			});
+			const origRemoteRename = remoteFs.rename.bind(remoteFs);
+			vi.spyOn(remoteFs, "rename").mockImplementation((o: string, n: string) => {
+				order.push("rename_remote");
+				return origRemoteRename(o, n);
+			});
+			const origRemoteDelete = remoteFs.delete.bind(remoteFs);
+			vi.spyOn(remoteFs, "delete").mockImplementation((path: string) => {
+				order.push("delete_remote");
+				return origRemoteDelete(path);
+			});
+			const origLocalRename = localFs.rename.bind(localFs);
+			vi.spyOn(localFs, "rename").mockImplementation((o: string, n: string) => {
+				order.push("rename_local");
+				return origLocalRename(o, n);
+			});
+			const origLocalDelete = localFs.delete.bind(localFs);
+			vi.spyOn(localFs, "delete").mockImplementation((path: string) => {
+				order.push("delete_local");
+				return origLocalDelete(path);
+			});
+
+			const plan = makePlan([
+				{ path: "push.md", action: "push", local: (await localFs.stat("push.md"))! },
+				{
+					path: "conflict.md",
+					action: "conflict",
+					protocol: { kind: "same_path" },
+					conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" },
+					local: (await localFs.stat("conflict.md"))!, remote: (await remoteFs.stat("conflict.md"))!,
+				},
+				{
+					path: "rr-new.md", action: "rename_remote", oldPath: "rr-old.md",
+					local: (await localFs.stat("rr-new.md"))!, remote: (await remoteFs.stat("rr-old.md"))!,
+					content: { mode: "equal" },
+					baseline: stateStore.records.get("rr-old.md"),
+				},
+				{ path: "dr.md", action: "delete_remote", remote: (await remoteFs.stat("dr.md"))! },
+				{
+					path: "rl-new.md", action: "rename_local", oldPath: "rl-old.md",
+					remote: (await remoteFs.stat("rl-new.md"))!, local: (await localFs.stat("rl-old.md"))!,
+					content: { mode: "equal" },
+					baseline: stateStore.records.get("rl-old.md"),
+				},
+				{ path: "dl.md", action: "delete_local", local: (await localFs.stat("dl.md"))! },
+			]);
+
+			const started: string[] = [];
+			ctx.beginAction = (action) => { started.push(action.path); return "run"; };
+			const result = await executePlan(plan, ctx);
+			expect(result.succeeded).toHaveLength(6);
+			expect(result.failed).toEqual([]);
+			expect(result.blocked).toEqual([]);
+			expect(order[0]).toBe("push");
+			expect(started).toEqual(["push.md", ...plan.components
+				.filter((component) => !component.paths.includes("push.md"))
+				.flatMap((component) => component.actions.map((action) => action.path))]);
+		});
+
+		it("does not start structural ops until transfers finish (Phase 1 barrier)", async () => {
+			const ctx = makeCtx();
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "p.md", "x");
+			addFile(remoteFs, "d.md", "y");
+
+			const gate = deferred();
+			const origRead = localFs.read.bind(localFs);
+			vi.spyOn(localFs, "read").mockImplementation(async (path: string) => {
+				if (path === "p.md") await gate.promise;
+				return origRead(path);
+			});
+			const deleteSpy = vi.spyOn(remoteFs, "delete");
+
+			const plan = makePlan([
+				{ path: "p.md", action: "push", local: { path: "p.md", isDirectory: false, size: 1, mtime: 1000, hash: "" } },
+				{ path: "d.md", action: "delete_remote", remote: (await remoteFs.stat("d.md"))! },
+			]);
+
+			const p = executePlan(plan, ctx);
+			await flush();
+			// The push is gated, so Phase 3 has not started.
+			expect(deleteSpy).not.toHaveBeenCalled();
+			gate.resolve();
+			await p;
+			expect(deleteSpy).toHaveBeenCalled();
+		});
+	});
+
+	describe("concurrency", () => {
+		it("serializes remote and local structural components across both filesystems", async () => {
+			const ctx = makeCtx();
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(remoteFs, "r.md", "x");
+			addFile(localFs, "l.md", "y");
+
+			let running = 0;
+			let maxRunning = 0;
+			const gate = deferred();
+			const started = deferred();
+			const gateDelete = (fs: MockFileSystem) => {
+				const orig = fs.delete.bind(fs);
+				vi.spyOn(fs, "delete").mockImplementation(async (path: string) => {
+					running++;
+					maxRunning = Math.max(maxRunning, running);
+					started.resolve();
+					await gate.promise;
+					running--;
+					return orig(path);
+				});
+			};
+			gateDelete(remoteFs);
+			gateDelete(localFs);
+
+			const plan = makePlan([
+				{ path: "r.md", action: "delete_remote", remote: (await remoteFs.stat("r.md"))! },
+				{ path: "l.md", action: "delete_local", local: (await localFs.stat("l.md"))! },
+			]);
+
+			const p = executePlan(plan, ctx);
+			await started.promise;
+			expect(running).toBe(1);
+			gate.resolve();
+			await p;
+			expect(maxRunning).toBe(1);
+		});
+
+		it("executes structural deletes one at a time", async () => {
+			const ctx = makeCtx();
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			const paths = Array.from({ length: 6 }, (_, k) => `del${k}.md`);
+			for (const path of paths) addFile(remoteFs, path, "x");
+
+			let running = 0;
+			let maxRunning = 0;
+			const gate = deferred();
+			const started = deferred();
+			const orig = remoteFs.delete.bind(remoteFs);
+			vi.spyOn(remoteFs, "delete").mockImplementation(async (path: string) => {
+				running++;
+				maxRunning = Math.max(maxRunning, running);
+				started.resolve();
+				await gate.promise;
+				running--;
+				return orig(path);
+			});
+
+			const plan = makePlan(await Promise.all(paths.map(async (path) => ({
+				path, action: "delete_remote" as const, remote: (await remoteFs.stat(path))!,
+			}))));
+
+			const p = executePlan(plan, ctx);
+			await started.promise;
+			expect(running).toBe(1);
+			gate.resolve();
+			await p;
+			expect(maxRunning).toBe(1);
+		});
+	});
+
+	describe("concurrent delete safety", () => {
+		it("deletes the child before its parent within an ordered component", async () => {
+			const ctx = makeCtx();
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(remoteFs, "A/child.md", "x"); // seeds folder A + the child
+
+			// Shared topology is ordered explicitly, never submitted to the singleton pool.
+			const plan = makePlan([
+				{ path: "A/child.md", action: "delete_remote", remote: (await remoteFs.stat("A/child.md"))! },
+				{ path: "A", action: "delete_remote", remote: (await remoteFs.stat("A"))! },
+			], true);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.failed).toHaveLength(0);
+			expect(result.succeeded).toHaveLength(2);
+			expect(remoteFs.files.has("A")).toBe(false);
+			expect(remoteFs.files.has("A/child.md")).toBe(false);
+		});
+	});
+
+	describe("conflict runs in its own phase (not pooled with transfers)", () => {
+		it("a pushed `.conflict` sidecar is not clobbered by a same-cycle conflict's duplicate", async () => {
+			const ctx = makeCtx({});
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			// A genuine conflict on foo.md (both sides, different content).
+			addFile(localFs, "foo.md", "local-foo");
+			addFile(remoteFs, "foo.md", "remote-foo");
+			// A user file literally named foo.conflict.md, pushed in the SAME plan.
+			addFile(localFs, "foo.conflict.md", "USER SIDECAR");
+
+			const plan = makePlan([
+				{ path: "foo.conflict.md", action: "push", local: (await localFs.stat("foo.conflict.md"))! },
+				{
+					path: "foo.md", action: "conflict",
+					protocol: { kind: "same_path" },
+					conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" },
+					local: (await localFs.stat("foo.md"))!,
+					remote: (await remoteFs.stat("foo.md"))!,
+				},
+			]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.failed).toHaveLength(0);
+			// Conflict resolves in Phase 2 — AFTER the Phase 1 push — so generateConflictPath
+			// sees foo.conflict.md is taken and picks the next free name; the pushed sidecar
+			// survives. If conflict were pooled with transfers, this would race (see ADR 0001).
+			expect(readText(remoteFs, "foo.conflict.md")).toBe("USER SIDECAR");
+			expect(remoteFs.files.has("foo.conflict-2.md")).toBe(true);
+		});
+	});
+
+	describe("progress reporting", () => {
+		it("reports progress once per successful action across pooled and serial components", async () => {
+			const calls: Array<[number, number]> = [];
+			const ctx = makeCtx({
+				onProgress: (completed, total) => calls.push([completed, total]),
+			});
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			const stateStore = ctx.committer.stateStore as unknown as ReturnType<typeof createMockStateStore>;
+			addFile(localFs, "p.md", "p");
+			addFile(localFs, "m.md", "m");
+			addFile(remoteFs, "m.md", "m");
+			addFile(localFs, "cf.md", "l");
+			addFile(remoteFs, "cf.md", "r");
+			addFile(remoteFs, "dr.md", "x");
+			addFile(localFs, "dl.md", "y");
+			stateStore.records.set("dr.md", {
+				path: "dr.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 1, remoteSize: 1, remoteIdentityKey: "id:dr.md", syncedAt: 900,
+			});
+			stateStore.records.set("dl.md", {
+				path: "dl.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 1, remoteSize: 1, remoteIdentityKey: "id:dl.md", syncedAt: 900,
+			});
+
+			const plan = makePlan([
+				{ path: "p.md", action: "push", local: (await localFs.stat("p.md"))! },
+				{
+					path: "m.md", action: "match",
+					local: (await localFs.stat("m.md"))!, remote: (await remoteFs.stat("m.md"))!,
+				},
+				{
+					path: "cf.md", action: "conflict",
+					protocol: { kind: "same_path" },
+					conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" },
+					local: (await localFs.stat("cf.md"))!, remote: (await remoteFs.stat("cf.md"))!,
+				},
+				{ path: "dr.md", action: "delete_remote", remote: (await remoteFs.stat("dr.md"))!, baseline: await stateStore.get("dr.md") },
+				{ path: "dl.md", action: "delete_local", local: (await localFs.stat("dl.md"))!, baseline: await stateStore.get("dl.md") },
+			]);
+
+			const result = await executePlan(plan, ctx);
+			expect(result.succeeded).toHaveLength(5);
+			expect(result.failed).toEqual([]);
+			expect(result.blocked).toEqual([]);
+			expect(calls).toHaveLength(5);
+			expect(calls[calls.length - 1]).toEqual([5, 5]);
+			expect(calls.map((c) => c[0]).sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5]);
+		});
+	});
+
+	describe("empty plan", () => {
+		it("returns empty result for a plan with no actions", async () => {
+			const ctx = makeCtx();
+			const plan = makePlan([]);
+
+			const result = await executePlan(plan, ctx);
+
+			expect(result.succeeded).toHaveLength(0);
+			expect(result.failed).toHaveLength(0);
+			expect(result.conflicts).toHaveLength(0);
+		});
+	});
+});
+
+describe("withIoRetry (per-action in-cycle retry)", () => {
+	const httpErr = (status: number) => Object.assign(new Error(`HTTP ${status}`), { status });
+	const pushPlan = (path = "x.md"): AuthorizedSyncPlan =>
+		makePlan([{ path, action: "push", local: { path, isDirectory: false, size: 7, mtime: 1000, hash: "" } }]);
+
+	it("retries a rate-limited (429) transfer, then succeeds", async () => {
+		const ctx = makeCtx();
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		addFile(localFs, "x.md", "content");
+		const orig = remoteFs.write.bind(remoteFs);
+		let n = 0;
+		const writeSpy = vi.spyOn(remoteFs, "write").mockImplementation((p, c, m) =>
+			n++ === 0 ? Promise.reject(httpErr(429)) : orig(p, c, m));
+
+		const result = await executePlan(pushPlan(), ctx);
+
+		expect(result.succeeded).toHaveLength(1);
+		expect(result.failed).toHaveLength(0);
+		expect(writeSpy).toHaveBeenCalledTimes(2);
+	});
+
+	it("retries a transient (503) transfer, then succeeds", async () => {
+		const ctx = makeCtx();
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		addFile(localFs, "x.md", "content");
+		const orig = remoteFs.write.bind(remoteFs);
+		let n = 0;
+		const writeSpy = vi.spyOn(remoteFs, "write").mockImplementation((p, c, m) =>
+			n++ === 0 ? Promise.reject(httpErr(503)) : orig(p, c, m));
+
+		const result = await executePlan(pushPlan(), ctx);
+
+		expect(result.succeeded).toHaveLength(1);
+		expect(writeSpy).toHaveBeenCalledTimes(2);
+	});
+
+	it("does NOT retry a permission (403) error — records failed, does not abort the cycle", async () => {
+		const ctx = makeCtx();
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		addFile(localFs, "x.md", "content");
+		const writeSpy = vi.spyOn(remoteFs, "write").mockRejectedValue(httpErr(403));
+
+		const result = await executePlan(pushPlan(), ctx); // resolves (no abort)
+
+		expect(result.failed).toHaveLength(1);
+		expect(result.succeeded).toHaveLength(0);
+		expect(writeSpy).toHaveBeenCalledTimes(1); // not retried
+	});
+
+	it("does NOT retry a notFound (404) error", async () => {
+		const ctx = makeCtx();
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		addFile(localFs, "x.md", "content");
+		const writeSpy = vi.spyOn(remoteFs, "write").mockRejectedValue(httpErr(404));
+
+		const result = await executePlan(pushPlan(), ctx);
+
+		expect(result.failed).toHaveLength(1);
+		expect(writeSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("aborts (no retry) on AuthError", async () => {
+		const ctx = makeCtx();
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		addFile(localFs, "x.md", "content");
+		const writeSpy = vi.spyOn(remoteFs, "write").mockRejectedValue(new AuthError("unauthorized", 401));
+
+		await expect(executePlan(pushPlan(), ctx)).rejects.toThrow(AuthError);
+		expect(writeSpy).toHaveBeenCalledTimes(1); // AuthError is rethrown immediately
+	});
+
+	it("aborts the cycle on a module-path auth BackendErrorShape", async () => {
+		const fatal = vi.fn();
+		const ctx = makeCtx({ onActionFatal: fatal });
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		addFile(localFs, "x.md", "content");
+		// The module provider throws its structural shape through toBackendError; an
+		// auth failure must still abort (onActionFatal) and reject as an AuthError.
+		const writeSpy = vi.spyOn(remoteFs, "write").mockRejectedValue(
+			toBackendError(backendError("auth", "credentials expired")),
+		);
+
+		await expect(executePlan(pushPlan(), ctx)).rejects.toThrow(AuthError);
+		expect(fatal).toHaveBeenCalledTimes(1);
+		expect(writeSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("gives up after MAX_ACTION_RETRIES (3) → failed, without a cycle abort", async () => {
+		const ctx = makeCtx();
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		addFile(localFs, "x.md", "content");
+		const writeSpy = vi.spyOn(remoteFs, "write").mockRejectedValue(httpErr(429));
+
+		const result = await executePlan(pushPlan(), ctx); // resolves (no throw → no cycle retry)
+
+		expect(writeSpy).toHaveBeenCalledTimes(3);
+		expect(result.failed).toHaveLength(1);
+	});
+
+	it("uses ctx.classifyError (Google 403 = rate-limit), so a 403 retries", async () => {
+		const ctx = makeCtx({ classifyError: () => ({ kind: "rateLimit", retryAfterMs: 1 }) });
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		addFile(localFs, "x.md", "content");
+		const orig = remoteFs.write.bind(remoteFs);
+		let n = 0;
+		const writeSpy = vi.spyOn(remoteFs, "write").mockImplementation((p, c, m) =>
+			n++ === 0 ? Promise.reject(httpErr(403)) : orig(p, c, m));
+
+		const result = await executePlan(pushPlan(), ctx);
+
+		expect(result.succeeded).toHaveLength(1); // retried — proves ctx.classifyError is used
+		expect(writeSpy).toHaveBeenCalledTimes(2);
+	});
+
+	it("treats a module-thrown permanent error with a permanentCode like an HTTP-derived permanent (no in-cycle retry)", async () => {
+		// The production classifier for a module-backed provider: the public boundary
+		// shape first, then the transport/HTTP fallback.
+		const classify = (err: unknown) => classifyBackendError(err) ?? classifyHttpError(err);
+		const cases: ReadonlyArray<readonly [string, Error]> = [
+			[
+				"module permanent",
+				toBackendError(backendError("permanent", "Resumable upload: no upload URL in response", {
+					permanentCode: "googledrive.resumable_upload.missing_location",
+				})),
+			],
+			// The adapter's status-derived permanent (a non-5xx HTTP status), with no code.
+			["http-derived permanent", toBackendError(backendErrorFromStatus(400, "bad request"))],
+		];
+
+		for (const [label, error] of cases) {
+			const ctx = makeCtx({ classifyError: classify });
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "x.md", "content");
+			const writeSpy = vi.spyOn(remoteFs, "write").mockRejectedValue(error);
+
+			const result = await executePlan(pushPlan(), ctx);
+
+			// `stop` for `permanent`: the same failing action is not retried in-cycle.
+			expect(writeSpy, label).toHaveBeenCalledTimes(1);
+			expect(result.failed, label).toHaveLength(1);
+		}
+	});
+
+	it("signals the transfer pool (noteRateLimit) BEFORE sleeping, on a 429", async () => {
+		const order: string[] = [];
+		const noteSpy = vi.spyOn(AdaptivePool.prototype, "noteRateLimit").mockImplementation(() => { order.push("noteRateLimit"); });
+		const ctx = makeCtx({ sleep: (ms) => { order.push(`sleep:${ms}`); return Promise.resolve(); } });
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		addFile(localFs, "x.md", "content");
+		const orig = remoteFs.write.bind(remoteFs);
+		let n = 0;
+		vi.spyOn(remoteFs, "write").mockImplementation((p, c, m) =>
+			n++ === 0 ? Promise.reject(httpErr(429)) : orig(p, c, m));
+
+		await executePlan(pushPlan(), ctx);
+
+		expect(noteSpy).toHaveBeenCalledTimes(1);
+		expect(order[0]).toBe("noteRateLimit");
+		expect(order[1]).toMatch(/^sleep:/);
+	});
+
+	it("does NOT retry a rate-limited conflict (not idempotent) and never signals the transfer pool (D1)", async () => {
+		const noteSpy = vi.spyOn(AdaptivePool.prototype, "noteRateLimit");
+		const ctx = makeCtx({});
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		addFile(localFs, "g.md", "local version");
+		addFile(remoteFs, "g.md", "remote version");
+		const readSpy = vi.spyOn(remoteFs, "read").mockRejectedValue(httpErr(429));
+
+		const result = await executePlan(makePlan([{
+			path: "g.md",
+			action: "conflict",
+			protocol: { kind: "same_path" },
+			conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" },
+			local: (await localFs.stat("g.md"))!,
+			remote: (await remoteFs.stat("g.md"))!,
+		}]), ctx);
+
+		// Conflict resolution is not idempotent on replay (a partial .conflict write would
+		// be orphaned by generateConflictPath on retry), so it is NOT wrapped in withIoRetry:
+		// a rate-limit fails the action (re-resolved next cycle) rather than retrying mid-resolve.
+		expect(result.conflicts).toHaveLength(0);
+		expect(result.failed).toHaveLength(1);
+		expect(readSpy).toHaveBeenCalledTimes(1); // not retried
+		expect(noteSpy).not.toHaveBeenCalled(); // conflict is serial; it never feeds the transfer pool
+	});
+
+	it("does NOT retry a rename (not idempotent on replay)", async () => {
+		const ctx = makeCtx();
+		const { action, remoteFs } = await arrangeFreshRename(ctx);
+		const renameSpy = vi.spyOn(remoteFs, "rename").mockRejectedValue(httpErr(429));
+
+		const result = await executePlan(makePlan([action]), ctx);
+
+		// rename tier is excluded from withIoRetry: re-running rename(oldPath, …) would hit a
+		// source the first (successful) attempt already moved → a spurious failure.
+		expect(result.failed).toHaveLength(1);
+		expect(renameSpy).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("adaptive transfer pool (Phase 1)", () => {
+	function gatedWrites(remoteFs: MockFileSystem) {
+		const gate = deferred();
+		let running = 0;
+		const counter = { max: 0 };
+		const orig = remoteFs.write.bind(remoteFs);
+		vi.spyOn(remoteFs, "write").mockImplementation(async (p, c, m) => {
+			running++;
+			counter.max = Math.max(counter.max, running);
+			await gate.promise;
+			running--;
+			return orig(p, c, m);
+		});
+		return { gate, counter };
+	}
+
+	async function manyPushes(n: number, ctx: ExecutionContext, size = 7): Promise<AuthorizedSyncPlan> {
+		const localFs = ctx.localFs as MockFileSystem;
+		const actions: SyncAction[] = [];
+		for (let i = 0; i < n; i++) {
+			addFile(localFs, `f${i}.md`, "x".repeat(size));
+			actions.push({ path: `f${i}.md`, action: "push", local: (await localFs.stat(`f${i}.md`))! });
+		}
+		return makePlan(actions);
+	}
+
+	it("starts transfers at the desktop pool's start concurrency (5)", async () => {
+		const ctx = makeCtx(); // DESKTOP_TRANSFER_POOL (start 5)
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		const { gate, counter } = gatedWrites(remoteFs);
+
+		const p = executePlan(await manyPushes(8, ctx), ctx);
+		await vi.waitFor(() => expect(counter.max).toBe(5));
+		gate.resolve();
+		await p;
+	});
+
+	it("caps mobile transfers at the mobile pool's start concurrency (3)", async () => {
+		const ctx = makeCtx({ transferPool: MOBILE_TRANSFER_POOL });
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		const { gate, counter } = gatedWrites(remoteFs);
+
+		const p = executePlan(await manyPushes(8, ctx), ctx);
+		await vi.waitFor(() => expect(counter.max).toBe(3));
+		gate.resolve();
+		await p;
+	});
+
+	it("byte-bounds transfers below the count ceiling when files are large", async () => {
+		// Count would allow 10 at once, but a 30-byte budget admits only 3 of the 10-byte files.
+		const ctx = makeCtx({
+			transferPool: { min: 1, start: 10, max: 10, rampAfter: 100, byteBudget: 30 },
+		});
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		const { gate, counter } = gatedWrites(remoteFs);
+
+		const p = executePlan(await manyPushes(8, ctx, 10), ctx);
+		await vi.waitFor(() => expect(counter.max).toBe(3));
+		gate.resolve();
+		await p;
+	});
+
+	it("lets small files reach the count ceiling under a generous byte budget", async () => {
+		const ctx = makeCtx({
+			transferPool: { min: 1, start: 4, max: 4, rampAfter: 100, byteBudget: 48 * 1024 * 1024 },
+		});
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		const { gate, counter } = gatedWrites(remoteFs);
+
+		const p = executePlan(await manyPushes(8, ctx, 7), ctx);
+		await vi.waitFor(() => expect(counter.max).toBe(4));
+		gate.resolve();
+		await p;
+	});
+});
+
+describe("toConflictRecords", () => {
+	const localEntity = { path: "a.md", isDirectory: false, size: 1, mtime: 1, hash: "L" };
+	const remoteEntity = { path: "a.md", isDirectory: false, size: 2, mtime: 2, hash: "R" };
+
+	it("maps a resolved conflict to a record carrying the resolution + stamps", () => {
+		const conflicts: ResolvedConflict[] = [{
+			action: { action: "conflict", path: "a.md", protocol: { kind: "same_path" },
+				conflictPolicy: { mode: "preserve", strategy: "duplicate" } },
+			resolution: { action: "duplicated", duplicatePath: "a.conflict.md" },
+			localEntity,
+			remoteEntity,
+		}];
+		const rec = toConflictRecords(conflicts, "sess-1", "2024-01-01T00:00:00.000Z")[0]!;
+		expect(rec.path).toBe("a.md");
+		expect(rec.actionType).toBe("conflict");
+		expect(rec.strategy).toBe("duplicate");
+		expect(rec.action).toBe("duplicated");
+		expect(rec.duplicatePath).toBe("a.conflict.md");
+		expect(rec.local).toBe(localEntity);
+		expect(rec.remote).toBe(remoteEntity);
+		expect(rec.sessionId).toBe("sess-1");
+		expect(rec.resolvedAt).toBe("2024-01-01T00:00:00.000Z");
+	});
+
+	it("preserves every ordered duplicate path while retaining the first-path compatibility field", () => {
+		const duplicatePaths = ["a.conflict-a.md", "a.conflict-b.md", "a.conflict-c.md"];
+		const conflicts: ResolvedConflict[] = [{
+			action: { action: "conflict", path: "a.md", protocol: { kind: "same_path" },
+				conflictPolicy: { mode: "preserve", strategy: "duplicate" } },
+			resolution: { action: "duplicated", duplicatePath: duplicatePaths[0], duplicatePaths },
+		}];
+
+		const rec = toConflictRecords(conflicts, "session", "time")[0]!;
+
+		expect(rec.duplicatePath).toBe(duplicatePaths[0]);
+		expect(rec.duplicatePaths).toEqual(duplicatePaths);
+	});
+
+	it.each([
+		{ policy: { mode: "preserve", strategy: "prefer_local" } as const, expected: "prefer_local" },
+		{ policy: { mode: "preserve", strategy: "auto_merge" } as const, expected: "auto_merge" },
+	])("projects exact $expected provenance even when the execution mode is preserve", ({ policy, expected }) => {
+		const conflicts: ResolvedConflict[] = [{
+			action: {
+				action: "conflict", path: "a.md", protocol: {
+					kind: "preservation_cover", collisionWitnesses: [], candidatePaths: [],
+					preservedPaths: [], children: [], cleanup: [],
+				},
+				conflictPolicy: policy,
+			},
+			resolution: { action: "duplicated", duplicatePaths: [] },
+		}];
+
+		const record = toConflictRecords(conflicts, "session", "time")[0]!;
+
+		expect(record.strategy).toBe(expected);
+	});
+
+	it("projects each conflict's own strategy when one cycle contains mixed policies", () => {
+		const conflicts: ResolvedConflict[] = [
+			{
+				action: { action: "conflict", path: "local.md", protocol: { kind: "same_path" },
+					conflictPolicy: { mode: "local_win", strategy: "prefer_local" } },
+				resolution: { action: "kept_local" },
+			},
+			{
+				action: { action: "conflict", path: "copy.md", protocol: { kind: "same_path" },
+					conflictPolicy: { mode: "preserve", strategy: "duplicate" } },
+				resolution: { action: "duplicated", duplicatePath: "copy.conflict.md" },
+			},
+			{
+				action: { action: "conflict", path: "merge.md", protocol: { kind: "same_path" },
+					conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" } },
+				resolution: { action: "merged", hasConflictMarkers: false },
+			},
+		];
+
+		expect(toConflictRecords(conflicts, "session", "time").map((record) => ({
+			path: record.path, strategy: record.strategy, action: record.action,
+		}))).toEqual([
+			{ path: "local.md", strategy: "prefer_local", action: "kept_local" },
+			{ path: "copy.md", strategy: "duplicate", action: "duplicated" },
+			{ path: "merge.md", strategy: "auto_merge", action: "merged" },
+		]);
+	});
+
+	it("carries hasConflictMarkers through for a merged resolution (and tolerates absent entities)", () => {
+		const conflicts: ResolvedConflict[] = [{
+			action: { action: "conflict", path: "b.md", protocol: { kind: "same_path" },
+				conflictPolicy: { mode: "auto_merge", strategy: "auto_merge" } },
+			resolution: { action: "merged", hasConflictMarkers: true },
+		}];
+		const rec = toConflictRecords(conflicts, "s", "t")[0]!;
+		expect(rec.action).toBe("merged");
+		expect(rec.hasConflictMarkers).toBe(true);
+		expect(rec.local).toBeUndefined();
+	});
+
+	it("returns an empty list for no conflicts (so the writer is never touched)", () => {
+		expect(toConflictRecords([], "s", "t")).toEqual([]);
+	});
+});

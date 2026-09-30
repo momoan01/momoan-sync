@@ -1,0 +1,107 @@
+import { errorMessage } from "../backend-api";
+import type { App } from "../platform/obsidian";
+import { Modal, Notice, Setting } from "../platform/obsidian";
+import type { AirSyncSettings } from "../settings";
+
+/** Minimal client shape the picker needs: list folders directly under the app root. */
+interface AppFolderListClient {
+	listAppRootFolders(): Promise<{ name: string }[]>;
+}
+
+/** Minimal provider shape: build a UI client for the given settings. */
+export interface AppFolderPickerProvider {
+	createUiClient(settings: AirSyncSettings): AppFolderListClient;
+}
+
+/**
+ * In-app folder picker for an App-Folder-scoped backend (Dropbox, OneDrive). Lists the
+ * folders directly under the backend's app-folder root and lets the user pick an
+ * existing one or type a new name. On confirm it writes the chosen name to
+ * `pendingPickedFolderPath` via the renderer-provided `onSave`, then runs `bindDefault`
+ * (the default-bind action), so the provider's `resolveRemoteVault` find-or-creates
+ * `/<name>` and binds its id.
+ *
+ * This replaces a full-drive web picker: App Folder scope means the app only ever sees
+ * folders under its own root, so a picker that then had to reject outside picks was
+ * misleading. No BackendManager changes are needed — binding reuses the default path.
+ */
+export class AppFolderPickerModal extends Modal {
+	private selected = "";
+	private newName = "";
+
+	constructor(
+		app: App,
+		private title: string,
+		private provider: AppFolderPickerProvider,
+		private settings: AirSyncSettings,
+		private onSave: (updates: Record<string, unknown>) => Promise<void>,
+		private bindDefault: () => Promise<void>,
+	) {
+		super(app);
+	}
+
+	async onOpen(): Promise<void> {
+		const { contentEl } = this;
+		this.setTitle(this.title);
+		contentEl.createEl("p", {
+			text: "Pick an existing folder in the app folder, or create a new one. This vault syncs into the chosen folder.",
+		});
+
+		let folders: string[] = [];
+		try {
+			const client = this.provider.createUiClient(this.settings);
+			folders = (await client.listAppRootFolders()).map((f) => f.name);
+		} catch (err) {
+			// Show WHY, not just that it failed: the backend's own message is what
+			// distinguishes "nothing there yet" from a service-side denial, and a bare
+			// "could not list" reads like the former even when it is the latter. The full
+			// response body is already in the log (see backend-api/backend-error-log.ts).
+			const reason = errorMessage(err);
+			contentEl.createEl("p", {
+				text: `Could not list existing folders: ${reason}. You can still create a new one below.`,
+			});
+		}
+
+		if (folders.length > 0) {
+			new Setting(contentEl)
+				.setName("Existing folder")
+				.setDesc("Sync into a folder that already exists.")
+				.addDropdown((dd) => {
+					dd.addOption("", "Select a folder…");
+					for (const name of folders) dd.addOption(name, name);
+					dd.onChange((value) => { this.selected = value; });
+				});
+		}
+
+		new Setting(contentEl)
+			.setName("New folder")
+			.setDesc("Or create a new folder by name.")
+			.addText((text) =>
+				text.setPlaceholder("My vault").onChange((value) => { this.newName = value.trim(); }),
+			);
+
+		new Setting(contentEl).addButton((button) =>
+			button
+				.setButtonText("Use this folder")
+				.setCta()
+				.onClick(() => void this.confirm()),
+		);
+	}
+
+	private async confirm(): Promise<void> {
+		const name = this.newName || this.selected;
+		if (!name) {
+			new Notice("Pick an existing folder or enter a new name.");
+			return;
+		}
+		this.close();
+		// Queue the chosen name, then trigger the default-bind action — the provider's
+		// resolveRemoteVault find-or-creates /<name> and binds its id.
+		await this.onSave({ pendingPickedFolderPath: name });
+		await this.bindDefault();
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}

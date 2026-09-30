@@ -1,0 +1,10 @@
+{
+	"id": "air-sync",
+	"name": "Air Sync",
+	"version": "0.2.1",
+	"minAppVersion": "1.11.4",
+	"description": "Keep your vault in sync across devices without managing sync—sync only what changed, preserve conflicting edits, and use your own Google Drive, OneDrive, or Dropbox.",
+	"author": "Takehito Gondo",
+	"authorUrl": "https://github.com/takezoh",
+	"isDesktopOnly": false
+}

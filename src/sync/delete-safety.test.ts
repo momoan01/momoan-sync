@@ -1,0 +1,178 @@
+import { describe, it, expect, vi } from "vitest";
+import { compareContent } from "./decision-engine";
+import { executePlan as executePlanRaw, type ExecutionContext } from "./plan-executor";
+import {
+	collectChanges as collectChangesRaw, type ChangeDetectorDeps, type CollectChangesOptions,
+} from "./change-detector";
+import { LocalChangeTracker } from "./local-tracker";
+import { createChecksumRegistry } from "../fs/modules/checksum-registry";
+
+const checksumRegistry = createChecksumRegistry();
+
+const executePlan = (
+	plan: Parameters<typeof executePlanRaw>[0],
+	ctx: Omit<ExecutionContext, "checksumRegistry">,
+) => executePlanRaw(plan, { ...ctx, checksumRegistry });
+
+const collectChanges = (
+	deps: Omit<ChangeDetectorDeps, "checksumRegistry">,
+	opts?: CollectChangesOptions,
+) => collectChangesRaw({ ...deps, checksumRegistry }, opts);
+import {
+	createMockLocalFs, createMockRemoteFs,
+	createMockStateStore,
+	addFile,
+} from "../__mocks__/sync-test-helpers";
+import type { MixedEntity, SyncRecord } from "./types";
+import type { FileEntity } from "../fs/types";
+import { sha256 } from "../utils/hash";
+import { admitBatchObservation } from "./plan-admission";
+import { captureBatchObservation } from "./sync-cycle-planning";
+
+/**
+ * Delete-safety contracts.
+ *
+ * §2-1: the old volume-based `safety-check` hard-aborted any 100%-deletion plan
+ * with no count floor, so a single legitimate deletion never propagated while the
+ * orchestrator reported success. The guard was removed; a lone deletion now plans
+ * and executes normally — pinned GREEN below.
+ *
+ * Phantom warm deletion: a warm sync reads the in-memory vault index
+ * (getAllLoadedFiles), which can under-report. An erroneous deletion is PREVENTED
+ * at the source — `collectChanges` re-stat()s each baseline path absent from the
+ * listing against the authoritative filesystem (`LocalFs.stat` falls back to the
+ * adapter), so an unindexed-but-on-disk file is never deleted; a genuinely absent
+ * file is still deleted.
+ */
+
+const CONTENT = "content"; // 7 bytes
+
+function baselineRecord(path: string, hash = "h"): SyncRecord {
+	return {
+		path,
+		hash,
+		localMtime: 1000,
+		remoteMtime: 1000,
+		localSize: CONTENT.length,
+		remoteSize: CONTENT.length,
+		remoteIdentityKey: `id:${path}`,
+		syncedAt: 900,
+	};
+}
+
+/** SHA-256 of CONTENT — a baseline reflects the hash of the content it was synced from. */
+function contentHash(): Promise<string> {
+	return sha256(new TextEncoder().encode(CONTENT).buffer);
+}
+
+describe("§2-1 (fixed): a lone deletion is no longer silently aborted", () => {
+	it("a lone local deletion is planned as delete_remote", () => {
+		// local missing, remote unchanged vs baseline, baseline present.
+		const remote: FileEntity = {
+			path: "note.md",
+			isDirectory: false,
+			size: CONTENT.length,
+			mtime: 1000,
+			hash: "h",
+		};
+		const entry: MixedEntity = {
+			path: "note.md",
+			remote,
+			prevSync: baselineRecord("note.md"),
+		};
+		expect(compareContent(entry)).toBe("delete_remote");
+	});
+
+	it("a lone delete_remote actually executes (no abort path remains)", async () => {
+		const localFs = createMockLocalFs();
+		const remoteFs = createMockRemoteFs();
+		const stateStore = createMockStateStore();
+		addFile(remoteFs, "note.md", CONTENT, 1000);
+		await stateStore.put(baselineRecord("note.md", await contentHash()));
+
+		const admission = admitBatchObservation(captureBatchObservation(
+			[{ path: "note.md", remote: (await remoteFs.stat("note.md"))!, prevSync: await stateStore.get("note.md") }],
+			[],
+			[{ kind: "absent", side: "local", requestedPath: "note.md", authority: "stat" }],
+			{ isConfiguredScopeCompatible: () => true, byEndpoint: new Map([["note.md", "included"]]) },
+			"delete-safety-test",
+		));
+		const result = await executePlan(
+			admission.executable,
+			{
+				localFs,
+				remoteFs,
+				committer: {
+					stateStore: stateStore,
+				},
+			},
+		);
+
+		expect(result.succeeded).toHaveLength(1);
+		expect(remoteFs.files.has("note.md")).toBe(false);
+		expect(await stateStore.get("note.md")).toBeUndefined();
+	});
+});
+
+describe("phantom warm deletion: an incomplete listing does not mass-delete", () => {
+	// Each baseline path absent from the (incomplete) listing is re-stat()'d
+	// against the authoritative filesystem; the files exist on disk, so no
+	// deletion is planned. This is prevention at the source — not recovery.
+	it("a warm sync whose listing omits on-disk files plans zero delete_remote", async () => {
+		const localFs = createMockLocalFs();
+		const remoteFs = createMockRemoteFs();
+		const stateStore = createMockStateStore();
+		const localTracker = new LocalChangeTracker();
+
+		// 20 files exist on both sides with baselines, but the local listing comes
+		// back empty (an incomplete getAllLoadedFiles before the index settles).
+		// The files are still present on disk, so stat() finds every one.
+		const hash = await contentHash();
+		for (let i = 0; i < 20; i++) {
+			const p = `note-${i}.md`;
+			addFile(remoteFs, p, CONTENT, 1000);
+			addFile(localFs, p, CONTENT, 1000);
+			await stateStore.put(baselineRecord(p, hash));
+		}
+		vi.spyOn(localFs, "list").mockResolvedValueOnce([]);
+
+		const changeSet = await collectChanges({
+			localFs,
+			remoteFs,
+			stateStore,
+			changes: localTracker.snapshot(),
+		});
+		const actions = changeSet.entries.map(compareContent).filter((action) => action !== null);
+		const deletes = actions.filter(
+			(a) => a === "delete_remote",
+		).length;
+
+		expect(deletes).toBe(0);
+		// The files are unchanged vs baseline, so the incomplete listing must
+		// produce NO spurious actions at all — not deletions, not conflicts.
+		expect(actions).toHaveLength(0);
+	});
+
+	it("a genuinely deleted file (absent on disk too) is still planned as delete_remote", async () => {
+		const localFs = createMockLocalFs();
+		const remoteFs = createMockRemoteFs();
+		const stateStore = createMockStateStore();
+		const localTracker = new LocalChangeTracker();
+
+		addFile(remoteFs, "gone.md", CONTENT, 1000);
+		await stateStore.put(baselineRecord("gone.md", await contentHash()));
+		// gone.md is in neither the listing nor on disk → a real deletion.
+
+		const changeSet = await collectChanges({
+			localFs,
+			remoteFs,
+			stateStore,
+			changes: localTracker.snapshot(),
+		});
+		const entry = changeSet.entries.find(
+			(a) => a.path === "gone.md",
+		);
+		expect(entry).toBeDefined();
+		expect(compareContent(entry!)).toBe("delete_remote");
+	});
+});

@@ -1,0 +1,34 @@
+import { createMockFs } from "./sync-test-helpers";
+import {
+	bytes,
+	runRemoteChangeDetectionContract,
+	statOrThrow,
+} from "../../tests/fs/contracts/remote-change-detection.contract";
+
+// createMockFs is the canonical in-memory test double: hash-based (sha256), mtime
+// round-trips through write → stat. It must satisfy the same remote change-
+// detection contract as every real backend. It is NOT checksumBased (no
+// remoteChecksum), so the metadata-touch case does not apply.
+runRemoteChangeDetectionContract("createMockFs", () => {
+	// A remote-role double: every real backend mints a provider identity, and the
+	// record layer refuses to baseline an entity that carries none.
+	const fs = createMockFs("remote-contract", "requested_echo", "id:");
+	const path = "note.md";
+	return Promise.resolve({
+		async observeWritten() {
+			await fs.write(path, bytes("version one"), 1000);
+			return statOrThrow(fs, path);
+		},
+		async observeUnchanged() {
+			return statOrThrow(fs, path);
+		},
+		async observeAfterEdit() {
+			await fs.write(
+				path,
+				bytes("version two — different content"),
+				2000,
+			);
+			return statOrThrow(fs, path);
+		},
+	});
+});

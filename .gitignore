@@ -1,0 +1,45 @@
+# vscode
+.vscode 
+
+# Intellij
+*.iml
+.idea
+
+# npm
+node_modules
+
+# test coverage reports
+coverage
+
+# Don't include the compiled main.js file in the repo.
+# They should be uploaded to GitHub releases instead.
+main.js
+
+# Exclude sourcemaps
+*.map
+
+# env
+.env
+
+# e2e harness secrets + build artifacts (local-only, never committed)
+.env.e2e
+.env.e2e.authorize-url
+e2e/.bootstrap.bundle.mjs
+
+# obsidian
+data.json
+
+# Exclude macOS Finder (System Explorer) View States
+.DS_Store
+
+# cloudflare worker (oauth-relay)
+.wrangler/
+.dev.vars
+dist/
+
+# local agent/tooling artifacts (not part of the plugin)
+.playwright-mcp/
+.mcp.json
+*.log
+.roost/
+.agent-reactor/

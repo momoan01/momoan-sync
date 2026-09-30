@@ -1,0 +1,101 @@
+/**
+ * Normalize a sync path to canonical form:
+ * - Backslashes → forward slashes
+ * - Collapse consecutive slashes
+ * - Strip leading/trailing slashes
+ */
+export function normalizeSyncPath(path: string): string {
+	let p = path.replace(/\\/g, "/");
+	p = p.replace(/\/+/g, "/");
+	if (p.startsWith("/")) p = p.substring(1);
+	if (p.endsWith("/")) p = p.substring(0, p.length - 1);
+	return p;
+}
+
+/**
+ * Extract the file extension (including the dot) in lowercase.
+ * Returns "" if the path has no extension or the last dot belongs to a directory segment.
+ */
+export function getFileExtension(path: string): string {
+	const lastDot = path.lastIndexOf(".");
+	if (lastDot === -1 || lastDot <= path.lastIndexOf("/")) {
+		return "";
+	}
+	return path.substring(lastDot).toLowerCase();
+}
+
+/**
+ * A dot-prefixed (hidden) path — top-level (".airsync") or nested ("foo/.bar").
+ * Obsidian's vault index excludes these, so they must be operated on via the raw
+ * adapter rather than the indexed Vault API (which returns null / can't create
+ * them). This is a mechanism check (which API to use), independent of sync policy.
+ */
+export function isDotPrefixed(path: string): boolean {
+	return path.startsWith(".") || path.includes("/.");
+}
+
+/**
+ * A dot-prefixed path is in sync scope only when it sits under a configured
+ * syncDotPaths root. Every other hidden path (.obsidian, .git, .airsync, etc.)
+ * is out of scope and must not be synced in either direction. Normal (non-hidden)
+ * paths are never out of scope here (ignorePatterns is applied separately).
+ */
+export function isDotPathOutOfScope(path: string, syncDotPaths: string[]): boolean {
+	if (!isDotPrefixed(path)) return false;
+	return !syncDotPaths.some((root) => {
+		const r = root.replace(/\/+$/, "");
+		return path === r || path.startsWith(r + "/");
+	});
+}
+
+/**
+ * The paths having `prefix`, from a lexicographically sorted array. The array MUST
+ * be sorted with the default `Array#sort()` (UTF-16 code-unit order), which is the
+ * same order the lower-bound comparison below uses; prefix-matching entries are
+ * contiguous from that lower bound. Shared so the comparator invariant has one owner.
+ */
+export function pathsWithPrefix(sortedPaths: readonly string[], prefix: string): string[] {
+	let low = 0;
+	let high = sortedPaths.length;
+	while (low < high) {
+		const middle = (low + high) >>> 1;
+		if (sortedPaths[middle]! < prefix) low = middle + 1;
+		else high = middle;
+	}
+	const matches: string[] = [];
+	for (let index = low; index < sortedPaths.length; index++) {
+		const path = sortedPaths[index]!;
+		if (!path.startsWith(prefix)) break;
+		matches.push(path);
+	}
+	return matches;
+}
+
+/**
+ * Insert the deterministic conflict suffix into a path, before its extension:
+ * `notes/file.md` → `notes/file.conflict-2.md`. Pure path composition, shared by the
+ * conflict resolver and the remote filesystem's namespace reconciliation.
+ */
+export function insertConflictSuffix(path: string, seq: number | string): string {
+	const suffix = seq === 1 ? ".conflict" : `.conflict-${seq}`;
+	const lastDot = path.lastIndexOf(".");
+	if (lastDot === -1 || lastDot <= path.lastIndexOf("/")) {
+		return `${path}${suffix}`;
+	}
+	return `${path.substring(0, lastDot)}${suffix}${path.substring(lastDot)}`;
+}
+
+/**
+ * Validate that a rename operation is safe.
+ * @throws if oldPath === newPath or newPath is inside oldPath's subtree.
+ */
+export function validateRename(oldPath: string, newPath: string): void {
+	if (oldPath === newPath) {
+		throw new Error(`Cannot rename "${oldPath}" to itself`);
+	}
+	if (newPath.startsWith(oldPath + "/")) {
+		throw new Error(
+			`Cannot move "${oldPath}" into its own subtree "${newPath}"`
+		);
+	}
+}

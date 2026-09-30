@@ -1,0 +1,449 @@
+# Code & architecture enforcement
+
+The mechanisms that keep the codebase true to its intended architecture. Most are
+rejected mechanically at **lint, compile, or test time** rather than relying on
+review. For each: what it prevents, where it is defined, how it is enforced, and how
+to declare an exception.
+
+The design principles themselves are owned by [ARCHITECTURE.md](../ARCHITECTURE.md);
+this document covers their *enforcement*. The local code gate is:
+
+```bash
+npm run lint && npm run lint:bot-repro && npm run build && npm run test:coverage
+```
+
+CI (`.github/workflows/lint.yml`) runs `npm run build`, `npm run lint`,
+`npm run lint:bot-repro`, and `npm run test:coverage` on Node 20 and 22 for every push
+and PR.
+
+## 1. Type safety — no `any`
+
+Casting away types defeats `strict` mode and is forbidden by the obsidianmd ruleset.
+
+| | |
+|---|---|
+| **Prevents** | `as any`, `any` in type definitions, unnecessary assertions |
+| **Where** | `obsidianmd.configs.recommended` + `typescript-eslint` (`eslint.config.mts`) |
+| **How** | `@typescript-eslint/no-explicit-any` (error); `tsc -noEmit` in `npm run build` |
+| **Exception** | None. Use `unknown` and narrow; `as unknown as T` only when a cast is truly unavoidable |
+
+Practical patterns:
+
+- Type external API responses (`response.json`, etc.) as `const x: unknown = …` and
+  narrow with a runtime validator (assert function).
+- Annotate `JSON.parse()` return values explicitly (`as { key: Type }`).
+- Access private fields in tests via the `as unknown as { field: Type }` pattern.
+- Do not write unnecessary assertions — if `.buffer` is already `ArrayBuffer`, don't
+  cast `as ArrayBuffer`.
+
+### Type-safe test doubles
+
+`as any` is forbidden in tests too — use the project's typed helpers instead of casting
+`vi.spyOn` targets or hand-rolling partial objects:
+
+- `spyRequestUrl()` (`src/backends/googledrive/test-helpers.ts`) — type-safe spy on obsidian's `requestUrl`.
+- `mockSettings()` (`src/__mocks__/sync-test-helpers.ts`) — returns a complete `AirSyncSettings` default.
+- `createMockStateStore()` (`src/__mocks__/sync-test-helpers.ts`) — pass it directly; its intersection type satisfies `SyncStateStore`.
+
+## 2. No `async` without `await`
+
+An `async` function with no `await` is almost always a mistake (a forgotten `await`,
+or needless Promise wrapping).
+
+| | |
+|---|---|
+| **Prevents** | `async` functions/arrows containing no `await` |
+| **Where** | `eslint.config.mts` (project-wide guards block) |
+| **How** | `@typescript-eslint/require-await` (error) |
+| **Exception** | None — fix the code, don't disable the rule |
+
+Test-mock patterns that satisfy it:
+
+- Throw only: `() => { throw err; }` (synchronous, no `async`).
+- Return a value as a Promise: `() => Promise.resolve(value)` (no `async`).
+- Mixed throw/return: ensure at least one `await` (e.g. `return await Promise.resolve(…)`).
+- Assigning to a property follows the same rules (`obj.fn = () => Promise.resolve(v)`).
+
+## 3. Mobile compatibility — no Node/Electron APIs
+
+The plugin ships with `isDesktopOnly: false`, so it must run on mobile, where
+Node/Electron APIs do not exist.
+
+| | |
+|---|---|
+| **Prevents** | importing `fs`, `path`, `os`, `child_process`, `crypto`, `util`, `stream`, `electron` (and `node:` forms); importing `axios` (not bundled) |
+| **Where** | `NODE_API_IMPORTS` / `AXIOS_IMPORT` in `eslint.config.mts` |
+| **How** | `no-restricted-imports` (error) across `src/**/*.ts` |
+| **Exception** | None. Use the Obsidian Vault API, browser globals, or `requestUrl()` for network |
+
+## 4. Swappable backends (Principle #2)
+
+The backend-agnostic production core must not depend on a specific backend. Adding a
+backend leaves that core unchanged and uses explicit extension points: its
+implementation/provider, `fs/registry.ts`, backend-specific settings UI where
+applicable, shared contract harness/catalog/matrix, and opt-in live E2E wiring.
+
+| | |
+|---|---|
+| **Prevents** | `sync/`, `main.ts`, `store/`, `queue/`, `utils/` importing backend-specific modules (e.g. `**/googledrive/**`) |
+| **Where** | `BACKEND_SPECIFIC_IMPORTS` in `eslint.config.mts` |
+| **How** | `no-restricted-imports` (error), scoped to those directories |
+| **Exception** | Backend-specific production wiring belongs in `fs/registry.ts`; `ui/` may render backend-specific settings. Contract harnesses and live E2E are verification extension points, not production-core exceptions |
+
+### Remote backend completeness
+
+Supported production implementations are closed over one mechanically checked catalog
+and contract matrix; do not maintain parallel backend lists.
+
+| Guard | Ownership and enforcement |
+|---|---|
+| **Exact implementation-family catalog** | `tests/fs/contracts/remote-backend-family.ts` owns the production filesystem families and maps exact constructors to family names. Adding or removing a production family changes this catalog explicitly |
+| **Required 4-contract matrix** | `tests/fs/remote-backend-contracts.test.ts` is the sole remote unit composition root. Its `satisfies Record<RemoteBackendFamily, RequiredRemoteContractSet>` matrix requires every family to register `filesystem`, `caching`, `changeDetection`, and `priorityObservation`; `Object.values` registers every cell. A missing family or cell is a compile error |
+| **Registry guard** | `fs/registry.test.ts` constructs every registered provider and fails if its filesystem implementation is absent from the exact family catalog. Built-in and custom providers may converge on the same implementation family |
+| **Live E2E ownership** | The credentials-gated suites documented in `docs/e2e-testing.md` own fidelity against the real Google Drive, Dropbox, and OneDrive APIs, including filesystem and priority-observation behaviour. They backstop faithful fakes but do not replace the always-on unit matrix or enter the local/CI gate |
+
+Each backend's shared-contract adapters live with the shared definitions under the
+corresponding `tests/fs/<backend>/` directory. Production coverage includes only `src/`,
+while the central `tests/fs/remote-backend-contracts.test.ts` composition root remains a
+discovered unit test.
+
+### Backend Module API boundary (v3)
+
+The public extension boundary is `src/backend-api/` (`BackendModule`,
+`BackendRuntimeContext`, `RemoteBackendAdapter`). A backend module implements provider
+operations only; it does not implement `IFileSystem`, the metadata cache, the delta cursor,
+scope, checkpoint commit/abort, or stores — core owns those (see
+[adr-20260920-backend-module-boundary.md](adr/adr-20260920-backend-module-boundary.md)).
+
+The backend implementation family is consolidated under `src/backends/`: the three
+built-ins (`googledrive/`, `dropbox/`, `onedrive/`) plus `shared/` for the
+provider-neutral helpers they build on. One module is one backend: a provider file may
+import only the public `src/backend-api/**`, `shared/`, and its own provider
+directory — never another provider — and `shared/` may import only the public API and
+itself. Every browser-safe shared helper now lives in the public API, so a backend
+cannot reach into the internal backend-module API (`src/fs/modules/**`), core state,
+or the plain `src/fs/**` helpers. That keeps it a provider integration and an exact
+candidate for the future external-artifact boundary.
+
+| | |
+|---|---|
+| **Prevents** | (a) `src/backend-api/**` importing `obsidian`, Node/Electron, or any path outside `src/backend-api/`; (b) a `src/backends/**` file importing outside `src/backend-api/**`, `src/backends/shared/**`, and its own provider directory — including a cross-provider import, a plain `src/fs/**`/`src/queue/**` helper, `obsidian`/`electron`, or a bare Node builtin (not only `node:*`) |
+| **Where** | `backend-module-boundary-guard.test.mjs`, run by `npm run lint:bot-repro` |
+| **How** | textual import scan over `src/backend-api/**/*.ts` and all non-test `src/backends/**/*.ts`; `tests/backend-api/fake-module.ts` is the compile fixture that builds a module with only the public API |
+| **Exception** | none. The public API carries the provider-neutral runtime helpers a module bundles; nothing under `src/fs/**` or `src/queue/` is reachable from a backend |
+
+Runtime validation (`src/fs/modules/validate-module.ts`) is authoritative for a candidate
+module shape; TypeScript compatibility alone is insufficient for a future dynamically loaded
+JavaScript artifact. `*-custom` ids are legacy settings aliases and are rejected as module
+ids; built-in vs custom OAuth is an `authMode` within a module.
+
+The single built-in import root (`src/fs/modules/builtin-modules.ts`) is the only place
+that imports the backend-specific module implementations; `src/fs/registry.ts` validates
+and registers them and wraps each in the core `BackendModuleProvider` (connection host
++ `ManagedRemoteFs`) used in production.
+
+### Limited compatibility exception (settings reshape)
+
+The "no migration code" rule in `AGENTS.md` has one bounded exception for the backend
+module migration: the three settings normalizations in `settings-normalize.ts` —
+`liftActiveBackendData`, `normalizeConflictStrategy`, and
+`normalizeBackendModuleSettings`. They reshape (or discard) an incompatible old
+settings shape so a vault upgrading stays connected; they do not transform data
+field-by-field. `normalizeBackendModuleSettings` canonicalizes a legacy `*-custom`
+backend id to its module id and coerces the one `authMode` representation — a stored
+`"custom"`/`"default"` string, or the boolean implied by a legacy alias — to the
+persisted boolean, leaving every other field intact; it is idempotent. A change to a
+persisted *metadata-record* format is handled by ordinary cold-start — a `MetadataStore`
+version bump drops and re-creates the derived checkpoint cache on open, so the old
+records and cursor disappear together, and same-generation corrupt/foreign records fail
+`bulkLoad` validation and re-scan — never by a codec. See
+[adr-20260920-backend-module-boundary.md](adr/adr-20260920-backend-module-boundary.md).
+
+## 5. Pipeline as data (Principle #4)
+
+The pure transform stages of the sync pipeline are deterministic `data → data`
+functions — no I/O, no clock, no randomness — so every intermediate state is testable.
+
+| | |
+|---|---|
+| **Prevents** | the pure transforms importing `fs/interface` (IFileSystem), or calling `Date.now()` / `Math.random()` |
+| **Where** | `PURE_TRANSFORMS` list in `eslint.config.mts` (`decision-engine`, `change-compare`, `merge`, PlanAdmission + its component graph/decision/lifecycle helpers, and the private local/remote shaping helpers) |
+| **How** | `no-restricted-imports` + `no-restricted-syntax` (error), scoped to those files |
+| **Exception** | Pass timestamps/variation in as data. To add a new pure transform, list its file in `PURE_TRANSFORMS` |
+
+The Admission implementation has a second structural guard:
+`ADMISSION_INTERNAL_IMPORTS` prevents any other production sync module from importing
+the path-local decision engine, component graph, lifecycle, shaping helpers, or a revived
+`rename-optimizer` stage. Only `plan-admission.ts` and its private helper modules may
+use those imports; the rest of production consumes the public Admission result or
+`AuthorizedSyncPlan`. This keeps path-local proposal and identity-component authority
+from becoming two whole-plan policy owners again.
+
+`sync-admission-authority-guard.test.mjs` closes the boundary inside Admission.
+Production value imports of content comparison and report-family classification are
+limited to `identity-component-decision.ts`; the fact graph and identity decision are
+reachable only through `plan-admission.ts`. Retired action-first optimizer modules have
+no permitted value importers. The AST guard rejects retired APIs and pins the fact-only
+fields of `BatchObservation` and `IdentityComponent`.
+`BatchObservation.candidateFacts` is a separate read-only occupancy view carrying the
+requested address, both authoritative resolved endpoint observations, and the
+requested-address `SyncRecord` baseline, so
+candidate lookups cannot become ordinary alias-topology authority.
+`IdentityComponent` may carry only those candidate facts derived for its current
+original alias component. They are occupancy and publication-precondition facts for
+direct content-addressed candidates, not independent identity claims, dispositions,
+or proposed actions.
+The same AST guard rejects module-scope mutable or computed correctness data in the
+decision and subordinate proof modules.
+The selected rename family and folder proof must therefore remain immutable call-local
+values; a helper cannot become a second policy or retry-state owner.
+
+### Producer-qualified mock path evidence
+
+Sync tests must not choose path authority independently from the filesystem role.
+The canonical role factories keep mutation-backed local observations resolved and
+remote observations as request echoes until a test explicitly models provider confirmation.
+
+| | |
+|---|---|
+| **Prevents** | `src/sync/**/*.test.ts` importing the raw authority-parameterized `createMockFs`, which could give remote mutations invented `actual_resolved` evidence |
+| **Where** | `RAW_SYNC_MOCK_FS_IMPORT` in `eslint.config.mts` |
+| **How** | `no-restricted-imports` (error), scoped to sync tests |
+| **Exception** | Raw construction is reserved for dedicated mock contract tests under `src/__mocks__/`; sync tests use `createMockLocalFs()` or `createMockRemoteFs()` |
+
+## 6. Single responsibility per module (Principle #7)
+
+Each file owns one concept. The `max-lines` cap is a **prompt to consider a
+responsibility split — not a line-count target to minimize against.** When a file
+trips it, the question is "does a concept want to move to its own module?", not
+"how do I shave lines off this one?".
+
+| | |
+|---|---|
+| **Prevents** | a module growing past ~300 code lines (comments/blanks excluded) *silently*, without anyone asking whether it should split |
+| **Where** | `max-lines` in `eslint.config.mts`, plus per-file `/* eslint max-lines */` header comments |
+| **How** | `max-lines` (error) on `src/**/*.ts`; tests, mocks, and `test-helpers.ts` are exempt |
+| **Exception** | If a clean responsibility split is natural, split. If it is not — the lines are one cohesive concern, or the split is its own task — **raise this file's threshold** with a `files`-scoped override or a file-header comment, and a justifying comment either way. Do **not** force the count down with churn |
+
+**Reducing the number is never the goal; keeping each module honestly sized is.**
+So do not inline single-use locals, merge imports, or otherwise contort code purely
+to fit under the cap — that trades readability for a number, which is exactly what
+the rule is *not* asking for. When a cohesive change pushes a file over and a clean
+split isn't natural (or is its own task), add or raise a per-file override pinned at
+the new size, with a comment saying why the split was deferred. The pin is a
+ratchet: it stops *silent* growth and flags the file as split-when-convenient — it
+is not a mandate to shrink the file by force.
+
+Seven modules currently carry such overrides as known debt in `eslint.config.mts`:
+`backends/googledrive/auth.ts` (337), `sync/orchestrator.ts` (444), `sync/plan-executor.ts`
+(334), `fs/caching/remote-fs.ts` (411), `fs/backend-manager.ts` (373),
+`fs/modules/backend-module-provider.ts` (322), and `fs/caching/metadata-cache.ts` (595).
+Ratchet them down when a natural responsibility split presents itself.
+
+Four modules instead carry a **file-header `/* eslint max-lines */` comment**, which
+overrides the config entry for that file: `sync/scope-projection.ts` (340),
+`sync/conflict-resolver.ts` (350), `sync/identity-component-decision.ts` (822), and
+`sync/plan-executor.ts` (1034 — so its 334 config entry above is inert). Same ratchet,
+same obligation to justify the pin in the comment; the inline form keeps the reason
+next to the code it is about.
+
+## 7. Vault-index read centralization
+
+The in-memory vault index can under-report before layout-ready, so reads go through a
+single gated entry point in `LocalFs`.
+
+| | |
+|---|---|
+| **Prevents** | calling `getAllLoadedFiles()` outside `src/fs/local/` |
+| **Where** | `NO_GET_ALL_LOADED_FILES` in `eslint.config.mts` |
+| **How** | `no-restricted-syntax` (error); allowed only in `src/fs/local/**` and `src/__mocks__/**` |
+| **Exception** | Read the index via `LocalFs.list()` |
+
+Companion behavioral rule (not statically enforceable): **never derive a deletion from
+listing-absence alone** — confirm against the authoritative `LocalFs.stat()`, which
+falls back to the adapter so a not-yet-indexed file on disk is never reported absent.
+See the IFileSystem notes in [ARCHITECTURE.md](../ARCHITECTURE.md).
+
+## 8. obsidianmd plugin rules
+
+`eslint-plugin-obsidianmd` (`obsidianmd.configs.recommended`) is the same ruleset the
+community submission bot runs against PRs, so `npm run lint` must pass before pushing.
+Notable rules:
+
+- **Sentence case** for UI text (`.setName()` / `.setDesc()`); acronyms outside the
+  rule's dictionary (e.g. `URI`, `MB`) must be lowercased or rephrased.
+- **No hardcoded `.obsidian`** — use `Vault#configDir`.
+- **No `TFile`/`TFolder` cast** (`obsidianmd/no-tfile-tfolder-cast`).
+- **Restricted globals** (`no-restricted-globals`, error): `fetch` (use `requestUrl()`),
+  `localStorage` (use `App#saveLocalStorage` / `loadLocalStorage`), and the global `app`
+  (use your plugin's own reference). So "use `requestUrl()`, never `fetch`" is enforced —
+  not merely a convention.
+
+Do not disable rules the obsidianmd plugin forbids — fix the code instead. The one
+sanctioned escape hatch is the hardcoded-config-path rule in **tests**: assign
+`configDir` to a variable and add `// eslint-disable-line obsidianmd/hardcoded-config-path`.
+Every `eslint-disable` directive must carry a `-- reason` describing why.
+
+## 9. Offline community-bot unsafe-warning diagnostic
+
+`npm run lint:bot-repro` distinguishes a source type-safety defect from the mass
+`@typescript-eslint/no-unsafe-*` cascade caused when external declaration boundaries
+are unavailable. It is a deterministic CI contract, not a replacement for
+`npm run lint`.
+
+This command verifies three different lint environments:
+
+- `npm run lint` runs after `npm ci`, so TypeScript can read declarations from
+  `node_modules`.
+- The Obsidian community Dashboard may scan submitted production source without runtime
+  declarations. An unresolved import then becomes TypeScript's `error` type and can
+  generate hundreds of secondary unsafe-call/assignment/member/argument/return
+  findings in otherwise typed application code.
+- Vitest is independently made untyped to ensure no Vitest-owned contract or harness
+  has leaked into the Dashboard's `src/` scan boundary.
+
+The Dashboard result for the exact submitted commit remains authoritative. The local
+reproduction prevents the known dependency-resolution mismatch from returning; it
+does not substitute a previous release's score or claim that an unscanned commit has
+already passed the remote service.
+
+| | |
+|---|---|
+| **Prevents** | Shipping hundreds of `error`/`any` diagnostics when the community scanner does not install dependency declarations; weakening the five unsafe rules while normal lint happens to stay green |
+| **Where** | `package-lock.json`, `tsconfig.json`, `lint-bot-repro.mjs`, its pure classifier and `node:test` contract, and the isolated fixtures under `test-fixtures/lint-bot-repro/` |
+| **How** | Lints identical production source and ESLint configuration three times: with installed declarations, with the five direct runtime dependencies replaced by an untyped declaration, and with Vitest replaced independently. All candidates must exit 0 with zero findings from all five unsafe rule families. |
+| **Exception** | None. Do not cast, disable rules, or update the contract to hide a source or declaration failure. |
+
+Do not copy dependency declarations into the repository. The community scanner lints
+committed `.d.ts` files as source, so vendoring official declarations merely replaces
+resolution warnings with warnings inside third-party code. Dependency versions and
+their declaration files are owned by `package-lock.json` and restored with `npm ci`.
+
+The injected process models the community scanner's dependency-less source pass. The
+wrapper exits **0** only after its negative classifier tests pass, all three candidates exit
+0 with zero unsafe findings, TypeScript proves that all five runtime imports and Vitest resolve
+to their independently injected fixtures while non-injected boundaries resolve from
+`node_modules`, and the effective configs match. A lint exit of 1, a tool exit
+of 2, or no exit status is a failure.
+
+This path never runs `npm install`, `npx`, a download, or a network request. It uses
+only `node_modules/.bin/eslint` and the ESLint API already installed from the lockfile,
+copies `src` into disposable workspaces (never symlinks it), and removes those
+workspaces on success and failure. If it reports that project-local ESLint is missing,
+restore dependencies with the normal project setup (`npm ci`) outside the repro, then
+run the command again; the repro deliberately has no download fallback.
+
+The same command runs an esbuild metafile probe for fflate, ignore, js-md5, and
+node-diff3. It fails if the bundle no longer contains each package's JavaScript
+implementation.
+
+Production modules reach those five packages only through `src/platform/`. Each
+boundary receives an unresolved runtime import as `unknown`, validates the small shape
+the plugin uses, and exposes first-party types to the rest of `src`. This keeps the
+runtime bundle unchanged while preventing a missing third-party declaration from
+poisoning application types. If either candidate reports unsafe findings, the fix is
+incomplete. If the wrapper reports config, resolution, spawn, JSON, or exit-status
+failure, fix the runner/toolchain path before drawing a conclusion.
+
+## Test-pinned principles
+
+Principles that can't be expressed as a static rule are pinned by tests instead. Keep
+these green when touching the pipeline:
+
+| Principle | Pinned by |
+|---|---|
+| **Two-authority durable sync state** — only the clean-cycle remote cursor and per-file successful `SyncRecord` are authoritative; the complete remote cache is a derived co-commit. The guard's mutating-method set is exactly `SyncStateStore`'s write surface: `put`, `putContent`, `delete`, `clear`, `compareAndPut`, `compareAndDelete`, `compareAndRewritePaths`, `compareAndPutContent` | `sync-state-ownership-guard.test.mjs` (run by `npm run lint:bot-repro`) |
+| **Single Admission identity authority** — bind current component facts before content comparison; no action-first APIs, foreign policy imports, action-bearing observations, or retained proof | `sync-admission-authority-guard.test.mjs`, `sync/plan-admission.test.ts` |
+| **Remote backend completeness** — every registered provider resolves to an exact catalogued filesystem family, and every family runs all five shared contracts (the fifth is the adapter-level concurrency contract, which drives the real adapter directly so a change between its observation and its provider operation is not masked by core re-observation) | `fs/registry.test.ts`, `tests/fs/remote-backend-contracts.test.ts` |
+| **#3 delta-first** — the hot path stats only dirty paths and never calls `list()` (full scans are cold-start only) | `sync/delta-first.test.ts` |
+| **#5 crash-safe** — an interrupted action commits no baseline and re-syncs to convergence | `sync/crash-safety.test.ts`, `sync/convergence.test.ts` |
+| **Attempt-bounded remote working view** — a clean cycle commits; every incomplete result or pre-closeout exception aborts before classification/retry; the next COLD/WARM/HOT attempt derives only from durable/current facts | `sync/sync-cycle-finalization.test.ts`, `sync/orchestrator.test.ts`, `sync/plan-executor.test.ts`, `tests/fs/remote-backend-contracts.test.ts` |
+| **Case-alias canonicalization adds no owner** — Observation records raw-adapter actual casing and comparable content facts; Admission alone normalizes an explicit alias component and may canonicalize remote casing when endpoints, vacancy, unique identity, and content are complete. Temperature, global record count, database version, and prior failure are not decision inputs | `fs/local/local-fs.test.ts`, `sync/change-detector.test.ts`, `sync/plan-admission.test.ts`, `sync/orchestrator.test.ts` |
+| **Requested spelling has no topology authority** — `requested_echo` may refresh metadata at an identity's current path but cannot re-key it. Provider-resolved mutation responses and successful explicit rename endpoints alone may change the cache path; a mixed case-only parent component retains content work and uses one parent rename | `tests/fs/managed/normalized-metadata-cache.test.ts`, `tests/fs/remote-backend-contracts.test.ts`, `sync/orchestrator.test.ts` |
+| **Command-ID immutability** — registered command IDs are a stable, published API | `main-commands.test.ts` (snapshot — update only for a genuinely new command, never to rename a shipped ID) |
+| **Coverage floors** — ratchet thresholds (lines 76 / statements 75 / functions 70 / branches 65) | `vitest.config.ts`, enforced by `npm run test:coverage` in CI. Raise as coverage improves; never lower to make CI pass |
+
+### Closed two-authority fixture
+
+`sync-state-ownership-guard.test.mjs` uses the installed TypeScript AST to inventory every
+`SyncOrchestrator` instance field (including non-private, `#private`, computed, and
+constructor-parameter fields), every production property/element access to
+`commitCheckpoint` (including extracted or bound forms), and the production imports,
+references, constructors, and mutating calls for `SyncStateStore`, `MetadataStore`, and
+`IDBHelper`. It also inventories direct `indexedDB.open` accesses. Its receiver tracking
+covers direct, aliased, destructured, and bracket-notation `SyncStateStore` calls,
+including exact record/content CAS and the atomic compare-and-swap relocation of a
+record set. The mutating-method set has **two** consumers in that file: the call-site
+detector that decides each file's per-file booleans, and a hardcoded list that generates
+two negative fixtures — `records.<method>` and `records["<method>"]` — for every
+compare-and-swap method; both are edited together, so every CAS method keeps both of its
+fixtures and adding a method must not silently remove its existing writer from the
+inventory. A method leaving `SyncStateStore` reduces the set at both sites, and that is
+detector hygiene: what the fixture proves about ownership is the four per-file
+inventories (`imports`, `references`, `constructors`, `mutationCallers`), so only a change
+in one of those — not a fixture edit that follows a removal — is evidence of a new writer
+or owner. This makes a new durable owner, persistent-store owner, or in-memory recovery
+owner a deliberate review event rather than an incidental field or write.
+The Backend Module API's `src/fs/managed/managed-remote-fs.ts` is one such deliberate
+entry: core constructs and owns the checkpoint `MetadataStore<RemoteObject>` for the
+managed remote filesystem so no backend module ever receives a store. It is a core
+owner of the same non-authoritative, commit-last projection, recorded in the fixture
+beside the legacy per-provider owners.
+The record store's key shape is subordinate storage mechanism, not an authority:
+`sync-records` and `sync-content` are keyed by `remoteIdentityKey`, and the unique `path`
+index guards the filesystem layer's path-uniqueness guarantee rather than arbitrating
+between claimants — which is why re-keying the store changes no inventory here and needs
+no edit to `sync-admission-authority-guard.test.mjs`'s fixture (see
+[ADR 0001](adr/0001-metadata-cache-is-subordinate-to-commit-last.md)). The cache checkpoint must serialize the
+complete final live cache under its mutex with the cursor; do not add touched-path,
+pending-flush, receipt, journal, or other intermediate correctness state.
+The unified conflict resolver removes the former `conflict.ts` Store reader/import;
+no writer, constructor, or retained-field owner is added. The Admission architecture
+guard also rejects the retired conflict execution switches and legacy resolver APIs.
+`fact-first-execution.test.ts` pins ordinary and renamed conflict preservation,
+original-source revalidation, arriving-destination rejection, terminal-copy integrity,
+and interrupted merge convergence without compensating rollback.
+The `prefer_local` proof result is compiled by Admission into the required
+action-local `ConflictExecutionPolicy`: a proven ordinary same-path edit/edit conflict
+becomes `local_win`; incomplete or ineligible proof becomes `preserve`. Observation may
+use a responsibility-local pure predicate only to acquire the bounded proof facts.
+Execution, resolver, and audit may consume the admitted policy but cannot receive or
+reinterpret the raw strategy. The policy remains attempt-local and must not become a
+COLD/HOT branch, durable recovery marker, or resolver-owned decision.
+Observation evidence and Admission dispositions/failure reasons are immutable
+cycle-local values only. Do not persist them, add them to `SyncRecord`, or introduce an
+Orchestrator field to carry them across cycles. Case-alias handling must use one
+Admission-owned normalized component and exhaustive decision, never an
+initial/COLD/error partition. Observation owns fact acquisition only; negative tests
+cover every destructive precondition plus temperature and unrelated-record invariance.
+Within that component, caller-requested spelling remains an address only. It cannot
+become cached topology, cannot authorize a child rename, and cannot substitute for the
+single explicit parent transition after content work.
+
+This is an ordinary architectural primitive/owner inventory, not a malicious-code sandbox:
+it is deliberately conservative for ordinary TypeScript ownership forms, and semantic
+review remains required.
+
+When an intentional architecture change needs a new entry, update the guard fixture,
+ADR 0001, this section, and `AGENTS.md` together, then run `npm run lint:bot-repro`.
+Do not weaken the inventory or add a broad pattern exception to admit a writer.
+
+## Declaring an exception
+
+In order of preference:
+
+1. **Restructure the code** so the rule passes — this is almost always the right move.
+2. **By path in `eslint.config.mts`** for legitimate, durable carve-outs (e.g. adding a
+   file to `PURE_TRANSFORMS`, or the per-file `max-lines` overrides). These are reviewed
+   as code.
+3. **`// eslint-disable-line <rule> -- <reason>`** for a one-off, with a mandatory
+   reason. Never use this for rules the obsidianmd plugin forbids
+   (`@typescript-eslint/no-explicit-any`, `obsidianmd/no-tfile-tfolder-cast`,
+   `obsidianmd/ui/sentence-case`, …).
+
+## Related
+
+- Canonical design principles: [ARCHITECTURE.md](../ARCHITECTURE.md)
+- The rules themselves: [`eslint.config.mts`](../eslint.config.mts)
+- Contributor workflow: [CONTRIBUTING.md](../CONTRIBUTING.md)
+- Agent operating notes: [CLAUDE.md](../CLAUDE.md)

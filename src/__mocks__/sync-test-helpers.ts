@@ -1,0 +1,494 @@
+import type { IFileSystem } from "../fs/interface";
+import type { FileEntity, PathAuthority } from "../fs/types";
+import type { RecordRelocation, SyncRecord } from "../sync/types";
+import type { SyncStateStore } from "../sync/state";
+import type { AirSyncSettings } from "../settings";
+import { sha256 } from "../utils/hash";
+import { normalizeSyncPath, validateRename } from "../utils/path";
+
+/**
+ * In-memory mock IFileSystem for unit tests — the single canonical test double.
+ *
+ * Contract-faithful: paths are normalized, renames validated, reads return
+ * copies, and writes/mkdir reject type collisions — exactly as LocalFs /
+ * GoogleDriveFs behave. `stat()` computes a real SHA-256 so hash-based decisions
+ * are exercised through the pipeline; `list()` keeps `hash: ""` per the
+ * IFileSystem contract (list may skip hashing for performance — callers stat()
+ * when an accurate hash is needed). The `.files` map is exposed so tests can
+ * seed/inspect state directly (e.g. attach a `remoteChecksum`).
+ */
+export type MockFileSystem = IFileSystem & {
+	files: Map<string, { content: ArrayBuffer; entity: FileEntity }>;
+	/**
+	 * The provider identity a newly created object is born with. Remote mocks mint
+	 * one per created object and keep it across renames, as all three backends do;
+	 * the local mock mints none, because LocalFs never observes one.
+	 */
+	mintIdentity(path: string): string | undefined;
+};
+
+export function createMockFs(
+	name: string,
+	mutationPathAuthority: PathAuthority,
+	identityPrefix?: string,
+): MockFileSystem {
+	const mintIdentity = (path: string) =>
+		identityPrefix === undefined ? undefined : `${identityPrefix}${path}`;
+	const files = new Map<
+		string,
+		{ content: ArrayBuffer; entity: FileEntity }
+	>();
+
+	/** Create each directory along `path`, rejecting any component that is a file. */
+	function mkdirInternal(path: string): FileEntity {
+		const parts = path.split("/");
+		let current = "";
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			const existing = files.get(current);
+			if (existing && !existing.entity.isDirectory) {
+				throw new Error(
+					`Cannot create directory "${path}": "${current}" is a file`,
+				);
+			}
+			if (!existing) {
+				files.set(current, {
+					content: new ArrayBuffer(0),
+					entity: {
+						path: current,
+						pathAuthority: mutationPathAuthority,
+						isDirectory: true,
+						size: 0,
+						mtime: 0,
+						hash: "",
+						identityKey: mintIdentity(current),
+					},
+				});
+			}
+		}
+		return { path, pathAuthority: "requested_echo", isDirectory: true, size: 0, mtime: 0, hash: "" };
+	}
+
+	function ensureParents(path: string): void {
+		const parent = path.substring(0, path.lastIndexOf("/"));
+		if (parent) mkdirInternal(parent);
+	}
+
+	return {
+		name,
+		files,
+		mintIdentity,
+		list() {
+			// Return fresh entities (real backends build a new FileEntity per call);
+			// a caller mutating a listing result must not corrupt stored state.
+			return Promise.resolve(
+				Array.from(files.values()).map((f) => ({ ...f.entity })),
+			);
+		},
+		async stat(path: string) {
+			path = normalizeSyncPath(path);
+			const entry = files.get(path);
+			if (!entry) return null;
+			const { entity } = entry;
+			// A real file always has a computable hash; fill it on stat(). Preserve
+			// any hash a test injected directly onto the stored entity. Always return
+			// a fresh object so callers can't mutate the mock's backing store.
+			if (!entity.isDirectory && !entity.hash) {
+				return { ...entity, hash: await sha256(entry.content) };
+			}
+			return { ...entity };
+		},
+		async read(path: string) {
+			path = normalizeSyncPath(path);
+			const entry = files.get(path);
+			if (!entry) throw new Error(`File not found: ${path}`);
+			if (entry.entity.isDirectory) {
+				throw new Error(`Not a file (is a directory): ${path}`);
+			}
+			// Stays async so the throws above reject (tests assert .rejects);
+			// `await Promise.resolve` satisfies require-await for the sync body.
+			return await Promise.resolve(entry.content.slice(0));
+		},
+		async write(path: string, content: ArrayBuffer, mtime: number) {
+			path = normalizeSyncPath(path);
+			const existing = files.get(path)?.entity;
+			if (existing?.isDirectory) {
+				throw new Error(
+					`Cannot write file: "${path}" is an existing directory`,
+				);
+			}
+			ensureParents(path);
+			const entity: FileEntity = {
+				path,
+				pathAuthority: mutationPathAuthority,
+				isDirectory: false,
+				size: content.byteLength,
+				mtime,
+				hash: "",
+				identityKey: existing?.identityKey ?? mintIdentity(path),
+				backendMeta: existing?.backendMeta,
+			};
+			// Copy on store: real backends persist their own bytes, so a later
+			// mutation of the caller's buffer must not change stored content.
+			files.set(path, { content: content.slice(0), entity });
+			// list() reads the stored entity (hash ""); the return value carries the
+			// computed hash, mirroring a real backend's write(). Remote-cache tests
+			// inject requested_echo so later stat/list cannot silently claim that a
+			// mutation path was producer-resolved; local tests retain actual_resolved.
+			return { ...entity, pathAuthority: "requested_echo", hash: await sha256(content) };
+		},
+		async mkdir(path: string) {
+			// Stays async so mkdirInternal's type-collision throw rejects.
+			return await Promise.resolve(
+				mkdirInternal(normalizeSyncPath(path)),
+			);
+		},
+		hasChildren(dirPath: string) {
+			const prefix = normalizeSyncPath(dirPath) + "/";
+			for (const p of files.keys()) {
+				if (
+					p.startsWith(prefix) &&
+					!p.substring(prefix.length).includes("/")
+				) {
+					return Promise.resolve(true);
+				}
+			}
+			return Promise.resolve(false);
+		},
+		delete(path: string) {
+			path = normalizeSyncPath(path);
+			const prefix = path + "/";
+			for (const key of [...files.keys()]) {
+				if (key === path || key.startsWith(prefix)) files.delete(key);
+			}
+			return Promise.resolve();
+		},
+		async rename(oldPath: string, newPath: string) {
+			// Stays async so the validation throws below reject (tests assert .rejects).
+			await Promise.resolve();
+			oldPath = normalizeSyncPath(oldPath);
+			newPath = normalizeSyncPath(newPath);
+			validateRename(oldPath, newPath);
+			const entry = files.get(oldPath);
+			if (!entry) throw new Error(`File not found: ${oldPath}`);
+			if (files.has(newPath)) {
+				throw new Error(`Destination already exists: ${newPath}`);
+			}
+			ensureParents(newPath);
+			// Move the entry itself
+			files.delete(oldPath);
+			entry.entity.path = newPath;
+			files.set(newPath, entry);
+			// Move descendants (folder rename)
+			const prefix = oldPath + "/";
+			for (const [p, f] of [...files.entries()]) {
+				if (p.startsWith(prefix)) {
+					const childNewPath =
+						newPath + "/" + p.substring(prefix.length);
+					files.delete(p);
+					f.entity.path = childNewPath;
+					files.set(childNewPath, f);
+				}
+			}
+		},
+		// A full incremental-checkpoint capability (all-or-nothing — see IFileSystem).
+		// Defaults are no-op/empty; individual tests override a method (or delete
+		// `checkpoint`) to drive cold-reconcile / commit / reset behaviour.
+		checkpoint: {
+			getChangedPaths: () =>
+				Promise.resolve({
+					modified: [] as string[],
+					deleted: [] as string[],
+				}),
+			listCurrentSnapshot: () => Promise.resolve(
+				Array.from(files.values()).map((entry) => ({ ...entry.entity })),
+			),
+			// Load-bearing default: true ⇒ orchestrator's `checkpoint ? !hasCheckpoint() : false`
+			// is false ⇒ no forced cold scan, so default tests stay WARM/COLD (mirroring the
+			// pre-capability mock, which had no hasCheckpoint and short-circuited to false).
+			// Flipping this to false would silently force every default test cold.
+			hasCheckpoint: () => Promise.resolve(true),
+			abortWorkingView: () => Promise.resolve(),
+			resetCheckpoint: () => Promise.resolve(),
+			commitCheckpoint: () => Promise.resolve(),
+		},
+	};
+}
+
+/** Local mutations are observed from the authoritative vault adapter. */
+export function createMockLocalFs(): MockFileSystem {
+	return createMockFs("local", "actual_resolved");
+}
+
+/** Remote mutations remain request echoes until a test models provider confirmation. */
+export function createMockRemoteFs(mutationPathAuthority: PathAuthority = "requested_echo"): MockFileSystem {
+	return createMockFs("remote", mutationPathAuthority, "id:");
+}
+
+/** Model a provider observation that confirms one remote path and its descendants. */
+export function confirmMockPath(fs: MockFileSystem, path: string): void {
+	path = normalizeSyncPath(path);
+	const prefix = path + "/";
+	for (const [candidate, entry] of fs.files) {
+		if (candidate === path || candidate.startsWith(prefix)) {
+			entry.entity.pathAuthority = "actual_resolved";
+		}
+	}
+}
+
+/** In-memory mock SyncStateStore for unit tests */
+export function createMockStateStore(): {
+	records: Map<string, SyncRecord>;
+	contents: Map<string, ArrayBuffer>;
+} & SyncStateStore {
+	// `records` stays the address index the real store's unique `path` index is, and
+	// `contents` is keyed by remote identity as `sync-content` now is. The row a
+	// publication continues is found by identity, exactly as `keyPath` finds it.
+	const records = new Map<string, SyncRecord>();
+	const contents = new Map<string, ArrayBuffer>();
+	const rowFor = (remoteIdentityKey: string): SyncRecord | undefined =>
+		[...records.values()].find((record) => record.remoteIdentityKey === remoteIdentityKey);
+	/** The two operations: a replacement ends the compared incumbent, a rename moves no row. */
+	const publish = (expectedRow: SyncRecord | undefined, record: SyncRecord,
+		expectedOccupant: SyncRecord | undefined): void => {
+		for (const ended of [expectedOccupant, expectedRow]) {
+			if (!ended || ended.remoteIdentityKey === record.remoteIdentityKey) continue;
+			records.delete(ended.path);
+			contents.delete(ended.remoteIdentityKey);
+		}
+		if (expectedRow && expectedRow.path !== record.path) records.delete(expectedRow.path);
+		records.set(record.path, record);
+		if (!expectedRow || !record.hash || expectedRow.hash !== record.hash ||
+			expectedRow.localSize !== record.localSize ||
+			expectedRow.remoteIdentityKey !== record.remoteIdentityKey) {
+			contents.delete(record.remoteIdentityKey);
+		}
+	};
+	return {
+		records,
+		contents,
+		async open() {},
+		async close() {},
+		get(path: string) {
+			return Promise.resolve(records.get(path));
+		},
+		getMany(paths: string[]) {
+			const result = new Map<string, SyncRecord>();
+			for (const p of paths) {
+				const r = records.get(p);
+				if (r !== undefined) result.set(p, r);
+			}
+			return Promise.resolve(result);
+		},
+		getManyByIdentity(identities: readonly string[]) {
+			const result = new Map<string, SyncRecord>();
+			for (const identity of identities) {
+				const r = rowFor(identity);
+				if (r !== undefined) result.set(identity, r);
+			}
+			return Promise.resolve(result);
+		},
+		getAll() {
+			return Promise.resolve(Array.from(records.values()));
+		},
+		put(record: SyncRecord) {
+			records.set(record.path, record);
+			return Promise.resolve();
+		},
+		compareAndPut(expectedRow: SyncRecord | undefined, record: SyncRecord,
+			expectedOccupant: SyncRecord | undefined) {
+			const ended = expectedRow && expectedRow.remoteIdentityKey !== record.remoteIdentityKey
+				? expectedRow : undefined;
+			if (JSON.stringify(rowFor(record.remoteIdentityKey)) !==
+					JSON.stringify(ended ? undefined : expectedRow) ||
+				JSON.stringify(ended && rowFor(ended.remoteIdentityKey)) !== JSON.stringify(ended) ||
+				JSON.stringify(records.get(record.path)) !== JSON.stringify(expectedOccupant)) {
+				return Promise.resolve(false);
+			}
+			publish(expectedRow, record, expectedOccupant);
+			return Promise.resolve(true);
+		},
+		compareAndRewritePaths(relocations: readonly RecordRelocation[]) {
+			const sources = new Set(relocations.map((item) => item.source.path));
+			if (sources.size !== relocations.length ||
+				new Set(relocations.map((item) => item.terminal.path)).size !== relocations.length ||
+				relocations.some((item) => item.source.path !== item.terminal.path &&
+					sources.has(item.terminal.path)) ||
+				relocations.some((item) =>
+					JSON.stringify(rowFor(item.source.remoteIdentityKey)) !== JSON.stringify(item.source) ||
+					JSON.stringify(records.get(item.terminal.path)) !== JSON.stringify(item.destination))) {
+				return Promise.resolve(false);
+			}
+			for (const item of relocations) publish(item.source, item.terminal, item.destination);
+			return Promise.resolve(true);
+		},
+		compareAndDelete(path: string, expected: SyncRecord | undefined) {
+			if (JSON.stringify(expected && rowFor(expected.remoteIdentityKey)) !== JSON.stringify(expected) ||
+				JSON.stringify(records.get(path)) !== JSON.stringify(expected)) return Promise.resolve(false);
+			if (expected) {
+				records.delete(expected.path);
+				contents.delete(expected.remoteIdentityKey);
+			}
+			return Promise.resolve(true);
+		},
+		delete(path: string) {
+			const record = records.get(path);
+			records.delete(path);
+			if (record) contents.delete(record.remoteIdentityKey);
+			return Promise.resolve();
+		},
+		clear() {
+			records.clear();
+			contents.clear();
+			return Promise.resolve();
+		},
+		putContent(remoteIdentityKey: string, content: ArrayBuffer) {
+			contents.set(remoteIdentityKey, content);
+			return Promise.resolve();
+		},
+		compareAndPutContent(expected: SyncRecord, content: ArrayBuffer) {
+			if (JSON.stringify(rowFor(expected.remoteIdentityKey)) !== JSON.stringify(expected)) {
+				return Promise.resolve(false);
+			}
+			contents.set(expected.remoteIdentityKey, content);
+			return Promise.resolve(true);
+		},
+		getContent(remoteIdentityKey: string) {
+			return Promise.resolve(contents.get(remoteIdentityKey));
+		},
+	} as unknown as {
+		records: Map<string, SyncRecord>;
+		contents: Map<string, ArrayBuffer>;
+	} & SyncStateStore;
+}
+
+/** Create a FileEntity + ArrayBuffer pair from text content */
+export function makeFile(
+	path: string,
+	content: string,
+	mtime = 1000,
+	// A remote entity always arrives with a provider identity, and the record layer
+	// refuses to baseline one that does not. Pass "" for the empty-identity case;
+	// spread the entity and override `identityKey` to model an absent one, since an
+	// explicit `undefined` argument re-selects this default.
+	identityKey: string | undefined = `id:${path}`,
+): { entity: FileEntity; content: ArrayBuffer } {
+	const buf = new TextEncoder().encode(content).buffer;
+	return {
+		entity: {
+			path,
+			isDirectory: false,
+			size: buf.byteLength,
+			mtime,
+			hash: "",
+			identityKey,
+		},
+		content: buf,
+	};
+}
+
+/** Add a file to a mock FS and return its entity */
+export function addFile(
+	fs: ReturnType<typeof createMockFs>,
+	path: string,
+	text: string,
+	mtime = 1000,
+): FileEntity {
+	// Seed under the same canonical key the FS methods look up by, so a
+	// non-normalized path (e.g. "/a.md") can't become invisible to stat()/read().
+	path = normalizeSyncPath(path);
+	const buf = new TextEncoder().encode(text).buffer;
+	// Ensure parent directories exist
+	const parentPath = path.substring(0, path.lastIndexOf("/"));
+	if (parentPath) {
+		const parts = parentPath.split("/");
+		let current = "";
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			if (!fs.files.has(current)) {
+				const dirEntity: FileEntity = {
+					path: current,
+					pathAuthority: "actual_resolved",
+					isDirectory: true,
+					size: 0,
+					mtime: 0,
+					hash: "",
+					identityKey: fs.mintIdentity(current),
+				};
+				fs.files.set(current, {
+					content: new ArrayBuffer(0),
+					entity: dirEntity,
+				});
+			}
+		}
+	}
+	const entity: FileEntity = {
+		path,
+		pathAuthority: "actual_resolved",
+		isDirectory: false,
+		size: buf.byteLength,
+		mtime,
+		hash: "",
+		identityKey: fs.mintIdentity(path),
+	};
+	fs.files.set(path, { content: buf, entity });
+	return entity;
+}
+
+/** Read a file from a mock FS as a string */
+export function readText(
+	fs: ReturnType<typeof createMockFs>,
+	path: string,
+): string {
+	const entry = fs.files.get(path);
+	if (!entry) throw new Error(`Not found: ${path}`);
+	return new TextDecoder().decode(entry.content);
+}
+
+/**
+ * A complete, type-checked `AirSyncSettings` for tests. Typed so that adding a
+ * required settings field breaks compilation here (and at every call site)
+ * rather than silently drifting. Override any field via `overrides`.
+ */
+export function mockSettings(
+	overrides: Partial<AirSyncSettings> = {},
+): AirSyncSettings {
+	return {
+		vaultId: "test-vault",
+		backendType: "test",
+		conflictStrategy: "auto_merge",
+		ignorePatterns: [],
+		syncDotPaths: [],
+		// Mirror production DEFAULT_SETTINGS for behaviour-affecting flags so tests
+		// don't run under a configuration real users never have.
+		enableConfigSync: false,
+		syncConfigJsonFiles: true,
+		syncConfigPlugins: true,
+		syncConfigSnippets: false,
+		syncConfigThemes: false,
+		syncConfigIcons: false,
+		enableThreeWayMerge: true,
+		mobileMaxFileSizeMB: 10,
+		screenWakeLockOnSync: false,
+		showSyncNotifications: false,
+		enableLogging: false,
+		logLevel: "info",
+		backendData: {},
+		lastSyncedIdentity: "",
+		...overrides,
+	};
+}
+
+/** A promise resolvable from outside — gate concurrent work in tests. */
+export function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((r) => {
+		resolve = r;
+	});
+	return { promise, resolve };
+}
+
+/** Flush pending microtasks + one macrotask so scheduled async phases advance. */
+export function flush(): Promise<void> {
+	return new Promise((r) => setTimeout(r, 0));
+}

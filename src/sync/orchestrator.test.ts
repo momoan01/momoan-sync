@@ -1,0 +1,3753 @@
+import { describe, it, expect, vi } from "vitest";
+import "fake-indexeddb/auto";
+import { SyncOrchestrator } from "./orchestrator";
+import type { SyncOrchestratorDeps } from "./orchestrator";
+import { backendError } from "../backend-api";
+import { collectChanges } from "./change-detector";
+import { createChecksumRegistry } from "../fs/modules/checksum-registry";
+import { prepareSyncCycleSnapshot } from "./sync-cycle-planning";
+
+const checksumRegistry = createChecksumRegistry();
+import { admitBatchObservation } from "./plan-admission";
+import { LocalChangeTracker } from "./local-tracker";
+import {
+	confirmMockPath, createMockLocalFs, createMockRemoteFs, type MockFileSystem,
+	addFile, deferred, flush,
+	readText,
+	mockSettings as baseMockSettings,
+} from "../__mocks__/sync-test-helpers";
+import type { AirSyncSettings } from "../settings";
+import type { AddressDisplacement } from "../fs/caching/claim-set-assignment";
+import { namespaceRepairFor } from "../fs/caching/namespace-reconciliation";
+import type { NamespaceRepairPolicy } from "../fs/caching/namespace-reconciliation";
+import type { FileEntity } from "../fs/types";
+import { AuthError } from "../backend-api/error-classification";
+import { sha256 } from "../utils/hash";
+import type { Logger } from "../logging/logger";
+import type { PriorityObservation, PriorityObservationRequest } from "../fs/priority-observation";
+
+// Make retry backoff instant: the retry tests assert behaviour (retry count,
+// status), not wall-clock timing, and real exponential backoff + jitter added
+// ~4s to the suite. `sleep` is the only export stubbed; the retry policy
+// (decideRetry) and the error classifier (backend-api/error-classification classifyHttpError) stay real.
+// Mocking sleep — rather than fake timers — avoids interfering with
+// fake-indexeddb's async scheduling.
+vi.mock("./error", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./error")>();
+	return { ...actual, sleep: () => Promise.resolve() };
+});
+
+// A vault's configDir is user-configurable, so tests use a value distinct from
+// the (arbitrary) Obsidian default to prove the logic doesn't hardcode it. It's
+// dot-prefixed like every real configDir, since that's what puts it under the
+// syncDotPaths scope gate in the first place.
+const TEST_CONFIG_DIR = ".cfg";
+// Distinct from the real manifest id ("air-sync") to prove the exclusion logic
+// derives it from deps rather than hardcoding it.
+const TEST_PLUGIN_ID = "test-plugin";
+
+/** Positive scenarios with provider-confirmed post-write metadata. The canonical
+ * remote double stays conservative; fact-first execution tests pin echo rejection.
+ */
+function confirmRemoteWrites(fs: MockFileSystem): void {
+	const write = fs.write.bind(fs);
+	fs.write = async (path, content, mtime) => {
+		const written = await write(path, content, mtime);
+		confirmMockPath(fs, written.path);
+		return written;
+	};
+}
+
+function mockSettings(): AirSyncSettings {
+	// Unique vaultId per call keeps each orchestrator's fake-indexeddb store isolated.
+	return baseMockSettings({
+		backendType: "none",
+		vaultId: `test-${Math.random()}`,
+	});
+}
+
+function createDeps(
+	overrides: Partial<SyncOrchestratorDeps> = {},
+): SyncOrchestratorDeps {
+	const localFs = createMockLocalFs();
+	const remoteFs = createMockRemoteFs();
+	return {
+		getSettings: () => mockSettings(),
+		saveSettings: vi.fn().mockResolvedValue(undefined),
+		configDir: () => TEST_CONFIG_DIR,
+		pluginId: () => TEST_PLUGIN_ID,
+		localFs: () => localFs,
+		remoteFs: () => remoteFs,
+		backendProvider: () => null,
+		checksumRegistry,
+		onStatusChange: vi.fn(),
+		onProgress: vi.fn(),
+		notify: vi.fn(),
+		isMobile: () => false,
+		localTracker: new LocalChangeTracker(),
+		...overrides,
+	};
+}
+
+/** Minimal IBackendProvider double exposing only what the orchestrator uses. */
+function mockProvider(
+	over: Partial<import("../fs/backend").IBackendProvider> & { type?: string },
+): import("../fs/backend").IBackendProvider {
+	return {
+		type: "test",
+		...over,
+	} as unknown as import("../fs/backend").IBackendProvider;
+}
+
+describe("SyncOrchestrator", () => {
+	it.each(["after-admission", "after-publication"] as const)(
+		"queues and syncs a local edit %s of an initial match", async (timing) => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs("actual_resolved");
+			const originalHash = await sha256(new TextEncoder().encode("original").buffer);
+			const modifiedHash = await sha256(new TextEncoder().encode("modified").buffer);
+			addFile(localFs, "note.md", "original", 1000);
+			addFile(remoteFs, "note.md", "original", 1000).remoteChecksum = { algo: "sha256", value: originalHash };
+			const records: Array<{ hash: string } | undefined> = [];
+			const settings = baseMockSettings({ vaultId: `test-${Math.random()}`, enableThreeWayMerge: false });
+			let edited = false;
+			const editAndQueue = () => {
+				if (edited) return;
+				edited = true;
+				// Same size and mtime: the retained dirty generation must drive a
+				// fresh hash comparison, not merely a metadata-only full scan.
+				addFile(localFs, "note.md", "modified", 1000);
+				deps.localTracker.markDirty("note.md");
+				void orchestrator.runSync(); // scheduler's debounced request, while locked
+			};
+			const info = vi.fn((message: string) => {
+				if (timing === "after-admission" && message === "Sync plan created") editAndQueue();
+			});
+			const deps = createDeps({
+				localFs: () => localFs, remoteFs: () => remoteFs, getSettings: () => settings,
+				logger: { enabled: () => true, debug: vi.fn(), info, warn: vi.fn(), error: vi.fn(), flush: vi.fn() } as unknown as Logger,
+				saveSettings: async () => {
+					records.push(await orchestrator.state.get("note.md"));
+					if (timing === "after-publication") editAndQueue();
+				},
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			try {
+				await orchestrator.runSync();
+				expect(edited).toBe(true);
+				expect(records).toHaveLength(2);
+				expect(records[0]).toMatchObject({ hash: originalHash });
+				expect(records[1]).toMatchObject({ hash: modifiedHash });
+				expect(readText(localFs, "note.md")).toBe("modified");
+				expect(readText(remoteFs, "note.md")).toBe("modified");
+				expect(deps.localTracker.getDirtyPaths().size).toBe(0);
+				expect(deps.onStatusChange).not.toHaveBeenCalledWith("partial_error");
+				expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			} finally {
+				await orchestrator.close();
+			}
+		},
+	);
+
+	it("retains an edit made during push and converges it through the next HOT push", async () => {
+		const localFs = createMockLocalFs();
+		const remoteFs = createMockRemoteFs("actual_resolved");
+		addFile(localFs, "note.md", "original", 1000);
+		addFile(remoteFs, "note.md", "original", 1000).identityKey = "R";
+		const settings = baseMockSettings({
+			backendType: "test", vaultId: `test-${Math.random()}`, enableThreeWayMerge: true,
+		});
+		const recordConflicts = vi.fn().mockResolvedValue(undefined);
+		const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+		const detectedTemperatures: unknown[] = [];
+		const dirtyAtDetection: boolean[] = [];
+		const info = vi.fn((message: string, context?: Record<string, unknown>) => {
+			if (message !== "Change detection completed") return;
+			detectedTemperatures.push(context?.temperature);
+			dirtyAtDetection.push(deps.localTracker.getDirtyPaths().has("note.md"));
+		});
+		remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+		const deps = createDeps({
+			getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+			recordConflicts,
+			logger: { enabled: () => true, debug: vi.fn(), info, warn: vi.fn(), error: vi.fn(), flush: vi.fn() } as unknown as Logger,
+		});
+		const orchestrator = new SyncOrchestrator(deps);
+		try {
+			await orchestrator.runSync();
+			commitCheckpoint.mockClear();
+			recordConflicts.mockClear();
+			detectedTemperatures.length = 0;
+			dirtyAtDetection.length = 0;
+			await localFs.write("note.md", new TextEncoder().encode("first local").buffer, 2000);
+			deps.localTracker.markDirty("note.md");
+
+			const write = remoteFs.write.bind(remoteFs);
+			let injected = false;
+			const remoteWrite = vi.spyOn(remoteFs, "write").mockImplementation(async (path, bytes, mtime) => {
+				const result = await write(path, bytes, mtime);
+				if (!injected) {
+					injected = true;
+					await localFs.write(path, new TextEncoder().encode("latest local").buffer, 3000);
+					deps.localTracker.markDirty(path);
+					void orchestrator.runSync();
+				}
+				return result;
+			});
+
+			await orchestrator.runSync();
+
+			expect(remoteWrite).toHaveBeenCalledTimes(2);
+			expect(detectedTemperatures).toEqual(["hot", "hot"]);
+			expect(dirtyAtDetection).toEqual([true, true]);
+			expect(readText(localFs, "note.md")).toBe("latest local");
+			expect(readText(remoteFs, "note.md")).toBe("latest local");
+			expect(recordConflicts).not.toHaveBeenCalled();
+			expect(commitCheckpoint).toHaveBeenCalledTimes(2);
+			expect(deps.localTracker.getDirtyPaths().size).toBe(0);
+			expect(deps.onStatusChange).not.toHaveBeenCalledWith("partial_error");
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+
+			await orchestrator.runSync();
+			expect(remoteWrite).toHaveBeenCalledTimes(2);
+			expect(recordConflicts).not.toHaveBeenCalled();
+		} finally {
+			await orchestrator.close();
+		}
+	});
+
+	it("aborts the checkpoint when a remote identity is replaced after push bytes arrive", async () => {
+		const localFs = createMockLocalFs();
+		const remoteFs = createMockRemoteFs("actual_resolved");
+		addFile(localFs, "note.md", "original", 1000);
+		addFile(remoteFs, "note.md", "original", 1000).identityKey = "R";
+		const settings = baseMockSettings({
+			backendType: "test", vaultId: `test-${Math.random()}`, enableThreeWayMerge: true,
+		});
+		const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+		const abortWorkingView = vi.fn().mockResolvedValue(undefined);
+		remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+		remoteFs.checkpoint!.abortWorkingView = abortWorkingView;
+		const deps = createDeps({
+			getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+		});
+		const orchestrator = new SyncOrchestrator(deps);
+		try {
+			await orchestrator.runSync();
+			const baseline = await orchestrator.state.get("note.md");
+			commitCheckpoint.mockClear();
+			abortWorkingView.mockClear();
+			await localFs.write("note.md", new TextEncoder().encode("changed!").buffer, 2000);
+			deps.localTracker.markDirty("note.md");
+			const write = remoteFs.write.bind(remoteFs);
+			vi.spyOn(remoteFs, "write").mockImplementation(async (path, bytes, mtime) => {
+				const result = await write(path, bytes, mtime);
+				remoteFs.files.get(path)!.entity.identityKey = "replacement";
+				return result;
+			});
+
+			await orchestrator.runSync();
+
+			expect(await orchestrator.state.get("note.md")).toEqual(baseline);
+			expect(commitCheckpoint).not.toHaveBeenCalled();
+			expect(abortWorkingView).toHaveBeenCalledOnce();
+			expect(deps.localTracker.getDirtyPaths()).toContain("note.md");
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("partial_error");
+		} finally {
+			await orchestrator.close();
+		}
+	});
+
+	describe("cold hash-match diagnostics", () => {
+		it("reports checksum enrichment candidates and successful fast matches", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			const content = new TextEncoder().encode("same").buffer;
+			addFile(localFs, "same.md", "same");
+			const remote = addFile(remoteFs, "same.md", "same");
+			remote.remoteChecksum = { algo: "sha256", value: await sha256(content) };
+			const info = vi.fn();
+			const settings = baseMockSettings({
+				backendType: "test",
+				vaultId: `test-${Math.random()}`,
+				showSyncNotifications: true,
+			});
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				logger: { enabled: () => true, debug: vi.fn(), info, warn: vi.fn(), error: vi.fn(), flush: vi.fn() } as unknown as Logger,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+
+			await orchestrator.runSync();
+
+			expect(info).toHaveBeenCalledWith("Change detection completed", expect.objectContaining({
+				temperature: "cold",
+				hashEnrichmentCandidates: 1,
+				hashEnrichmentMatches: 1,
+			}));
+			expect(deps.notify).toHaveBeenCalledWith("Sync: 1 matched");
+			await orchestrator.close();
+		});
+	});
+
+	describe("plan admission and stateless rename recovery", () => {
+		it("pushes a never-synchronized local rename", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs("actual_resolved");
+			const tracker = new LocalChangeTracker();
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`, lastSyncedIdentity: "test:root",
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			await localFs.write("final.md", new TextEncoder().encode("new").buffer, 1000);
+			tracker.markRenamed("final.md", "draft.md");
+			const info = vi.fn();
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+				logger: { enabled: () => true, debug: vi.fn(), info, warn: vi.fn(), error: vi.fn(), flush: vi.fn() } as unknown as Logger,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+
+			await orchestrator.runSync();
+
+			expect(readText(remoteFs, "final.md")).toBe("new");
+			expect(tracker.getRenamePairs()).toEqual(new Map());
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			expect(info).toHaveBeenCalledWith("Sync plan created", expect.objectContaining({
+				freshLocalRenameCandidates: 1,
+			}));
+			await orchestrator.close();
+		});
+
+		it("abandons an unconfirmed folder relation and converges from current paths", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			const tracker = new LocalChangeTracker();
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+				lastSyncedIdentity: "test:root",
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			const localDelete = vi.spyOn(localFs, "delete");
+			const remoteDelete = vi.spyOn(remoteFs, "delete");
+			const remoteRename = vi.spyOn(remoteFs, "rename");
+
+			await localFs.write("Drafts/nested/note.md", new TextEncoder().encode("kept").buffer, 1000);
+			await orchestrator.runSync();
+			expect((await remoteFs.stat("Drafts"))?.pathAuthority).toBe("requested_echo");
+			expect((await remoteFs.stat("Drafts/nested/note.md"))?.pathAuthority).toBe("requested_echo");
+
+			await localFs.rename("Drafts", "Published");
+			tracker.markFolderRenamed("Published", "Drafts");
+			await orchestrator.runSync();
+
+			expect(remoteRename).not.toHaveBeenCalled();
+			expect(localDelete).not.toHaveBeenCalled();
+			expect(remoteDelete).not.toHaveBeenCalled();
+			expect(remoteFs.files.has("Drafts/nested/note.md")).toBe(true);
+			expect(tracker.getFolderRenamePairs()).toEqual(new Map());
+
+			confirmMockPath(remoteFs, "Drafts");
+			await orchestrator.runSync();
+
+			expect(remoteRename).not.toHaveBeenCalled();
+			expect(remoteFs.files.has("Published/nested/note.md")).toBe(true);
+			expect(remoteFs.files.has("Drafts/nested/note.md")).toBe(true);
+			expect(localDelete).not.toHaveBeenCalled();
+			expect(remoteDelete).not.toHaveBeenCalled();
+			expect(tracker.getRenamePairs()).toEqual(new Map());
+			expect(tracker.getFolderRenamePairs()).toEqual(new Map());
+			await orchestrator.close();
+		});
+
+		it("converges a local folder rename with a newly added descendant", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const warn = vi.fn();
+			const tracker = new LocalChangeTracker();
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+				lastSyncedIdentity: "test:root", ignorePatterns: ["*.tmp"],
+			});
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+				logger: { enabled: () => true, debug: vi.fn(), info: vi.fn(), warn, error: vi.fn(), flush: vi.fn() } as unknown as Logger,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await localFs.write("A/known.md", new TextEncoder().encode("kept").buffer, 1000);
+			await orchestrator.runSync();
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			confirmMockPath(remoteFs, "A");
+			const remoteWrite = vi.spyOn(remoteFs, "write");
+			const remoteDelete = vi.spyOn(remoteFs, "delete");
+			const remoteRename = vi.spyOn(remoteFs, "rename");
+
+			await localFs.rename("A", "B");
+			await localFs.write("B/added.md", new TextEncoder().encode("new").buffer, 2000);
+			await localFs.write("B/ignored.tmp", new TextEncoder().encode("private").buffer, 2000);
+			tracker.markFolderRenamed("B", "A");
+			tracker.markDirty("B/added.md");
+			tracker.markDirty("B/ignored.tmp");
+			await orchestrator.runSync();
+
+			expect(warn).not.toHaveBeenCalled();
+			expect(readText(remoteFs, "B/known.md")).toBe("kept");
+			expect(readText(remoteFs, "B/added.md")).toBe("new");
+			expect(remoteFs.files.has("A/known.md")).toBe(false);
+			expect(remoteFs.files.has("B/ignored.tmp")).toBe(false);
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			expect(tracker.getFolderRenamePairs().size).toBe(0);
+			const writesAfterConvergence = remoteWrite.mock.calls.length;
+			const deletesAfterConvergence = remoteDelete.mock.calls.length;
+			const renamesAfterConvergence = remoteRename.mock.calls.length;
+			const localWrite = vi.spyOn(localFs, "write");
+			const localDelete = vi.spyOn(localFs, "delete");
+			const localRename = vi.spyOn(localFs, "rename");
+
+			await orchestrator.runSync();
+
+			expect(remoteWrite).toHaveBeenCalledTimes(writesAfterConvergence);
+			expect(remoteDelete).toHaveBeenCalledTimes(deletesAfterConvergence);
+			expect(remoteRename).toHaveBeenCalledTimes(renamesAfterConvergence);
+			expect(localWrite).not.toHaveBeenCalled();
+			expect(localDelete).not.toHaveBeenCalled();
+			expect(localRename).not.toHaveBeenCalled();
+			await orchestrator.close();
+		});
+
+		it("consumes a fully excluded folder rename after a clean cycle", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			const tracker = new LocalChangeTracker();
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+				lastSyncedIdentity: "test:root", ignorePatterns: ["private/**"],
+			});
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await localFs.write("private/A/secret.md", new TextEncoder().encode("private").buffer, 1000);
+			await orchestrator.runSync();
+
+			await localFs.rename("private/A", "private/B");
+			tracker.markFolderRenamed("private/B", "private/A");
+			await orchestrator.runSync();
+
+			expect(remoteFs.files.has("private/A/secret.md")).toBe(false);
+			expect(remoteFs.files.has("private/B/secret.md")).toBe(false);
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			expect(tracker.getFolderRenamePairs().size).toBe(0);
+			await orchestrator.close();
+		});
+
+		it.each([false, true])("converges folder rename and remote edits with local content changed=%s", async (localChanged) => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const tracker = new LocalChangeTracker();
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+				lastSyncedIdentity: "test:root", conflictStrategy: "duplicate",
+			});
+			const recordConflicts = vi.fn().mockResolvedValue(undefined);
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker, recordConflicts,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await localFs.write("A/known.md", new TextEncoder().encode("baseline").buffer, 1000);
+			await orchestrator.runSync();
+			confirmMockPath(remoteFs, "A");
+
+			await remoteFs.write("A/known.md", new TextEncoder().encode("remote changed").buffer, 3000);
+			confirmMockPath(remoteFs, "A");
+			await localFs.rename("A", "B");
+			if (localChanged) await localFs.write("B/known.md", new TextEncoder().encode("local changed").buffer, 4000);
+			await localFs.write("B/added.md", new TextEncoder().encode("new").buffer, 2000);
+			tracker.markFolderRenamed("B", "A");
+			tracker.markDirty("B/added.md");
+			await orchestrator.runSync();
+
+			expect(remoteFs.files.has("A/known.md")).toBe(false);
+			expect(readText(remoteFs, "B/known.md")).toBe(localChanged ? "local changed" : "remote changed");
+			expect(readText(localFs, "B/known.md")).toBe(localChanged ? "local changed" : "remote changed");
+			expect(readText(remoteFs, "B/added.md")).toBe("new");
+			expect(recordConflicts).toHaveBeenCalledTimes(localChanged ? 1 : 0);
+			if (localChanged) {
+				for (const fs of [localFs, remoteFs]) {
+					const copies = [...fs.files.keys()].filter((path) => path.includes(".conflict"));
+					expect(copies.map((path) => readText(fs, path))).toContain("remote changed");
+				}
+			}
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("replans an ordinary retry after a partial folder-rename effect failure", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const tracker = new LocalChangeTracker();
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+				lastSyncedIdentity: "test:root",
+			});
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await localFs.write("A/known.md", new TextEncoder().encode("kept").buffer, 1000);
+			await orchestrator.runSync();
+			confirmMockPath(remoteFs, "A");
+			commitCheckpoint.mockClear();
+
+			await localFs.rename("A", "B");
+			await localFs.write("B/added.md", new TextEncoder().encode("new").buffer, 2000);
+			tracker.markFolderRenamed("B", "A");
+			tracker.markDirty("B/added.md");
+			const failedRename = vi.spyOn(remoteFs, "rename").mockRejectedValue(new Error("rename failed"));
+			await orchestrator.runSync();
+
+			expect(failedRename).toHaveBeenCalledWith("A", "B");
+			expect(readText(remoteFs, "A/known.md")).toBe("kept");
+			expect(readText(remoteFs, "A/added.md")).toBe("new");
+			expect(remoteFs.files.has("B/known.md")).toBe(false);
+			expect(readText(localFs, "B/known.md")).toBe("kept");
+			expect(readText(localFs, "B/added.md")).toBe("new");
+			expect(commitCheckpoint).not.toHaveBeenCalled();
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("partial_error");
+			// A failed attempt must not turn cycle-local rename evidence into retry
+			// state. The next cycle re-observes current endpoints from the unchanged
+			// durable checkpoint and plans ordinary convergence from those facts.
+			expect(tracker.getFolderRenamePairs().size).toBe(0);
+
+			failedRename.mockRestore();
+			confirmMockPath(remoteFs, "B");
+			await orchestrator.runSync();
+
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			expect(remoteFs.files.has("A/known.md")).toBe(false);
+			expect(readText(remoteFs, "B/known.md")).toBe("kept");
+			expect(readText(remoteFs, "B/added.md")).toBe("new");
+			expect(commitCheckpoint).toHaveBeenCalledTimes(1);
+			expect(tracker.getFolderRenamePairs().size).toBe(0);
+			await orchestrator.close();
+		});
+
+		it("re-observes an abandoned folder relation when only unrelated work also failed the cycle", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const tracker = new LocalChangeTracker();
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+				lastSyncedIdentity: "test:root",
+			});
+			const info = vi.fn();
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+				logger: { enabled: () => true, debug: vi.fn(), info, warn: vi.fn(), error: vi.fn(), flush: vi.fn() } as unknown as Logger,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await localFs.write("A/known.md", new TextEncoder().encode("kept").buffer, 1000);
+			await localFs.write("unrelated.md", new TextEncoder().encode("old!").buffer, 1000);
+			await orchestrator.runSync();
+			confirmMockPath(remoteFs, "A");
+
+			await localFs.rename("A", "B");
+			await localFs.write("unrelated.md", new TextEncoder().encode("new!").buffer, 2000);
+			tracker.markFolderRenamed("B", "A");
+			tracker.markDirty("unrelated.md");
+			const failedRename = vi.spyOn(remoteFs, "rename").mockRejectedValue(new Error("rename failed"));
+			await orchestrator.runSync();
+
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("partial_error");
+			expect(tracker.getFolderRenamePairs()).toEqual(new Map());
+			expect(tracker.getDirtyPaths().has("A")).toBe(true);
+			expect(tracker.getDirtyPaths().has("B")).toBe(true);
+			failedRename.mockRestore();
+
+			await orchestrator.runSync();
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			expect(readText(remoteFs, "B/known.md")).toBe("kept");
+			expect(readText(remoteFs, "unrelated.md")).toBe("new!");
+			await orchestrator.close();
+		});
+
+		// This input used to be abandoned as `remote_identity_missing`, but only because
+		// a baseline carrying no identity could be bound to a remote address
+		// positionally. The record layer's identity floor removes that input class and
+		// the arm with it, so the record and the remote object at "A.md" are now one
+		// identity and the tracker's case-only rename is provable from current facts:
+		// the diverged sides converge in a single cycle through the ordinary conflict
+		// route. `remote_identity_missing` is still pinned where it remains reachable —
+		// see plan-admission.test.ts's local case-alias case.
+		it("converges a diverged case-only local rename from current facts", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			addFile(localFs, "a.md", "changed", 2000);
+			addFile(remoteFs, "A.md", "old", 1000);
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+				lastSyncedIdentity: "test:root", showSyncNotifications: true,
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			const abortWorkingView = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.abortWorkingView = abortWorkingView;
+			const remoteWrite = vi.spyOn(remoteFs, "write");
+			const remoteDelete = vi.spyOn(remoteFs, "delete");
+			const warn = vi.fn();
+			const tracker = new LocalChangeTracker();
+			tracker.markRenamed("a.md", "A.md");
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+				logger: { enabled: () => true, debug: vi.fn(), info: vi.fn(), warn, error: vi.fn(), flush: vi.fn() } as unknown as Logger,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "A.md", hash: "different-baseline-hash", localMtime: 1000, remoteMtime: 1000,
+				localSize: 3, remoteSize: 3, remoteIdentityKey: "id:A.md", syncedAt: 900,
+			});
+			await orchestrator.runSync();
+
+			// Both versions survive: the object is renamed to the local spelling and the
+			// losing remote bytes are preserved beside it. Nothing is deleted.
+			expect([...remoteFs.files.keys()].sort()).toEqual(["a.conflict.md", "a.md"]);
+			expect(remoteWrite).toHaveBeenCalled();
+			expect(remoteDelete).not.toHaveBeenCalled();
+			expect(warn).not.toHaveBeenCalled();
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			expect(commitCheckpoint).toHaveBeenCalledOnce();
+			expect(abortWorkingView).not.toHaveBeenCalled();
+			expect(tracker.getRenamePairs()).toEqual(new Map());
+			await orchestrator.close();
+		});
+
+
+		it("executes a remote case-only rename when local destination stat aliases the source", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(localFs, "C.md", "same", 1000);
+			// One remote object: the record was committed at "C.md" and the provider
+			// then renamed it to "c.md" without changing its identity.
+			addFile(remoteFs, "c.md", "same", 1000).identityKey = "remote-c";
+			confirmMockPath(remoteFs, "c.md");
+			const settings = baseMockSettings({ backendType: "test", vaultId: `test-${Math.random()}` });
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			remoteFs.checkpoint!.getChangedPaths = vi.fn().mockResolvedValue({
+				modified: ["c.md"], deleted: ["C.md"],
+				renamed: [{ oldPath: "C.md", newPath: "c.md" }],
+			});
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			const exactLocalStat = localFs.stat.bind(localFs);
+			vi.spyOn(localFs, "stat").mockImplementation(async (path) => {
+				const exact = await exactLocalStat(path);
+				if (exact || path !== "c.md") return exact;
+				return exactLocalStat("C.md");
+			});
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "C.md", hash: "baseline", localMtime: 1000, remoteMtime: 1000,
+				localSize: 4, remoteSize: 4, remoteIdentityKey: "remote-c", syncedAt: 900,
+			});
+			const localRename = vi.spyOn(localFs, "rename");
+			const localDelete = vi.spyOn(localFs, "delete");
+			const remoteDelete = vi.spyOn(remoteFs, "delete");
+
+			await orchestrator.runSync();
+
+			expect(localRename).toHaveBeenCalledWith("C.md", "c.md");
+			expect(localDelete).not.toHaveBeenCalled();
+			expect(remoteDelete).not.toHaveBeenCalled();
+			expect(commitCheckpoint).toHaveBeenCalledTimes(1);
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("reports an actionless unresolved rename and withholds the checkpoint", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(localFs, "a.md", "same", 1000);
+			addFile(remoteFs, "a.md", "same", 1000);
+			confirmMockPath(localFs, "a.md");
+			confirmMockPath(remoteFs, "a.md");
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`, showSyncNotifications: true,
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			remoteFs.checkpoint!.getChangedPaths = vi.fn().mockResolvedValue({
+				modified: ["a.md"], deleted: ["A.md"],
+				renamed: [{ oldPath: "A.md", newPath: "a.md" }],
+			});
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			const originalRemoteStat = remoteFs.stat.bind(remoteFs);
+			vi.spyOn(remoteFs, "stat").mockImplementation(async (path) => {
+				const found = await originalRemoteStat(path === "A.md" ? "a.md" : path);
+				return path === "A.md" && found
+					? { ...found, pathAuthority: "requested_echo" }
+					: found;
+			});
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			const content = new TextEncoder().encode("same").buffer;
+			await orchestrator.state.put({
+				path: "a.md", hash: await sha256(content), localMtime: 1000, remoteMtime: 1000,
+				localSize: 4, remoteSize: 4, remoteIdentityKey: "id:a.md", syncedAt: 900,
+			});
+			const localWrite = vi.spyOn(localFs, "write");
+			const remoteWrite = vi.spyOn(remoteFs, "write");
+			const localDelete = vi.spyOn(localFs, "delete");
+			const remoteDelete = vi.spyOn(remoteFs, "delete");
+
+			await orchestrator.runSync();
+
+			expect(localWrite).not.toHaveBeenCalled();
+			expect(remoteWrite).not.toHaveBeenCalled();
+			expect(localDelete).not.toHaveBeenCalled();
+			expect(remoteDelete).not.toHaveBeenCalled();
+			expect(commitCheckpoint).not.toHaveBeenCalled();
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("partial_error");
+			expect(deps.notify).toHaveBeenCalledWith("Sync: 1 error — Admission failed (unclassified)");
+			await orchestrator.close();
+		});
+
+
+
+		it("converges a synchronized local rename plus edit and reaches a fixed point", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const tracker = new LocalChangeTracker();
+			addFile(localFs, "new.md", "local edited", 2000);
+			const remote = addFile(remoteFs, "old.md", "baseline", 1000);
+			remote.identityKey = "R";
+			tracker.markRenamed("new.md", "old.md");
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`, lastSyncedIdentity: "test:root",
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			const remoteRename = vi.spyOn(remoteFs, "rename");
+			const remoteWrite = vi.spyOn(remoteFs, "write");
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			const baselineBytes = new TextEncoder().encode("baseline").buffer;
+			await orchestrator.state.put({
+				path: "old.md", hash: await sha256(baselineBytes), localMtime: 1000, remoteMtime: 1000,
+				localSize: 8, remoteSize: 8, remoteIdentityKey: "R", syncedAt: 900,
+			});
+
+			await orchestrator.runSync();
+
+			expect(remoteFs.files.has("old.md")).toBe(false);
+			expect(readText(remoteFs, "new.md")).toBe("local edited");
+			expect([...localFs.files.keys()].some((path) => path.includes(".conflict"))).toBe(false);
+			expect([...remoteFs.files.keys()].some((path) => path.includes(".conflict"))).toBe(false);
+			expect(await orchestrator.state.get("old.md")).toBeUndefined();
+			expect(await orchestrator.state.get("new.md")).toBeDefined();
+			expect(commitCheckpoint).toHaveBeenCalledTimes(1);
+			expect(tracker.getRenamePairs()).toEqual(new Map());
+			const renameCallsAfterConvergence = remoteRename.mock.calls.length;
+			const writeCallsAfterConvergence = remoteWrite.mock.calls.length;
+
+			await orchestrator.runSync();
+
+			expect(remoteRename).toHaveBeenCalledTimes(renameCallsAfterConvergence);
+			expect(remoteWrite).toHaveBeenCalledTimes(writeCallsAfterConvergence);
+			expect(commitCheckpoint).toHaveBeenCalledTimes(2);
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("replans a case-only rename plus edit from committed state after restart", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			addFile(localFs, "case.md", "local edited", 2000);
+			confirmMockPath(localFs, "case.md");
+			const remote = addFile(remoteFs, "Case.md", "baseline", 1000);
+			remote.identityKey = "R";
+			confirmMockPath(remoteFs, "Case.md");
+			const exactLocalStat = localFs.stat.bind(localFs);
+			localFs.stat = async (path) => path === "Case.md"
+				? { ...(await exactLocalStat("case.md"))!, path: "case.md", pathAuthority: "actual_resolved" }
+				: exactLocalStat(path);
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`, lastSyncedIdentity: "test:root",
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			const renameRemote = vi.spyOn(remoteFs, "rename");
+			const firstDeps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+			});
+			const first = new SyncOrchestrator(firstDeps);
+			const baselineBytes = new TextEncoder().encode("baseline").buffer;
+			await first.state.put({
+				path: "Case.md", hash: await sha256(baselineBytes), localMtime: 1000, remoteMtime: 1000,
+				localSize: 8, remoteSize: 8, remoteIdentityKey: "R", syncedAt: 900,
+			});
+
+			expect(await first.state.get("Case.md")).toBeDefined();
+			await first.close();
+
+			const restartedDeps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: new LocalChangeTracker(),
+			});
+			const restarted = new SyncOrchestrator(restartedDeps);
+			await restarted.runSync();
+
+			expect(renameRemote).toHaveBeenCalledOnce();
+			expect(remoteFs.files.has("Case.md")).toBe(false);
+			expect(readText(remoteFs, "case.md")).toBe("local edited");
+			expect(await restarted.state.get("Case.md")).toBeUndefined();
+			expect(await restarted.state.get("case.md")).toBeDefined();
+			expect(commitCheckpoint).toHaveBeenCalledOnce();
+			expect(restartedDeps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			await restarted.close();
+		});
+
+		it("converges an unbaselined case-only alias from current facts", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(localFs, "case.md", "same", 1000);
+			confirmMockPath(localFs, "case.md");
+			const remote = addFile(remoteFs, "Case.md", "same", 1000);
+			remote.identityKey = "R";
+			confirmMockPath(remoteFs, "Case.md");
+			const exactLocalStat = localFs.stat.bind(localFs);
+			localFs.stat = async (path) => path === "Case.md"
+				? { ...(await exactLocalStat("case.md"))!, path: "case.md", pathAuthority: "actual_resolved" }
+				: exactLocalStat(path);
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`, lastSyncedIdentity: "test:root",
+			});
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: new LocalChangeTracker(),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			const renameRemote = vi.spyOn(remoteFs, "rename");
+			const writeRemote = vi.spyOn(remoteFs, "write");
+
+			await orchestrator.runSync();
+
+			expect(renameRemote).toHaveBeenCalledWith("Case.md", "case.md");
+			expect(writeRemote).not.toHaveBeenCalled();
+			expect(remoteFs.files.has("Case.md")).toBe(false);
+			expect(remoteFs.files.has("case.md")).toBe(true);
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("admits the complete mixed-child case-only folder component from a cold scan", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const localChanged = addFile(localFs, "TemplateS/changed.md", "local edit", 2000);
+			const localPush = addFile(localFs, "TemplateS/push.md", "local edit", 2000);
+			const localSame = addFile(localFs, "TemplateS/same.md", "same", 1000);
+			const remoteChanged = addFile(remoteFs, "Templates/changed.md", "remote edit", 2000);
+			const remotePush = addFile(remoteFs, "Templates/push.md", "base", 1000);
+			const remoteSame = addFile(remoteFs, "Templates/same.md", "same", 1000);
+			remoteChanged.identityKey = "changed-R";
+			remotePush.identityKey = "push-R";
+			remoteSame.identityKey = "same-R";
+			confirmMockPath(localFs, "TemplateS");
+			confirmMockPath(remoteFs, "Templates");
+
+			const exactLocalStat = localFs.stat.bind(localFs);
+			const exactLocalWrite = localFs.write.bind(localFs);
+			const exactLocalRead = localFs.read.bind(localFs);
+			const exactRemoteWrite = remoteFs.write.bind(remoteFs);
+			const localPhysicalPath = (path: string) => path === "Templates"
+				? "TemplateS"
+				: path.startsWith("Templates/")
+					? `TemplateS/${path.slice("Templates/".length)}`
+					: path;
+			localFs.stat = async (path) => {
+				const exact = await exactLocalStat(path);
+				if (exact) return exact;
+				return exactLocalStat(localPhysicalPath(path));
+			};
+			localFs.write = (path, content, mtime) =>
+				exactLocalWrite(localPhysicalPath(path), content, mtime);
+			localFs.read = (path) => exactLocalRead(localPhysicalPath(path));
+			remoteFs.write = (path, content, mtime) => {
+				const providerPath = path.startsWith("TemplateS/")
+					? `Templates/${path.slice("TemplateS/".length)}`
+					: path;
+				return exactRemoteWrite(providerPath, content, mtime);
+			};
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+				lastSyncedIdentity: "test:root", conflictStrategy: "duplicate",
+			});
+			const info = vi.fn();
+			const warn = vi.fn();
+			const error = vi.fn();
+			const tracker = new LocalChangeTracker();
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+				logger: {
+					enabled: () => true, debug: vi.fn(), info, warn, error, flush: vi.fn(),
+				} as unknown as Logger,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			const baseChanged = new TextEncoder().encode("base").buffer;
+			const baseSame = new TextEncoder().encode("same").buffer;
+			await orchestrator.state.put({
+				path: "Templates/changed.md", hash: await sha256(baseChanged),
+				localMtime: 1000, remoteMtime: 1000, localSize: 4, remoteSize: 4,
+				remoteIdentityKey: "changed-R", syncedAt: 900,
+			});
+			await orchestrator.state.put({
+				path: "Templates/same.md", hash: await sha256(baseSame),
+				localMtime: localSame.mtime, remoteMtime: remoteSame.mtime,
+				localSize: localSame.size, remoteSize: remoteSame.size,
+				remoteIdentityKey: "same-R", syncedAt: 900,
+			});
+			await orchestrator.state.put({
+				path: "Templates/push.md", hash: await sha256(baseChanged),
+				localMtime: 1000, remoteMtime: remotePush.mtime,
+				localSize: 4, remoteSize: remotePush.size,
+				remoteIdentityKey: "push-R", syncedAt: 900,
+			});
+			const renameRemote = vi.spyOn(remoteFs, "rename");
+			const changes = await collectChanges({
+				localFs, remoteFs, stateStore: orchestrator.state, checksumRegistry,
+				changes: tracker.snapshot(),
+			}, { forceFullScan: true });
+			const planning = prepareSyncCycleSnapshot(changes, "test:root", {
+				ignorePatterns: [],
+			});
+			const admission = admitBatchObservation(planning.snapshot);
+			expect(admission.snapshot.observations).toContainEqual(expect.objectContaining({
+				kind: "alias", side: "local",
+				requestedPath: "Templates", resolvedPath: "TemplateS",
+			}));
+			expect(admission.failures).toEqual([]);
+
+			await orchestrator.runSync();
+
+			const planLog = info.mock.calls.find(([message]) => message === "Sync plan created");
+			expect(planLog?.[1]).toMatchObject({ push: 1, conflict: 1, rename_remote: 1 });
+			expect(error.mock.calls).toEqual([]);
+			expect(warn.mock.calls).toEqual([]);
+			expect(renameRemote.mock.calls).toEqual([["Templates", "TemplateS"]]);
+			expect(localChanged.path).toBe("TemplateS/changed.md");
+			expect(localPush.path).toBe("TemplateS/push.md");
+			expect(readText(remoteFs, "TemplateS/push.md")).toBe("local edit");
+			expect(await orchestrator.state.get("Templates/push.md")).toBeUndefined();
+			expect(await orchestrator.state.get("TemplateS/push.md")).toBeDefined();
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("preserves third-path R and destination Y once through runSync", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const tracker = new LocalChangeTracker();
+			addFile(localFs, "new.md", "local edited", 2000);
+			const primary = addFile(remoteFs, "third.md", "remote R changed", 1500);
+			primary.identityKey = "R";
+			const additional = addFile(remoteFs, "new.md", "foreign Y", 1400);
+			additional.identityKey = "Y";
+			tracker.markRenamed("new.md", "old.md");
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`, lastSyncedIdentity: "test:root",
+				conflictStrategy: "duplicate",
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			remoteFs.checkpoint!.getChangedPaths = vi.fn().mockResolvedValue({
+				modified: ["third.md", "new.md"], deleted: ["old.md"],
+				renamed: [{ oldPath: "old.md", newPath: "third.md" }],
+			});
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "old.md", hash: "baseline", localMtime: 1000, remoteMtime: 1000,
+				localSize: 8, remoteSize: 8, remoteIdentityKey: "R", syncedAt: 900,
+			});
+
+			await orchestrator.runSync();
+
+			expect(readText(localFs, "new.conflict.md")).toBe("remote R changed");
+			expect(readText(remoteFs, "new.conflict.md")).toBe("remote R changed");
+			expect(readText(localFs, "new.conflict-2.md")).toBe("foreign Y");
+			expect(readText(remoteFs, "new.conflict-2.md")).toBe("foreign Y");
+			expect(localFs.files.has("new.conflict-3.md")).toBe(false);
+			expect(remoteFs.files.has("new.conflict-3.md")).toBe(false);
+			expect(localFs.files.has("new.conflict-4.md")).toBe(false);
+			expect(remoteFs.files.has("new.conflict-4.md")).toBe(false);
+			expect(readText(remoteFs, "new.md")).toBe("local edited");
+			expect(remoteFs.files.has("third.md")).toBe(false);
+			expect(commitCheckpoint).toHaveBeenCalledTimes(1);
+			await orchestrator.close();
+		});
+
+		it("auto-merges third-path R while preserving exact R and Y through runSync", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const tracker = new LocalChangeTracker();
+			const base = "one\ntwo\nthree\nfour\nfive\n";
+			const localText = "one\nlocal\nthree\nfour\nfive\n";
+			const remoteText = "one\ntwo\nthree\nfour\nremote\n";
+			addFile(localFs, "new.md", localText, 2000);
+			const primary = addFile(remoteFs, "third.md", remoteText, 1500);
+			primary.identityKey = "R";
+			const additional = addFile(remoteFs, "new.md", "foreign Y", 1400);
+			additional.identityKey = "Y";
+			tracker.markRenamed("new.md", "old.md");
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`, lastSyncedIdentity: "test:root",
+				conflictStrategy: "auto_merge",
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			remoteFs.checkpoint!.getChangedPaths = vi.fn().mockResolvedValue({
+				modified: ["third.md", "new.md"], deleted: ["old.md"],
+				renamed: [{ oldPath: "old.md", newPath: "third.md" }],
+			});
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			const baseBytes = new TextEncoder().encode(base).buffer;
+			await orchestrator.state.put({
+				path: "old.md", hash: await sha256(baseBytes), localMtime: 1000, remoteMtime: 1000,
+				localSize: base.length, remoteSize: base.length,
+				remoteIdentityKey: "R", syncedAt: 900,
+			});
+			await orchestrator.state.putContent("R", baseBytes);
+
+			await orchestrator.runSync();
+
+			expect(readText(localFs, "new.conflict.md")).toBe(remoteText);
+			expect(readText(remoteFs, "new.conflict.md")).toBe(remoteText);
+			expect(readText(localFs, "new.conflict-2.md")).toBe("foreign Y");
+			expect(readText(remoteFs, "new.conflict-2.md")).toBe("foreign Y");
+			expect(localFs.files.has("new.conflict-3.md")).toBe(false);
+			expect(remoteFs.files.has("new.conflict-3.md")).toBe(false);
+			expect(localFs.files.has("new.conflict-4.md")).toBe(false);
+			expect(remoteFs.files.has("new.conflict-4.md")).toBe(false);
+			expect(readText(localFs, "new.md")).toContain("local");
+			expect(readText(localFs, "new.md")).toContain("remote");
+			expect(readText(remoteFs, "new.md")).toBe(readText(localFs, "new.md"));
+			expect(remoteFs.files.has("third.md")).toBe(false);
+			expect(commitCheckpoint).toHaveBeenCalledTimes(1);
+			await orchestrator.close();
+		});
+
+		it("preserves foreign Y when tracked R is absent and converges through runSync", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const tracker = new LocalChangeTracker();
+			addFile(localFs, "new.md", "local edited", 2000);
+			const foreign = addFile(remoteFs, "new.md", "foreign Y", 1400);
+			foreign.identityKey = "Y";
+			tracker.markRenamed("new.md", "old.md");
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`, lastSyncedIdentity: "test:root",
+				conflictStrategy: "duplicate",
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			remoteFs.checkpoint!.getChangedPaths = vi.fn().mockResolvedValue({
+				modified: ["new.md"], deleted: ["old.md"], renamed: [],
+			});
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "old.md", hash: "baseline", localMtime: 1000, remoteMtime: 1000,
+				localSize: 8, remoteSize: 8, remoteIdentityKey: "R", syncedAt: 900,
+			});
+
+			await orchestrator.runSync();
+
+			expect(readText(localFs, "new.conflict.md")).toBe("foreign Y");
+			expect(readText(remoteFs, "new.conflict.md")).toBe("foreign Y");
+			expect(readText(remoteFs, "new.md")).toBe("local edited");
+			expect(await orchestrator.state.get("old.md")).toBeUndefined();
+			expect(await orchestrator.state.get("new.md")).toBeDefined();
+			expect(commitCheckpoint).toHaveBeenCalledTimes(1);
+			await orchestrator.close();
+		});
+
+		it("converges a vacant target when tracked R is absent through runSync", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const tracker = new LocalChangeTracker();
+			addFile(localFs, "new.md", "local edited", 2000);
+			tracker.markRenamed("new.md", "old.md");
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`, lastSyncedIdentity: "test:root",
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			remoteFs.checkpoint!.getChangedPaths = vi.fn().mockResolvedValue({
+				modified: [], deleted: ["old.md"], renamed: [],
+			});
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "old.md", hash: "baseline", localMtime: 1000, remoteMtime: 1000,
+				localSize: 8, remoteSize: 8, remoteIdentityKey: "R", syncedAt: 900,
+			});
+
+			await orchestrator.runSync();
+
+			expect(readText(remoteFs, "new.md")).toBe("local edited");
+			expect(await orchestrator.state.get("old.md")).toBeUndefined();
+			expect(await orchestrator.state.get("new.md")).toBeDefined();
+			expect(commitCheckpoint).toHaveBeenCalledTimes(1);
+			await orchestrator.close();
+		});
+
+		it("withholds checkpoint when fresh terminal proof is blocked", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			const tracker = new LocalChangeTracker();
+			addFile(localFs, "new.md", "local edited", 2000);
+			const remote = addFile(remoteFs, "old.md", "baseline", 1000);
+			remote.identityKey = "R";
+			tracker.markRenamed("new.md", "old.md");
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`, lastSyncedIdentity: "test:root",
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			vi.spyOn(remoteFs, "rename").mockResolvedValue(undefined);
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			const baselineBytes = new TextEncoder().encode("baseline").buffer;
+			const baseline = {
+				path: "old.md", hash: await sha256(baselineBytes), localMtime: 1000, remoteMtime: 1000,
+				localSize: 8, remoteSize: 8, remoteIdentityKey: "R", syncedAt: 900,
+			};
+			await orchestrator.state.put(baseline);
+
+			await orchestrator.runSync();
+
+			expect(commitCheckpoint).not.toHaveBeenCalled();
+			expect(await orchestrator.state.get("old.md")).toEqual(baseline);
+			expect(await orchestrator.state.get("new.md")).toBeUndefined();
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("partial_error");
+			await orchestrator.close();
+		});
+	});
+
+	describe("isSyncing()", () => {
+		it("returns false when not syncing", async () => {
+			const deps = createDeps();
+			const orchestrator = new SyncOrchestrator(deps);
+			expect(orchestrator.isSyncing()).toBe(false);
+			await orchestrator.close();
+		});
+
+		it("returns true while sync is running", async () => {
+			const deps = createDeps();
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			let resolveSync!: () => void;
+			const syncStarted = new Promise<void>((res) => {
+				resolveSync = res;
+			});
+
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+
+			// Intercept list to block sync and capture isSyncing state
+			let isSyncingDuringSync = false;
+			const orchestrator = new SyncOrchestrator(deps);
+			vi.spyOn(localFs, "list").mockImplementationOnce(() => {
+				isSyncingDuringSync = orchestrator.isSyncing();
+				resolveSync();
+				return Promise.resolve([]);
+			});
+
+			const syncPromise = orchestrator.runSync();
+			await syncStarted;
+			expect(isSyncingDuringSync).toBe(true);
+			await syncPromise;
+			await orchestrator.close();
+		});
+	});
+
+	describe("runSync()", () => {
+		it("keeps one conflict strategy throughout a cycle while settings change", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs("actual_resolved");
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: "test-" + Math.random(),
+				lastSyncedIdentity: "test:root", conflictStrategy: "prefer_local",
+				enableThreeWayMerge: false,
+			});
+			addFile(localFs, "note.md", "local", 2000);
+			addFile(remoteFs, "note.md", "remote", 3000).identityKey = "R";
+			const proofStarted = deferred();
+			const releaseProof = deferred();
+			const originalRead = localFs.read.bind(localFs);
+			let delayNextRead = true;
+			vi.spyOn(localFs, "read").mockImplementation(async (path) => {
+				if (delayNextRead && path === "note.md") {
+					delayNextRead = false;
+					proofStarted.resolve();
+					await releaseProof.promise;
+				}
+				return originalRead(path);
+			});
+			const recordConflicts = vi.fn().mockResolvedValue(undefined);
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				recordConflicts,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "note.md", hash: await sha256(new TextEncoder().encode("base").buffer),
+				localMtime: 1000, remoteMtime: 1000, localSize: 4, remoteSize: 4,
+				remoteIdentityKey: "R", syncedAt: 900,
+			});
+
+			const cycle = orchestrator.runSync();
+			await proofStarted.promise;
+			settings.conflictStrategy = "auto_merge";
+			releaseProof.resolve();
+			await cycle;
+
+			expect(readText(localFs, "note.md")).toBe("local");
+			expect(readText(remoteFs, "note.md")).toBe("local");
+			expect(recordConflicts).toHaveBeenCalledWith([
+				expect.objectContaining({ path: "note.md", strategy: "prefer_local", action: "kept_local" }),
+			]);
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("does not notify when remoteFs is not available", async () => {
+			const debugFn = vi.fn();
+			const deps = createDeps({
+				remoteFs: () => null,
+				logger: {
+					enabled: () => true,
+					debug: debugFn,
+					info: vi.fn(),
+					warn: vi.fn(),
+					error: vi.fn(),
+				} as unknown as import("../logging/logger").Logger,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+			expect(deps.notify).not.toHaveBeenCalled();
+			expect(deps.onStatusChange).toHaveBeenCalledWith("not_connected");
+			expect(debugFn).toHaveBeenCalledWith(
+				"runSync: skipped — no remote backend",
+			);
+			await orchestrator.close();
+		});
+
+		it("does not show sync completion notice when logging is disabled", async () => {
+			const deps = createDeps();
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+			expect(deps.notify).not.toHaveBeenCalled();
+			expect(deps.onStatusChange).toHaveBeenCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("shows sync completion notice when logging is enabled", async () => {
+			const settings = { ...mockSettings(), showSyncNotifications: true };
+			const deps = createDeps({ getSettings: () => settings });
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+			expect(deps.notify).toHaveBeenCalledWith("Everything up to date");
+			expect(deps.onStatusChange).toHaveBeenCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("queues a pending sync when called while locked", async () => {
+			const deps = createDeps();
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+
+			let callCount = 0;
+			let unblockFirst!: () => void;
+			const blocker = new Promise<void>((res) => {
+				unblockFirst = res;
+			});
+
+			vi.spyOn(localFs, "list").mockImplementation(async () => {
+				callCount++;
+				if (callCount === 1) await blocker;
+				return [];
+			});
+
+			const orchestrator = new SyncOrchestrator(deps);
+			const first = orchestrator.runSync();
+			// Give the first sync time to enter the mutex and start
+			await new Promise((res) => setTimeout(res, 10));
+			const second = orchestrator.runSync(); // should set syncPending since mutex is held
+			unblockFirst();
+			await first;
+			await second;
+			expect(callCount).toBeGreaterThanOrEqual(2);
+			await orchestrator.close();
+		});
+
+		it("notifies once for a coalesced burst (no duplicate up-to-date notice)", async () => {
+			// A second trigger arriving mid-sync (e.g. mobile resume firing both
+			// focus and visibilitychange) sets syncPending and runs another cycle.
+			// The burst must emit a single notice, not one per cycle.
+			const settings = { ...mockSettings(), showSyncNotifications: true };
+			const deps = createDeps({ getSettings: () => settings });
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+
+			let callCount = 0;
+			let unblockFirst!: () => void;
+			const blocker = new Promise<void>((res) => {
+				unblockFirst = res;
+			});
+			vi.spyOn(localFs, "list").mockImplementation(async () => {
+				callCount++;
+				if (callCount === 1) await blocker;
+				return [];
+			});
+
+			const orchestrator = new SyncOrchestrator(deps);
+			const first = orchestrator.runSync();
+			await new Promise((res) => setTimeout(res, 10));
+			const second = orchestrator.runSync(); // sets syncPending while locked
+			unblockFirst();
+			await first;
+			await second;
+
+			expect(callCount).toBeGreaterThanOrEqual(2);
+			expect(deps.notify).toHaveBeenCalledTimes(1);
+			expect(deps.notify).toHaveBeenCalledWith("Everything up to date");
+			await orchestrator.close();
+		});
+
+		it("sets status to error and notifies on AuthError", async () => {
+			const deps = createDeps();
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+
+			const authErr = new AuthError("Unauthorized", 401);
+			vi.spyOn(localFs, "list").mockRejectedValue(authErr);
+
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+
+			expect(deps.onStatusChange).toHaveBeenCalledWith("error");
+			expect(deps.notify).toHaveBeenCalledWith("Cycle abort failed (401, auth). Please reconnect in settings.");
+			await orchestrator.close();
+		});
+
+		it("retries on transient error and succeeds", async () => {
+			const deps = createDeps();
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+
+			let attempt = 0;
+			vi.spyOn(localFs, "list").mockImplementation(async () => {
+				attempt++;
+				if (attempt === 1) throw new Error("transient");
+				return await Promise.resolve([]);
+			});
+
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+
+			expect(attempt).toBe(2);
+			expect(deps.onStatusChange).toHaveBeenCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("fails after MAX_RETRIES and sets error status", async () => {
+			const deps = createDeps();
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+
+			vi.spyOn(localFs, "list").mockRejectedValue(
+				new Error("network down"),
+			);
+
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+
+			expect(deps.onStatusChange).toHaveBeenCalledWith("error");
+			expect(deps.notify).toHaveBeenCalledWith("Cycle abort failed (unclassified)");
+			await orchestrator.close();
+		});
+
+		it("preserves a plain structural error message through retry exhaustion", async () => {
+			const deps = createDeps();
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+
+			// A module may throw a plain BackendErrorShape object (no Error identity);
+			// the cycle notice must carry the structured clause and never a raw provider
+			// message, so the diagnostic text stays out of the user-facing string.
+			vi.spyOn(localFs, "list").mockRejectedValue(backendError("transient", "network blip"));
+
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+
+			expect(deps.onStatusChange).toHaveBeenCalledWith("error");
+			expect(deps.notify).toHaveBeenCalledWith("Cycle abort failed (unclassified)");
+			expect(JSON.stringify(vi.mocked(deps.notify).mock.calls)).not.toContain("network blip");
+			await orchestrator.close();
+		});
+
+		it("excludes files matching ignore patterns", async () => {
+			const settings = mockSettings();
+			settings.ignorePatterns = ["*.tmp"];
+			const deps = createDeps({ getSettings: () => settings });
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs("actual_resolved");
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+			addFile(localFs, "file.tmp", "ignored");
+			addFile(localFs, "file.md", "included");
+
+			let filteredCount = 0;
+			const origList = localFs.list.bind(localFs);
+			vi.spyOn(localFs, "list").mockImplementation(async () => {
+				const result = await origList();
+				filteredCount = result.filter((f) => !f.isDirectory).length;
+				return result;
+			});
+
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+
+			expect(filteredCount).toBe(2); // both files listed
+			// but file.tmp would be excluded from sync — check notify shows only md synced
+			expect(deps.onStatusChange).toHaveBeenCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("does not pull a remote-only hidden path outside syncDotPaths", async () => {
+			const settings = mockSettings();
+			settings.syncDotPaths = [];
+			const deps = createDeps({ getSettings: () => settings });
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+			// A hidden path present only on the remote (e.g. another device's logs).
+			addFile(remoteFs, ".airsync/logs/d/x.log", "log");
+
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+
+			// Out of scope → never pulled locally, and not deleted from the remote.
+			expect(localFs.files.has(".airsync/logs/d/x.log")).toBe(false);
+			expect(remoteFs.files.has(".airsync/logs/d/x.log")).toBe(true);
+			expect(deps.onStatusChange).toHaveBeenCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("pulls a remote-only hidden path when its root is opted in", async () => {
+			const settings = mockSettings();
+			settings.syncDotPaths = [".airsync"];
+			const deps = createDeps({ getSettings: () => settings });
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+			addFile(remoteFs, ".airsync/logs/d/x.log", "log");
+
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+
+			expect(readText(localFs, ".airsync/logs/d/x.log")).toBe("log");
+			expect(remoteFs.files.has(".airsync/logs/d/x.log")).toBe(true);
+			expect(deps.onStatusChange).toHaveBeenCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("skips when backend is connecting", async () => {
+			const deps = createDeps({ isBackendConnecting: () => true });
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+			expect(deps.notify).not.toHaveBeenCalled();
+			expect(deps.onStatusChange).not.toHaveBeenCalled();
+			await orchestrator.close();
+		});
+
+		it("runs normally when backend is not connecting", async () => {
+			const settings = mockSettings();
+			settings.showSyncNotifications = true;
+			const deps = createDeps({
+				isBackendConnecting: () => false,
+				getSettings: () => settings,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+			expect(deps.notify).toHaveBeenCalledWith("Everything up to date");
+			await orchestrator.close();
+		});
+
+		it("optimizes rename pair into rename_remote action", async () => {
+			const settings = { ...mockSettings(), showSyncNotifications: true };
+			const deps = createDeps({ getSettings: () => settings });
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+
+			// Add files with matching hash so optimizer can verify content unchanged
+			const localEntity = addFile(localFs, "new.md", "content", 1000);
+			localEntity.hash = "h1";
+			const remoteEntity = addFile(remoteFs, "old.md", "content", 1000);
+			remoteEntity.hash = "h1";
+
+			// Set up tracker with rename pair (do NOT initialize — cold mode
+			// lists all files so the "local deleted" entry survives filtering)
+			deps.localTracker.markRenamed("new.md", "old.md");
+
+			const orchestrator = new SyncOrchestrator(deps);
+			// Seed baseline for old.md so change detector sees it as previously synced
+			await orchestrator.state.put({
+				path: "old.md",
+				hash: "h1",
+				localMtime: 1000,
+				remoteMtime: 1000,
+				localSize: 7,
+				remoteSize: 7,
+				remoteIdentityKey: "id:old.md",
+				syncedAt: 900,
+			});
+
+			const renameSpy = vi.spyOn(remoteFs, "rename");
+			await orchestrator.runSync();
+
+			expect(renameSpy).toHaveBeenCalledWith("old.md", "new.md");
+			expect(deps.notify).toHaveBeenCalledWith(
+				expect.stringContaining("renamed"),
+			);
+			await orchestrator.close();
+		});
+
+		// Regression (issue #43): Windows resolves the source spelling of a case-only
+		// rename to the same on-disk file. The tracker is authoritative that the old
+		// logical path was renamed, so that alias must not make the old endpoint look
+		// locally present and suppress the delete_remote half of the rename pair.
+		it("optimizes a case-only local rename on a case-insensitive filesystem", async () => {
+			const deps = createDeps();
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+
+			const contentHash = await sha256(new TextEncoder().encode("content").buffer);
+			const localEntity = addFile(localFs, "PRUEBa.md", "content", 1000);
+			localEntity.hash = contentHash;
+			const remoteEntity = addFile(remoteFs, "PRUEBA.md", "content", 1000);
+			remoteEntity.hash = contentHash;
+
+			// Model Windows/Obsidian adapter fallback: stat(old spelling) resolves the
+			// file now indexed under the new spelling instead of reporting it absent.
+			const exactStat = localFs.stat.bind(localFs);
+			vi.spyOn(localFs, "stat").mockImplementation(async (path) => {
+				const exact = await exactStat(path);
+				if (exact) return exact;
+				const alias = [...localFs.files.keys()].find(
+					(candidate) => candidate.toLowerCase() === path.toLowerCase(),
+				);
+				return alias ? exactStat(alias) : null;
+			});
+
+			deps.localTracker.acknowledge(deps.localTracker.snapshot());
+			deps.localTracker.markRenamed("PRUEBa.md", "PRUEBA.md");
+
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "PRUEBA.md",
+				hash: contentHash,
+				localMtime: 1000,
+				remoteMtime: 1000,
+				localSize: 7,
+				remoteSize: 7,
+				remoteIdentityKey: "id:PRUEBA.md",
+				syncedAt: 900,
+			});
+
+			const renameSpy = vi.spyOn(remoteFs, "rename");
+			const writeSpy = vi.spyOn(remoteFs, "write");
+			await orchestrator.runSync();
+
+			expect(renameSpy).toHaveBeenCalledWith("PRUEBA.md", "PRUEBa.md");
+			expect(writeSpy).not.toHaveBeenCalled();
+			await orchestrator.close();
+		});
+
+		it("converges a case-only local folder rename with excluded descendants", async () => {
+			const warn = vi.fn();
+			const debug = vi.fn();
+			const deps = createDeps({
+				logger: {
+					enabled: () => true,
+					debug, info: vi.fn(), warn, error: vi.fn(), flush: vi.fn(),
+				} as unknown as Logger,
+			});
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+
+			const contentHash = await sha256(new TextEncoder().encode("content").buffer);
+			for (const name of ["Zettelkasten CTO.md", "Zettelkasten.md"]) {
+				const localEntity = addFile(localFs, `TemplateS/${name}`, "content", 1000);
+				localEntity.hash = contentHash;
+				const remoteEntity = addFile(remoteFs, `Templates/${name}`, "content", 1000);
+				remoteEntity.hash = contentHash;
+			}
+			addFile(remoteFs, "Templates/desktop.ini", "excluded", 1000);
+			confirmMockPath(localFs, "TemplateS");
+			confirmMockPath(remoteFs, "Templates");
+
+			const exactStat = localFs.stat.bind(localFs);
+			vi.spyOn(localFs, "stat").mockImplementation(async (path) => {
+				const exact = await exactStat(path);
+				if (exact) return exact;
+				if (path === "Templates") return exactStat("TemplateS");
+				const alias = [...localFs.files.keys()].find(
+					(candidate) => candidate.toLowerCase() === path.toLowerCase(),
+				);
+				return alias ? exactStat(alias) : null;
+			});
+
+			deps.localTracker.acknowledge(deps.localTracker.snapshot());
+			deps.localTracker.markFolderRenamed("TemplateS", "Templates");
+			for (const name of ["Zettelkasten CTO.md", "Zettelkasten.md"]) {
+				deps.localTracker.markRenamed(`TemplateS/${name}`, `Templates/${name}`);
+			}
+			const orchestrator = new SyncOrchestrator(deps);
+			for (const name of ["Zettelkasten CTO.md", "Zettelkasten.md"]) {
+				await orchestrator.state.put({
+					path: `Templates/${name}`,
+					hash: contentHash,
+					localMtime: 1000,
+					remoteMtime: 1000,
+					localSize: 7,
+					remoteSize: 7,
+					remoteIdentityKey: `id:Templates/${name}`,
+					syncedAt: 900,
+				});
+			}
+
+			const renameSpy = vi.spyOn(remoteFs, "rename");
+			await orchestrator.runSync();
+
+			expect(warn).not.toHaveBeenCalled();
+			expect(renameSpy).toHaveBeenCalledTimes(1);
+			expect(renameSpy).toHaveBeenCalledWith("Templates", "TemplateS");
+			expect(remoteFs.files.has("TemplateS/Zettelkasten CTO.md")).toBe(true);
+			expect(remoteFs.files.has("TemplateS/Zettelkasten.md")).toBe(true);
+			expect(debug.mock.calls.filter(([message]) => message === "Remote-only paths")
+				.flatMap(([, details]) => (details as { paths: string[] }).paths))
+				.not.toContain("Templates/desktop.ini");
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			expect(await orchestrator.state.get("Templates/Zettelkasten.md")).toBeUndefined();
+			expect(await orchestrator.state.get("TemplateS/Zettelkasten.md"))
+				.toMatchObject({ path: "TemplateS/Zettelkasten.md" });
+
+			await orchestrator.runSync();
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			await orchestrator.close();
+		});
+
+
+
+		it("acknowledges dirty paths after sync", async () => {
+			const deps = createDeps();
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+
+			// Initialize the tracker (it is empty here, so nothing is cleared), THEN
+			// dirty file.md — so file.md is genuinely dirty going into runSync and the
+			// post-sync assertion proves runSync's end-of-cycle acknowledge cleared it
+			// (not the setup). Ordering matters: marking before initializing would let
+			// the initialize snapshot clear file.md, making the assertion vacuous.
+			deps.localTracker.acknowledge(deps.localTracker.snapshot()); // initialize tracker
+			deps.localTracker.markDirty("file.md");
+
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+
+			expect(deps.localTracker.getDirtyPaths().size).toBe(0);
+			await orchestrator.close();
+		});
+
+		it("a markDirty arriving mid-cycle survives the cycle's acknowledge", async () => {
+			// A fresh tracker + empty store runs a COLD cycle, which lists the vault.
+			// Fire a markDirty from inside that list() — i.e. AFTER the cycle captured
+			// its snapshot — to simulate the user editing while a sync is in flight.
+			// The cycle must not sweep this path: it was never part of this cycle, so
+			// it must stay dirty (keeping it on the HOT path for the next cycle).
+			const deps = createDeps();
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+
+			let fired = false;
+			vi.spyOn(localFs, "list").mockImplementation(() => {
+				if (!fired) {
+					fired = true;
+					deps.localTracker.markDirty("mid-cycle.md");
+				}
+				return Promise.resolve([]);
+			});
+
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+
+			// RED on the old acknowledge(getDirtyPaths()) (swept); GREEN once the
+			// cycle acknowledges only its start-of-cycle snapshot.
+			expect(deps.localTracker.getDirtyPaths().has("mid-cycle.md")).toBe(true);
+			await orchestrator.close();
+		});
+	});
+
+	describe("adaptive transfer concurrency (wiring)", () => {
+		const rateLimit = () => Object.assign(new Error("rate limited"), { status: 429 });
+
+		it("retries a rate-limited transfer in-cycle, so the cycle completes clean", async () => {
+			const deps = createDeps();
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs("actual_resolved");
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+			addFile(localFs, "a.md", "content"); // local-only ⇒ push
+
+			const origWrite = remoteFs.write.bind(remoteFs);
+			let attempts = 0;
+			const writeSpy = vi.spyOn(remoteFs, "write").mockImplementation((p, c, m) =>
+				++attempts === 1 ? Promise.reject(rateLimit()) : origWrite(p, c, m));
+
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+
+			// classifyError (provider-less ⇒ classifyHttpError: 429 ⇒ rateLimit) + per-action
+			// retry are wired end-to-end ⇒ the push retries once and the cycle is clean.
+			expect(writeSpy).toHaveBeenCalledTimes(2);
+			expect(deps.onStatusChange).toHaveBeenCalledWith("idle");
+			expect(deps.onStatusChange).not.toHaveBeenCalledWith("partial_error");
+			await orchestrator.close();
+		});
+
+		it("a persistent rate-limit fails the file in ONE cycle (no cycle-level retry storm)", async () => {
+			const deps = createDeps();
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+			addFile(localFs, "a.md", "content");
+
+			const writeSpy = vi.spyOn(remoteFs, "write").mockRejectedValue(rateLimit());
+			let listCalls = 0;
+			const origList = localFs.list.bind(localFs);
+			vi.spyOn(localFs, "list").mockImplementation(() => { listCalls++; return origList(); });
+
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+
+			// Per-action: up to MAX_ACTION_RETRIES attempts then result.failed (a return, not a
+			// throw) ⇒ executeWithRetry does NOT re-run the cycle. One cold scan, one list.
+			expect(writeSpy).toHaveBeenCalledTimes(3);
+			expect(listCalls).toBe(1);
+			expect(deps.onStatusChange).toHaveBeenCalledWith("partial_error");
+			await orchestrator.close();
+		});
+	});
+
+	describe("pullSingle()", () => {
+		async function arrangePriorityPull(options: {
+			failRead?: boolean; remoteMissing?: boolean; untracked?: boolean;
+		} = {}) {
+			const info = vi.fn();
+			const warn = vi.fn();
+			const deps = createDeps({
+				isLayoutReady: () => false,
+				logger: {
+					enabled: () => true, debug: vi.fn(), info, warn, error: vi.fn(),
+					flush: vi.fn().mockResolvedValue(undefined),
+				} as unknown as SyncOrchestratorDeps["logger"],
+			});
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+			addFile(localFs, "note.md", "old", 1000);
+			const local = await localFs.stat("note.md");
+			if (!local) throw new Error("test setup failed");
+			const remote = addFile(remoteFs, "note.md", "remote content", 2000);
+			remote.identityKey = "remote-note-id";
+			const observed = {
+				kind: "current" as const,
+				path: "note.md",
+				identityKey: "remote-note-id",
+				token: "revision-2",
+				entity: { ...remote },
+				occupant: {
+					kind: "current" as const,
+					path: "note.md",
+					identityKey: "remote-note-id",
+					token: "revision-2",
+					entity: { ...remote },
+				},
+			};
+			const priorityRead = options.failRead
+				? vi.fn().mockRejectedValue(new Error("network error"))
+				: vi.fn().mockResolvedValue({
+					kind: "content" as const,
+					content: remoteFs.files.get("note.md")?.content.slice(0) ?? new ArrayBuffer(0),
+				});
+			remoteFs.priority = {
+				observe: vi.fn().mockResolvedValue(options.remoteMissing
+					? { kind: "missing", occupant: { kind: "absent" } }
+					: observed),
+				read: priorityRead,
+			};
+			const orchestrator = new SyncOrchestrator(deps);
+			if (!options.untracked) {
+				await orchestrator.state.put({
+					path: "note.md",
+					hash: local.hash,
+					localMtime: local.mtime,
+					remoteMtime: 1000,
+					localSize: local.size,
+					remoteSize: local.size,
+					remoteIdentityKey: "remote-note-id",
+					syncedAt: 1000,
+				});
+			}
+			return { deps, localFs, remoteFs, orchestrator, info, warn, priorityRead };
+		}
+
+		it("pulls a remote file and saves sync record", async () => {
+			const { localFs, orchestrator } = await arrangePriorityPull();
+			await orchestrator.pullSingle("note.md");
+
+			expect(readText(localFs, "note.md")).toBe("remote content");
+			const record = await orchestrator.state.get("note.md");
+			expect(record).toMatchObject({
+				path: "note.md", remoteMtime: 2000, remoteIdentityKey: "remote-note-id",
+			});
+			await orchestrator.close();
+		});
+
+		it("returns untracked without directly starting the normal lifecycle", async () => {
+			const { orchestrator, priorityRead } = await arrangePriorityPull({ untracked: true });
+			const runSync = vi.spyOn(orchestrator, "runSync");
+
+			expect(await orchestrator.pullSingle("note.md")).toBe("untracked");
+			expect(priorityRead).not.toHaveBeenCalled();
+			expect(runSync).not.toHaveBeenCalled();
+			await orchestrator.close();
+		});
+
+		it("acknowledges path after pull", async () => {
+			const { deps, orchestrator } = await arrangePriorityPull();
+			deps.localTracker.markDirty("note.md");
+
+			await orchestrator.pullSingle("note.md");
+
+			expect(deps.localTracker.getDirtyPaths().has("note.md")).toBe(
+				false,
+			);
+			await orchestrator.close();
+		});
+
+		it("fails closed and requests the normal lifecycle on detached read failure", async () => {
+			const { orchestrator, warn } = await arrangePriorityPull({ failRead: true });
+			await expect(
+				orchestrator.pullSingle("note.md"),
+			).resolves.toBeUndefined();
+			expect(warn).toHaveBeenCalledWith(
+				"file-open priority attempt failed",
+				expect.objectContaining({ path: "note.md" }),
+			);
+			await orchestrator.close();
+		});
+
+		it("defers a missing detached observation without overwriting local content", async () => {
+			const { localFs, orchestrator, info, priorityRead } =
+				await arrangePriorityPull({ remoteMissing: true });
+			await orchestrator.pullSingle("note.md");
+
+			expect(readText(localFs, "note.md")).toBe("old");
+			expect(priorityRead).not.toHaveBeenCalled();
+			expect(info).toHaveBeenCalledWith("file-open priority completed", {
+				path: "note.md", outcome: "deferred_to_batch",
+			});
+			await orchestrator.close();
+		});
+
+		it("uses detached provider I/O instead of the batch stat/read path", async () => {
+			const { remoteFs, orchestrator, priorityRead } = await arrangePriorityPull();
+			const stat = vi.spyOn(remoteFs, "stat");
+			const read = vi.spyOn(remoteFs, "read");
+
+			await orchestrator.pullSingle("note.md");
+
+			expect(priorityRead).toHaveBeenCalledOnce();
+			expect(stat).not.toHaveBeenCalled();
+			expect(read).not.toHaveBeenCalled();
+			await orchestrator.close();
+		});
+
+		it("supersedes an admitted pull before its normal provider read starts", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(false);
+			const paths = ["a.md", "b.md", "c.md", "d.md", "e.md", "f.md"];
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			for (const [index, path] of paths.entries()) {
+				const local = addFile(localFs, path, `old-${index}`, 1000);
+				const localStat = await localFs.stat(path);
+				if (!localStat) throw new Error("test setup failed");
+				const remote = addFile(remoteFs, path, `new-${index}`, 2000);
+				remote.identityKey = `id-${index}`;
+				await orchestrator.state.put({
+					path, hash: localStat.hash, localMtime: local.mtime, remoteMtime: 1000,
+					localSize: local.size, remoteSize: local.size,
+					remoteIdentityKey: `id-${index}`, syncedAt: 900,
+				});
+			}
+			const priorityRead = vi.fn((observation: Extract<PriorityObservation, { kind: "current" }>) =>
+				Promise.resolve({
+					kind: "content" as const,
+					content: remoteFs.files.get(observation.path)!.content.slice(0),
+				}));
+			remoteFs.priority = {
+				observe: vi.fn(({ path }: PriorityObservationRequest) => {
+					const entity = { ...remoteFs.files.get(path)!.entity };
+					const occupant = {
+						kind: "current" as const, path, identityKey: entity.identityKey!,
+						token: `revision-${entity.mtime}`, entity,
+					};
+					return Promise.resolve({ ...occupant, occupant });
+				}),
+				read: priorityRead,
+			};
+
+			const releaseReads = deferred<void>();
+			const fiveReadsStarted = deferred<void>();
+			const normalReadPaths: string[] = [];
+			vi.spyOn(remoteFs, "read").mockImplementation(async (path) => {
+				normalReadPaths.push(path);
+				if (normalReadPaths.length === 5) fiveReadsStarted.resolve();
+				await releaseReads.promise;
+				return remoteFs.files.get(path)!.content.slice(0);
+			});
+
+			const batch = orchestrator.runSync();
+			await fiveReadsStarted.promise;
+			const priority = orchestrator.pullSingle("f.md");
+			releaseReads.resolve();
+			await Promise.all([priority, batch]);
+
+			expect(priorityRead).toHaveBeenCalledOnce();
+			expect(normalReadPaths).not.toContain("f.md");
+			expect(readText(localFs, "f.md")).toBe("new-5");
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("never calls detached priority APIs for an ordinary multi-file batch", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(false);
+			const priorityObserve = vi.fn();
+			const priorityRead = vi.fn();
+			remoteFs.priority = { observe: priorityObserve, read: priorityRead };
+			const orchestrator = new SyncOrchestrator(createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+			}));
+			for (const [index, path] of ["a.md", "b.md"].entries()) {
+				const local = addFile(localFs, path, `old-${index}`, 1000);
+				const localStat = await localFs.stat(path);
+				if (!localStat) throw new Error("test setup failed");
+				const remote = addFile(remoteFs, path, `new-${index}`, 2000);
+				remote.identityKey = `id-${index}`;
+				await orchestrator.state.put({
+					path, hash: localStat.hash, localMtime: local.mtime, remoteMtime: 1000,
+					localSize: local.size, remoteSize: local.size,
+					remoteIdentityKey: `id-${index}`, syncedAt: 900,
+				});
+			}
+
+			await orchestrator.runSync();
+
+			expect(priorityObserve).not.toHaveBeenCalled();
+			expect(priorityRead).not.toHaveBeenCalled();
+			await orchestrator.close();
+		});
+
+		it("keeps file-open priority outside the real checkpoint and debt finalizer lease", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			const checkpointStarted = deferred<void>();
+			const releaseFinalizer = deferred<void>();
+			remoteFs.checkpoint!.commitCheckpoint = vi.fn(async () => {
+				checkpointStarted.resolve();
+				await releaseFinalizer.promise;
+			});
+			const priorityObserve = vi.fn();
+			const priorityRead = vi.fn();
+			remoteFs.priority = { observe: priorityObserve, read: priorityRead };
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+			});
+			const orchestrator = new SyncOrchestrator(createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+			}));
+
+			const batch = orchestrator.runSync();
+			await checkpointStarted.promise;
+			const priorityStateRead = vi.spyOn(orchestrator.state, "get");
+			const priority = orchestrator.pullSingle("note.md");
+			const priorityResolved = vi.fn();
+			void priority.then(priorityResolved);
+			await flush();
+			expect(priorityResolved).not.toHaveBeenCalled();
+			expect(priorityStateRead).not.toHaveBeenCalled();
+			expect(priorityObserve).not.toHaveBeenCalled();
+			releaseFinalizer.resolve();
+			await Promise.all([priority, batch]);
+
+			expect(priorityResolved).toHaveBeenCalledOnce();
+			expect(priorityObserve).not.toHaveBeenCalled();
+			expect(priorityRead).not.toHaveBeenCalled();
+			await orchestrator.close();
+		});
+	});
+
+	describe("shouldSync()", () => {
+		it("returns true when remote is available and not locked or connecting", () => {
+			const deps = createDeps();
+			const orchestrator = new SyncOrchestrator(deps);
+			expect(orchestrator.shouldSync()).toBe(true);
+		});
+
+		it("returns false when remote is null", () => {
+			const deps = createDeps({ remoteFs: () => null });
+			const orchestrator = new SyncOrchestrator(deps);
+			expect(orchestrator.shouldSync()).toBe(false);
+		});
+
+		it("returns false when backend is connecting", () => {
+			const deps = createDeps({ isBackendConnecting: () => true });
+			const orchestrator = new SyncOrchestrator(deps);
+			expect(orchestrator.shouldSync()).toBe(false);
+		});
+
+		it("returns true when backend is not connecting", () => {
+			const deps = createDeps({ isBackendConnecting: () => false });
+			const orchestrator = new SyncOrchestrator(deps);
+			expect(orchestrator.shouldSync()).toBe(true);
+		});
+	});
+
+	describe("isExcluded()", () => {
+		it("returns true for ignored paths", () => {
+			const settings = mockSettings();
+			settings.ignorePatterns = [".config/**"];
+			const deps = createDeps({ getSettings: () => settings });
+			const orchestrator = new SyncOrchestrator(deps);
+
+			expect(orchestrator.isExcluded(".config/settings")).toBe(true);
+			expect(orchestrator.isExcluded("notes/hello.md")).toBe(false);
+		});
+
+		it("always excludes OS-junk files on every backend, regardless of ignore/dot settings", () => {
+			const settings = mockSettings();
+			settings.ignorePatterns = [];
+			settings.syncDotPaths = [".DS_Store", "Anime"]; // even opted-in dot scope can't bring junk back
+			const deps = createDeps({ getSettings: () => settings });
+			const orchestrator = new SyncOrchestrator(deps);
+
+			expect(orchestrator.isExcluded("Anime/desktop.ini")).toBe(true);
+			expect(orchestrator.isExcluded("a/Thumbs.db")).toBe(true);
+			expect(orchestrator.isExcluded(".DS_Store")).toBe(true);
+			expect(orchestrator.isExcluded("notes/hello.md")).toBe(false);
+		});
+
+		it("excludes hidden paths not opted into syncDotPaths (scope gate)", () => {
+			const settings = mockSettings();
+			settings.syncDotPaths = [];
+			settings.ignorePatterns = [];
+			const deps = createDeps({ getSettings: () => settings });
+			const orchestrator = new SyncOrchestrator(deps);
+
+			expect(orchestrator.isExcluded(".airsync/logs/x.log")).toBe(true);
+			expect(orchestrator.isExcluded("notes/hello.md")).toBe(false);
+		});
+
+		it("includes a hidden path once opted into syncDotPaths", () => {
+			const settings = mockSettings();
+			settings.syncDotPaths = [".airsync"];
+			settings.ignorePatterns = [];
+			const deps = createDeps({ getSettings: () => settings });
+			const orchestrator = new SyncOrchestrator(deps);
+
+			expect(orchestrator.isExcluded(".airsync/logs/x.log")).toBe(false);
+		});
+
+		it("requires passing BOTH gates: opted-in dot path still excluded if ignored", () => {
+			const settings = mockSettings();
+			settings.syncDotPaths = [".airsync"];
+			settings.ignorePatterns = ["**/*.log"];
+			const deps = createDeps({ getSettings: () => settings });
+			const orchestrator = new SyncOrchestrator(deps);
+
+			expect(orchestrator.isExcluded(".airsync/logs/x.log")).toBe(true);
+		});
+
+		it("always excludes the reserved backend metadata path, even when .airsync is opted in", () => {
+			const settings = mockSettings();
+			settings.syncDotPaths = [".airsync"]; // opted in — logs would sync
+			settings.ignorePatterns = [];
+			const deps = createDeps({ getSettings: () => settings });
+			const orchestrator = new SyncOrchestrator(deps);
+
+			// Reserved: never synced from either side (prevents the push→delete_local
+			// data-loss path, since the remote FS hides this file).
+			expect(orchestrator.isExcluded(".airsync/metadata.json")).toBe(true);
+			// Sibling content under the same opted-in root still syncs.
+			expect(orchestrator.isExcluded(".airsync/logs/x.log")).toBe(false);
+		});
+
+		it("always excludes OS-junk files on every backend, regardless of ignore/syncDotPaths", () => {
+			const settings = mockSettings();
+			settings.syncDotPaths = []; // .DS_Store excluded even though dot paths are off-scope
+			settings.ignorePatterns = []; // no user pattern needed — junk is always excluded
+			const deps = createDeps({ getSettings: () => settings });
+			const orchestrator = new SyncOrchestrator(deps);
+
+			expect(orchestrator.isExcluded("desktop.ini")).toBe(true);
+			expect(orchestrator.isExcluded("Anime/Thumbs.db")).toBe(true);
+			expect(orchestrator.isExcluded("notes/.DS_Store")).toBe(true);
+			// Real content is unaffected.
+			expect(orchestrator.isExcluded("notes/hello.md")).toBe(false);
+		});
+
+		it("does not sync the config directory by default (enableConfigSync off)", () => {
+			const settings = mockSettings();
+			settings.enableConfigSync = false;
+			settings.syncDotPaths = [];
+			settings.ignorePatterns = [];
+			const deps = createDeps({ getSettings: () => settings });
+			const orchestrator = new SyncOrchestrator(deps);
+
+			expect(orchestrator.isExcluded(`${TEST_CONFIG_DIR}/app.json`)).toBe(true);
+		});
+
+		it("syncs allowed config-dir paths and excludes this plugin's own data.json when enableConfigSync is on", () => {
+			const settings = mockSettings();
+			settings.enableConfigSync = true;
+			settings.syncDotPaths = [];
+			settings.ignorePatterns = [];
+			const deps = createDeps({ getSettings: () => settings });
+			const orchestrator = new SyncOrchestrator(deps);
+
+			// Portable settings sync...
+			expect(orchestrator.isExcluded(`${TEST_CONFIG_DIR}/app.json`)).toBe(false);
+			expect(orchestrator.isExcluded(`${TEST_CONFIG_DIR}/plugins/some-other-plugin/data.json`)).toBe(false);
+			// ...but device-specific layout and this plugin's own data.json don't.
+			expect(orchestrator.isExcluded(`${TEST_CONFIG_DIR}/workspace.json`)).toBe(true);
+			expect(orchestrator.isExcluded(`${TEST_CONFIG_DIR}/plugins/${TEST_PLUGIN_ID}/data.json`)).toBe(true);
+		});
+
+		it("syncs root JSON config files only when their setting is enabled", () => {
+			const settings = mockSettings();
+			settings.enableConfigSync = true;
+			settings.syncConfigJsonFiles = false;
+			const deps = createDeps({ getSettings: () => settings });
+			const orchestrator = new SyncOrchestrator(deps);
+
+			expect(orchestrator.isExcluded(`${TEST_CONFIG_DIR}/app.json`)).toBe(true);
+			settings.syncConfigJsonFiles = true;
+			expect(orchestrator.isExcluded(`${TEST_CONFIG_DIR}/app.json`)).toBe(false);
+			expect(orchestrator.isExcluded(`${TEST_CONFIG_DIR}/workspace.json`)).toBe(true);
+			expect(orchestrator.isExcluded(`${TEST_CONFIG_DIR}/workspace-mobile.json`)).toBe(true);
+		});
+
+		it.each([
+			{ syncConfigJsonFiles: false, syncConfigPlugins: false },
+			{ syncConfigJsonFiles: true, syncConfigPlugins: false },
+			{ syncConfigJsonFiles: false, syncConfigPlugins: true },
+			{ syncConfigJsonFiles: true, syncConfigPlugins: true },
+		])(
+			"classifies the active community plugin list with plugins: $syncConfigJsonFiles/$syncConfigPlugins",
+			({ syncConfigJsonFiles, syncConfigPlugins }) => {
+				const settings = mockSettings();
+				settings.enableConfigSync = true;
+				settings.syncConfigJsonFiles = syncConfigJsonFiles;
+				settings.syncConfigPlugins = syncConfigPlugins;
+				const deps = createDeps({ getSettings: () => settings });
+				const orchestrator = new SyncOrchestrator(deps);
+
+				expect(orchestrator.isExcluded(`${TEST_CONFIG_DIR}/app.json`)).toBe(
+					!syncConfigJsonFiles,
+				);
+				expect(
+					orchestrator.isExcluded(`${TEST_CONFIG_DIR}/community-plugins.json`),
+				).toBe(!syncConfigPlugins);
+				expect(
+					orchestrator.isExcluded(
+						`${TEST_CONFIG_DIR}/plugins/some-other-plugin/data.json`,
+					),
+				).toBe(!syncConfigPlugins);
+			},
+		);
+
+		it.each([
+			["snippets", "syncConfigSnippets"],
+			["themes", "syncConfigThemes"],
+			["icons", "syncConfigIcons"],
+		] as const)("syncs config %s only when its setting is enabled", (directory, setting) => {
+			const settings = mockSettings();
+			settings.enableConfigSync = true;
+			settings[setting] = false;
+			const deps = createDeps({ getSettings: () => settings });
+			const orchestrator = new SyncOrchestrator(deps);
+			const directoryPath = `${TEST_CONFIG_DIR}/${directory}`;
+			const path = `${TEST_CONFIG_DIR}/${directory}/example.css`;
+
+			expect(orchestrator.isExcluded(directoryPath)).toBe(true);
+			expect(orchestrator.isExcluded(path)).toBe(true);
+			settings[setting] = true;
+			expect(orchestrator.isExcluded(directoryPath)).toBe(false);
+			expect(orchestrator.isExcluded(path)).toBe(false);
+		});
+
+		it("never syncs this plugin's own data.json, even if the user's own ignorePatterns tries to un-ignore it", () => {
+			const settings = mockSettings();
+			settings.enableConfigSync = true;
+			settings.syncDotPaths = [];
+			// A broad negation a user might add to "sync everything" — without the
+			// unconditional isOwnPluginDataPath check, gitignore's last-match-wins
+			// semantics would let this override the built-in exclusion and leak
+			// this device's backend credentials/vaultId to another device.
+			settings.ignorePatterns = ["!**"];
+			const deps = createDeps({ getSettings: () => settings });
+			const orchestrator = new SyncOrchestrator(deps);
+
+			expect(orchestrator.isExcluded(`${TEST_CONFIG_DIR}/plugins/${TEST_PLUGIN_ID}/data.json`)).toBe(true);
+		});
+
+		it("never syncs this plugin's own data.json even with enableConfigSync off, if the user manually opted the config dir into syncDotPaths", () => {
+			// The pre-existing, still-fully-functional manual workflow (typing the
+			// config dir into "Dot-prefixed paths to sync" without ever touching the
+			// new toggle) must stay protected too — isOwnPluginDataPath is checked
+			// unconditionally in isExcluded(), not gated on settings.enableConfigSync.
+			const settings = mockSettings();
+			settings.enableConfigSync = false;
+			settings.syncDotPaths = [TEST_CONFIG_DIR];
+			settings.ignorePatterns = ["!**"];
+			const deps = createDeps({ getSettings: () => settings });
+			const orchestrator = new SyncOrchestrator(deps);
+
+			expect(orchestrator.isExcluded(`${TEST_CONFIG_DIR}/plugins/${TEST_PLUGIN_ID}/data.json`)).toBe(true);
+		});
+	});
+
+	/**
+	 * Attach a fake namespace-reconciliation capability to the mock remote. Each call
+	 * consumes one entry from `queues`; facts eligible under the caller's policy are
+	 * renamed through the mock's own `identityRename` — so the provider/view mutation
+	 * the test arranged actually happens — and the result is `changed`, else `settled`.
+	 * The keeper policy is the production one the orchestrator supplies, so the record
+	 * holder keeps the plain address exactly as it does in production.
+	 */
+	function attachReconciliation(remoteFs: MockFileSystem, queues: AddressDisplacement[][]) {
+		let call = 0;
+		const reconcile = vi.fn(async (policy: NamespaceRepairPolicy) => {
+			const facts = queues[Math.min(call, queues.length - 1)] ?? [];
+			call += 1;
+			const repairable = facts.filter((fact) => fact.owesRemediation && policy.isInScope(fact.path));
+			if (repairable.length === 0) return { kind: "settled" as const };
+			for (const fact of repairable) {
+				const keeper = await policy.keeper(fact.path, [fact.admittedId, fact.withheldId]);
+				const repair = namespaceRepairFor(fact, keeper);
+				await remoteFs.identityRename!.renameById(repair.identityKey, repair.path, repair.target);
+			}
+			return { kind: "changed" as const };
+		});
+		remoteFs.namespaceReconciliation = { reconcileNamespace: reconcile };
+		return reconcile;
+	}
+
+	describe("contention remediation reaches only the synced scope", () => {
+		/**
+		 * One contended address exactly as the remote filesystem announces it. The
+		 * shape is pinned against the real arbiter in
+		 * `plan-admission-address-contention.test.ts`; authoring it directly here lets
+		 * the same cycle be driven at an included and at an excluded address without
+		 * also modelling a provider namespace for each.
+		 */
+		function contention(path: string): AddressDisplacement {
+			// `admittedId` is the claimant the CACHE seated, which is a working-view
+			// mechanism that cannot read sync state. Naming it "keeper" would write the
+			// assumption that it is also the claimant the address syncs into the fixture's
+			// own vocabulary — and that assumption is exactly what fails when a committed
+			// record names the other one.
+			return {
+				path, admittedId: "seated-id", withheldId: "moved-id",
+				displacedPaths: [], reason: "lowest_stable_id", owesRemediation: true,
+			};
+		}
+
+		/**
+		 * A settled vault, then one more cycle whose remote delta announces a
+		 * contention at `contendedPath`. The first cycle is what puts the second on
+		 * WARM — the temperature that asks the checkpoint for a delta at all.
+		 */
+		async function cycleWithContentionAt(contendedPath: string) {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+				lastSyncedIdentity: "test:root", ignorePatterns: ["private/**"],
+			});
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			addFile(localFs, "keep.md", "settled", 1000);
+			await orchestrator.runSync();
+
+			const renameById = vi.fn().mockResolvedValue(undefined);
+			remoteFs.identityRename = { renameById };
+			// Announced once: after the repair lands the provider no longer holds two
+			// objects there, so the next reconciliation has nothing to settle.
+			const reconcile = attachReconciliation(remoteFs, [[contention(contendedPath)], []]);
+			const getChangedPaths = vi.fn()
+				.mockResolvedValue({ modified: [], deleted: [] });
+			remoteFs.checkpoint!.getChangedPaths = getChangedPaths;
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			const abortWorkingView = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			remoteFs.checkpoint!.abortWorkingView = abortWorkingView;
+
+			await orchestrator.runSync();
+			await orchestrator.close();
+			return { renameById, commitCheckpoint, abortWorkingView, getChangedPaths, reconcile };
+		}
+
+		it("repairs, withholds that cycle's checkpoint, and commits in the follow-up it queues", async () => {
+			const cycle = await cycleWithContentionAt("docs/Note.md");
+
+			expect(cycle.renameById).toHaveBeenCalledOnce();
+			expect(cycle.renameById).toHaveBeenCalledWith(
+				"moved-id", "docs/Note.md", "docs/Note.conflict-id-moved-id.md");
+			// The filesystem settles the namespace before the engine consumes any view:
+			// reconciliation is called before change collection reads the delta.
+			expect(cycle.reconcile.mock.invocationCallOrder[0]!)
+				.toBeLessThan(cycle.getChangedPaths.mock.invocationCallOrder[0]!);
+			// One runSync, two cycles: the repair cycle settles the namespace before change
+			// collection (so it never consumes the incomplete view) and aborts; the cycle it
+			// queued — seeing the address settled — collects once and commits.
+			expect(cycle.getChangedPaths).toHaveBeenCalledOnce();
+			expect(cycle.abortWorkingView).toHaveBeenCalledOnce();
+			expect(cycle.commitCheckpoint).toHaveBeenCalledOnce();
+			expect(cycle.abortWorkingView.mock.invocationCallOrder[0]!)
+				.toBeLessThan(cycle.commitCheckpoint.mock.invocationCallOrder[0]!);
+		});
+
+		it("mutates nothing and still commits at an address the vault excludes", async () => {
+			// The remote metadata cache holds every object under the bound root,
+			// including the paths this vault ignores. Remediating there would rename
+			// data the user told the plugin to leave alone, and would block the
+			// checkpoint every cycle while doing it — for an address no cycle is
+			// allowed to touch in the first place.
+			const cycle = await cycleWithContentionAt("private/Note.md");
+
+			expect(cycle.renameById).not.toHaveBeenCalled();
+			expect(cycle.commitCheckpoint).toHaveBeenCalledOnce();
+			expect(cycle.abortWorkingView).not.toHaveBeenCalled();
+			// Nothing was owed, so nothing was queued.
+			expect(cycle.getChangedPaths).toHaveBeenCalledOnce();
+		});
+
+		it("queues one follow-up however many times one is requested", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`, lastSyncedIdentity: "test:root",
+			});
+			const orchestrator = new SyncOrchestrator(createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+			}));
+			addFile(localFs, "keep.md", "settled", 1000);
+			await orchestrator.runSync();
+
+			// While the repair cycle runs, other sync requests arrive too — as vault
+			// events do. The queue is one slot: the cycle's own follow-up and those
+			// requests are all the same next cycle.
+			remoteFs.identityRename = { renameById: vi.fn(async () => {
+				await orchestrator.runSync();
+				await orchestrator.runSync();
+			}) };
+			attachReconciliation(remoteFs, [[contention("docs/Note.md")], []]);
+			const getChangedPaths = vi.fn()
+				.mockResolvedValue({ modified: [], deleted: [] });
+			remoteFs.checkpoint!.getChangedPaths = getChangedPaths;
+
+			await orchestrator.runSync();
+			await orchestrator.close();
+
+			// The reconciled cycle settles before collection, so only the follow-up reads
+			// the delta — and the queue is one slot however many requests arrive.
+			expect(getChangedPaths).toHaveBeenCalledOnce();
+		});
+
+		it("routes a refused namespace repair through the error policy instead of looping", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`, lastSyncedIdentity: "test:root",
+			});
+			const statuses: string[] = [];
+			const orchestrator = new SyncOrchestrator(createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				onStatusChange: (status) => statuses.push(status),
+			}));
+			addFile(localFs, "keep.md", "settled", 1000);
+			await orchestrator.runSync();
+
+			// A repair the backend permanently refuses: `failed` carries the provider's error.
+			const reconcile = vi.fn().mockResolvedValue({
+				kind: "failed",
+				failures: [{
+					path: "note.md", identityKey: "b-id", target: "note.conflict-id-b-id.md",
+					message: "insufficient permissions", error: new Error("insufficient permissions"),
+				}],
+			});
+			remoteFs.namespaceReconciliation = { reconcileNamespace: reconcile };
+			remoteFs.checkpoint!.getChangedPaths = vi.fn().mockResolvedValue({ modified: [], deleted: [] });
+			const commit = vi.fn().mockResolvedValue(undefined);
+			const abort = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commit;
+			remoteFs.checkpoint!.abortWorkingView = abort;
+
+			await orchestrator.runSync();
+			await orchestrator.close();
+
+			// It terminates, reports an error, never commits, and retries a bounded number of
+			// times rather than re-running the follow-up inside one runSync forever.
+			expect(statuses).toContain("error");
+			expect(commit).not.toHaveBeenCalled();
+			expect(abort).toHaveBeenCalled();
+			expect(reconcile).toHaveBeenCalledTimes(3);
+		});
+	});
+
+	/**
+	 * The owner's rule for two live objects claiming one address has two verbs: sync the
+	 * object whose id matches the `SyncRecord`, rename the one that does not. The block
+	 * above drives only the case where those two answers agree, because its contended
+	 * path carries no record at all — so the claimant the cache seated is always also the
+	 * one the address syncs, and the rule that `chooseKeeper` exists to serve is never
+	 * exercised end to end.
+	 *
+	 * This block drives the disagreement, which is the only case that rule is FOR.
+	 */
+	describe("a contended address whose record names the withheld claimant", () => {
+		const CONTENDED = "docs/Note.md";
+		/** The mock mints `id:<path>`, so this is what the settling cycle records. */
+		const RECORD_HOLDER = `id:${CONTENDED}`;
+		const NEWCOMER = "seated-id";
+		/** Where the repair moves the newcomer. */
+		const TARGET = "docs/Note.conflict-id-seated-id.md";
+
+		/**
+		 * The provider as the repair leaves it: the newcomer at the target it was renamed
+		 * to, and the record holder — which the cache had dropped to seat the newcomer —
+		 * back at its own address, bytes and identity unchanged.
+		 */
+		function landRepair(
+			remoteFs: MockFileSystem,
+			holder: { content: ArrayBuffer; entity: FileEntity },
+		) {
+			return vi.fn((_identity: string, _admittedPath: string, target: string) => {
+				const seated = remoteFs.files.get(CONTENDED)!;
+				remoteFs.files.set(target, { content: seated.content, entity: { ...seated.entity, path: target } });
+				remoteFs.files.set(CONTENDED, holder);
+				return Promise.resolve();
+			});
+		}
+
+		/** Put the newcomer where the record holder was, keeping the holder to restore. */
+		function seatNewcomer(remoteFs: MockFileSystem) {
+			const seated = remoteFs.files.get(CONTENDED)!;
+			const holder = { content: seated.content, entity: { ...seated.entity } };
+			seated.content = new TextEncoder().encode("the newcomer's bytes").buffer;
+			seated.entity = { ...seated.entity, identityKey: NEWCOMER, mtime: 2000, size: 20 };
+			return holder;
+		}
+
+		/**
+		 * A settled vault, then a same-named sibling appears and wins the cache address.
+		 *
+		 * Cycle 1 syncs the user's file and commits its record. Between cycles the remote
+		 * entry at the contended path is REPLACED by the newcomer — which is exactly what
+		 * the working view looks like after the arbiter seats the lexicographically
+		 * smaller id and drops the other — and the delta announces both the change at that
+		 * address and the contention behind it.
+		 */
+		async function newcomerWinsTheAddress() {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+				lastSyncedIdentity: "test:root",
+			});
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			addFile(localFs, CONTENDED, "the user's file", 1000);
+			addFile(localFs, "elsewhere.md", "untouched by any contention", 1000);
+			await orchestrator.runSync();
+
+			// The newcomer now occupies the address in the working view. Different bytes
+			// and a later mtime, so the ordinary rules have something to do with it.
+			const holder = seatNewcomer(remoteFs);
+
+			const renameById = landRepair(remoteFs, holder);
+			remoteFs.identityRename = { renameById };
+			// The first reconciliation sees the newcomer beating the record holder and
+			// moves it; the follow-up reports what the repair did; after that nothing new.
+			attachReconciliation(remoteFs, [[{
+				path: CONTENDED, admittedId: NEWCOMER, withheldId: RECORD_HOLDER,
+				displacedPaths: [], reason: "lowest_stable_id", owesRemediation: true,
+			}], []]);
+			// The reconciled cycle settles before collection, so the follow-up is the first
+			// cycle to collect: it reads what the repair left, and then there is nothing new.
+			remoteFs.checkpoint!.getChangedPaths = vi.fn()
+				.mockResolvedValueOnce({ modified: [CONTENDED, TARGET], deleted: [] })
+				.mockResolvedValue({ modified: [], deleted: [] });
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			const abortWorkingView = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			remoteFs.checkpoint!.abortWorkingView = abortWorkingView;
+
+			await orchestrator.runSync();
+			await orchestrator.close();
+			return { renameById, commitCheckpoint, abortWorkingView, localFs, remoteFs };
+		}
+
+		it("writes nothing at the address the record holder keeps, and syncs the newcomer where it moved", async () => {
+			const cycle = await newcomerWinsTheAddress();
+
+			// Without the withholding, the repair cycle reads the newcomer against the
+			// record holder's baseline as a replaced destination and acts on it —
+			// overwriting the user's file, or duplicating it as a conflict — at the very
+			// address the repair is moving that same newcomer out of.
+			expect(readText(cycle.localFs, CONTENDED)).toBe("the user's file");
+			expect(readText(cycle.remoteFs, CONTENDED)).toBe("the user's file");
+			// The follow-up converges: the newcomer, renamed, arrives as its own file —
+			// and nothing else carrying ".conflict" does.
+			expect([...cycle.localFs.files.keys()].filter((path) => path.includes(".conflict")))
+				.toEqual([TARGET]);
+			expect(readText(cycle.localFs, TARGET)).toBe("the newcomer's bytes");
+		});
+
+		it("moves the newcomer once, and commits only in the follow-up", async () => {
+			const cycle = await newcomerWinsTheAddress();
+
+			expect(cycle.renameById).toHaveBeenCalledOnce();
+			expect(cycle.renameById).toHaveBeenCalledWith(NEWCOMER, CONTENDED, TARGET);
+			expect(cycle.abortWorkingView).toHaveBeenCalledOnce();
+			expect(cycle.commitCheckpoint).toHaveBeenCalledOnce();
+			expect(cycle.abortWorkingView.mock.invocationCallOrder[0]!)
+				.toBeLessThan(cycle.commitCheckpoint.mock.invocationCallOrder[0]!);
+		});
+
+		it("leaves every uncontended path in the same cycle alone", async () => {
+			const cycle = await newcomerWinsTheAddress();
+
+			// Withholding is address-local. A contention is not a reason to stop syncing
+			// the rest of the vault, and the settled file must not be disturbed.
+			expect(readText(cycle.remoteFs, "elsewhere.md")).toBe("untouched by any contention");
+		});
+
+		/**
+		 * The same address, reached by the other acquisition route.
+		 *
+		 * A COLD cycle never asks for a delta — it lists both sides — so the contention
+		 * channel it uses is the full scan's own, not `getChangedPaths`. COLD is not an
+		 * exotic state: `forceFullScan` is `noCheckpoint || scopeChanged`, and editing one
+		 * ignore pattern is enough. `AGENTS.md` requires COLD, WARM and HOT to reach the
+		 * same Admission decision from the same facts; this is that requirement, measured.
+		 */
+		it("withholds the same address when a COLD cycle acquired it by full scan", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+				lastSyncedIdentity: "test:root",
+			});
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			addFile(localFs, CONTENDED, "the user's file", 1000);
+			await orchestrator.runSync();
+			// A provider listing spells the parent it created as resolved; the mock keeps
+			// its own mkdir an echo unless told otherwise, which a COLD listing would see.
+			confirmMockPath(remoteFs, "docs");
+
+			const holder = seatNewcomer(remoteFs);
+
+			const renameById = landRepair(remoteFs, holder);
+			remoteFs.identityRename = { renameById };
+			// No checkpoint ⇒ forceFullScan ⇒ COLD, which never calls getChangedPaths. The
+			// first full scan's contention reaches reconciliation; the follow-up is settled.
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(false);
+			attachReconciliation(remoteFs, [[{
+				path: CONTENDED, admittedId: NEWCOMER, withheldId: RECORD_HOLDER,
+				displacedPaths: [], reason: "lowest_stable_id", owesRemediation: true,
+			}], []]);
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			remoteFs.checkpoint!.abortWorkingView = vi.fn().mockResolvedValue(undefined);
+
+			await orchestrator.runSync();
+			await orchestrator.close();
+
+			expect(readText(localFs, CONTENDED)).toBe("the user's file");
+			expect(renameById).toHaveBeenCalledOnce();
+			expect(renameById).toHaveBeenCalledWith(NEWCOMER, CONTENDED, TARGET);
+			// The follow-up is COLD again and lists what the repair left: it converges
+			// and commits, with the newcomer synced at its new address.
+			expect(commitCheckpoint).toHaveBeenCalledOnce();
+			expect(readText(localFs, TARGET)).toBe("the newcomer's bytes");
+		});
+	});
+
+	describe("getStatus()", () => {
+		it("returns idle when not syncing", () => {
+			const deps = createDeps();
+			const orchestrator = new SyncOrchestrator(deps);
+			expect(orchestrator.getStatus()).toBe("idle");
+		});
+	});
+
+	describe("clearSyncState()", () => {
+		it("clears the state store", async () => {
+			const deps = createDeps();
+			const orchestrator = new SyncOrchestrator(deps);
+
+			// Put a record first via a sync
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			deps.localFs = () => localFs;
+			deps.remoteFs = () => remoteFs;
+			addFile(remoteFs, "a.md", "content", 1000);
+
+			await orchestrator.runSync();
+			await orchestrator.clearSyncState();
+
+			const all = await orchestrator.state.getAll();
+			expect(all).toHaveLength(0);
+			await orchestrator.close();
+		});
+
+
+	});
+
+	describe("layoutReady gate", () => {
+		it("runSync is a no-op while the vault layout is not ready", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			const listSpy = vi.spyOn(localFs, "list");
+			const deps = createDeps({
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				isLayoutReady: () => false,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+
+			await orchestrator.runSync();
+
+			expect(listSpy).not.toHaveBeenCalled();
+			expect(deps.onStatusChange).not.toHaveBeenCalledWith("syncing");
+			await orchestrator.close();
+		});
+
+		it("runs once the layout becomes ready", async () => {
+			let ready = false;
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			const deps = createDeps({
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				isLayoutReady: () => ready,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+
+			await orchestrator.runSync();
+			expect(deps.onStatusChange).not.toHaveBeenCalledWith("syncing");
+			expect(deps.onStatusChange).not.toHaveBeenCalledWith("idle");
+
+			ready = true;
+			await orchestrator.runSync();
+			expect(deps.onStatusChange).toHaveBeenCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("shouldSync is false until the layout is ready", () => {
+			let ready = false;
+			const deps = createDeps({ isLayoutReady: () => ready });
+			const orchestrator = new SyncOrchestrator(deps);
+			expect(orchestrator.shouldSync()).toBe(false);
+			ready = true;
+			expect(orchestrator.shouldSync()).toBe(true);
+		});
+	});
+
+	describe("ordinary cold reconstruction from checkpoint absence", () => {
+		/**
+		 * A missing durable checkpoint selects the ordinary COLD acquisition path.
+		 * Existing per-file records may coexist with files that have no record, so
+		 * the full join must rediscover both without consulting prior failure state.
+		 */
+		it("hasCheckpoint=false forces a cold reconcile that pulls the un-synced file", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(localFs, "synced.md", "kept", 1000);
+			addFile(remoteFs, "synced.md", "kept", 1000);
+			addFile(remoteFs, "orphan.md", "left behind", 1000);
+
+			const settings = baseMockSettings({
+				backendType: "test",
+				vaultId: `test-${Math.random()}`,
+			});
+			// hasCheckpoint lives on the FS's checkpoint capability now (the cursor is
+			// stored with the cache).
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(false);
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+
+			// synced.md has a committed baseline; orphan.md has none.
+			await orchestrator.state.put({
+				path: "synced.md",
+				hash: "",
+				localMtime: 1000,
+				remoteMtime: 1000,
+				localSize: 4,
+				remoteSize: 4,
+				remoteIdentityKey: "id:synced.md",
+				syncedAt: 900,
+			});
+
+			await orchestrator.runSync();
+
+			expect(localFs.files.has("orphan.md")).toBe(true);
+			expect(await orchestrator.state.get("orphan.md")).toBeDefined();
+			await orchestrator.close();
+		});
+
+		it("rescan() resets the checkpoint via the FS inside the sync cycle, then cold-reconciles", async () => {
+			// The reset must run through the orchestrator's sync mutex (not be fired
+			// straight at the live FS from outside) so it can't clear the cache mid-cycle
+			// and corrupt an in-flight sync. After the reset, hasCheckpoint is false → cold.
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(localFs, "synced.md", "kept", 1000);
+			addFile(remoteFs, "synced.md", "kept", 1000);
+			addFile(remoteFs, "orphan.md", "left behind", 1000); // only a COLD reconcile finds this
+
+			const settings = baseMockSettings({ backendType: "test", vaultId: `test-${Math.random()}` });
+			// A checkpoint exists; rescan must discard it (via resetCheckpoint) to force cold.
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			const resetCheckpoint = vi.fn().mockImplementation(() => {
+				remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(false); // reset ⇒ no checkpoint
+				return Promise.resolve();
+			});
+			remoteFs.checkpoint!.resetCheckpoint = resetCheckpoint;
+
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "synced.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 4, remoteSize: 4, remoteIdentityKey: "id:synced.md", syncedAt: 900,
+			});
+
+			await orchestrator.rescan();
+
+			expect(resetCheckpoint).toHaveBeenCalledTimes(1);
+			// The forced cold reconcile rediscovered the orphan a warm/hot delta would miss.
+			expect(localFs.files.has("orphan.md")).toBe(true);
+			await orchestrator.close();
+		});
+
+		/**
+		 * The cursor ("completed up to") must advance only when the whole pipeline
+		 * succeeds. A cycle with a failed action must NOT advance the committed
+		 * changesStartPageToken, so the next run still re-detects the un-pulled work.
+		 */
+		it("replays from the committed cursor after aborting a failed working view", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(localFs, "synced.md", "kept", 1000);
+			addFile(remoteFs, "synced.md", "kept", 1000);
+			addFile(remoteFs, "orphan.md", "left behind", 1000);
+
+			const settings = baseMockSettings({
+				backendType: "test",
+				vaultId: `test-${Math.random()}`,
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			let deltaConsumed = false;
+			remoteFs.checkpoint!.getChangedPaths = vi.fn().mockImplementation(() => {
+				if (deltaConsumed) return Promise.resolve({ modified: [], deleted: [] });
+				deltaConsumed = true;
+				return Promise.resolve({ modified: ["orphan.md"], deleted: [] });
+			});
+			const abortWorkingView = vi.fn().mockImplementation(() => {
+				deltaConsumed = false;
+				return Promise.resolve();
+			});
+			remoteFs.checkpoint!.abortWorkingView = abortWorkingView;
+
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "synced.md",
+				hash: "",
+				localMtime: 1000,
+				remoteMtime: 1000,
+				localSize: 4,
+				remoteSize: 4,
+				remoteIdentityKey: "id:synced.md",
+				syncedAt: 900,
+			});
+
+			const originalRead = remoteFs.read.bind(remoteFs);
+			const readSpy = vi.spyOn(remoteFs, "read")
+				.mockRejectedValue(new Error("network dropped"));
+			await orchestrator.runSync();
+			expect(localFs.files.has("orphan.md")).toBe(false);
+			expect(abortWorkingView).toHaveBeenCalledOnce();
+
+			readSpy.mockImplementation(originalRead);
+			await orchestrator.runSync();
+			expect(localFs.files.has("orphan.md")).toBe(true);
+			expect(await orchestrator.state.get("orphan.md")).toBeDefined();
+			await orchestrator.close();
+		});
+
+		it("repeats an ordinary cold scan after aborting an uncommitted first scan", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(remoteFs, "cold-orphan.md", "remote", 1000);
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(false);
+			const abortWorkingView = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.abortWorkingView = abortWorkingView;
+			const readError = new Error("read failed");
+			const read = vi.spyOn(remoteFs, "read")
+				.mockRejectedValueOnce(readError)
+				.mockRejectedValueOnce(readError)
+				.mockRejectedValueOnce(readError);
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+			});
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+
+			await orchestrator.runSync();
+			expect(localFs.files.has("cold-orphan.md")).toBe(false);
+			await orchestrator.runSync();
+
+			expect(read).toHaveBeenCalledTimes(4);
+			expect(abortWorkingView).toHaveBeenCalledOnce();
+			expect(readText(localFs, "cold-orphan.md")).toBe("remote");
+			await orchestrator.close();
+		});
+
+		it("replays remote delta and retained tracker input after aborting a hot attempt", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(localFs, "synced.md", "kept", 1000);
+			addFile(remoteFs, "synced.md", "kept", 1000);
+			addFile(remoteFs, "hot-orphan.md", "remote", 1000);
+			const tracker = new LocalChangeTracker();
+			tracker.acknowledge(tracker.snapshot());
+			tracker.markDirty("ghost.md");
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			let deltaConsumed = false;
+			const getChangedPaths = vi.fn().mockImplementation(() => {
+				if (deltaConsumed) return Promise.resolve({ modified: [], deleted: [] });
+				deltaConsumed = true;
+				return Promise.resolve({ modified: ["hot-orphan.md"], deleted: [] });
+			});
+			remoteFs.checkpoint!.getChangedPaths = getChangedPaths;
+			const abortWorkingView = vi.fn().mockImplementation(() => {
+				deltaConsumed = false;
+				return Promise.resolve();
+			});
+			remoteFs.checkpoint!.abortWorkingView = abortWorkingView;
+			const readError = new Error("read failed");
+			vi.spyOn(remoteFs, "read")
+				.mockRejectedValueOnce(readError)
+				.mockRejectedValueOnce(readError)
+				.mockRejectedValueOnce(readError);
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+			});
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				localTracker: tracker,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "synced.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 4, remoteSize: 4, remoteIdentityKey: "id:synced.md", syncedAt: 900,
+			});
+
+			await orchestrator.runSync();
+			expect(tracker.getDirtyPaths()).toContain("ghost.md");
+			await orchestrator.runSync();
+
+			expect(getChangedPaths).toHaveBeenCalledTimes(2);
+			expect(abortWorkingView).toHaveBeenCalledOnce();
+			expect(readText(localFs, "hot-orphan.md")).toBe("remote");
+			await orchestrator.close();
+		});
+
+		it("retains a failed same-metadata edit while abandoning partial-cycle relations", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			confirmRemoteWrites(remoteFs);
+			const tracker = new LocalChangeTracker();
+			addFile(localFs, "edited.md", "old!", 1000);
+			addFile(remoteFs, "edited.md", "old!", 1000);
+			const settings = baseMockSettings({ backendType: "test", vaultId: `test-${Math.random()}` });
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				localTracker: tracker,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.runSync();
+
+			await localFs.write("edited.md", new TextEncoder().encode("new!").buffer, 1000);
+			tracker.markDirty("edited.md");
+			tracker.markRenamed("renamed.md", "old-name.md");
+			const failedWrite = vi.spyOn(remoteFs, "write").mockRejectedValue(new Error("write failed"));
+			await orchestrator.runSync();
+
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("partial_error");
+			expect(tracker.getDirtyPaths()).toContain("edited.md");
+			expect(tracker.getRenamePairs()).toEqual(new Map());
+			failedWrite.mockRestore();
+
+			await orchestrator.runSync();
+			expect(readText(remoteFs, "edited.md")).toBe("new!");
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("re-observes and retries the same failed file on every later sync", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(localFs, "synced.md", "kept", 1000);
+			addFile(localFs, "poison.zip", "large file", 1000);
+			addFile(remoteFs, "synced.md", "kept", 1000);
+
+			const settings = baseMockSettings({
+				backendType: "test",
+				vaultId: `test-${Math.random()}`,
+				showSyncNotifications: true,
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			const abortWorkingView = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.abortWorkingView = abortWorkingView;
+
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "synced.md",
+				hash: "",
+				localMtime: 1000,
+				remoteMtime: 1000,
+				localSize: 4,
+				remoteSize: 4,
+				remoteIdentityKey: "id:synced.md",
+				syncedAt: 900,
+			});
+
+			const remoteListSpy = vi.spyOn(remoteFs, "list");
+			let attempts = 0;
+			const writeSpy = vi.spyOn(remoteFs, "write").mockImplementation(() => {
+				attempts++;
+				const headers = attempts === 1
+					? "X-Goog-Upload-Status, X-Request-Id"
+					: "X-Request-Id, X-Goog-Upload-Status";
+				return Promise.reject(Object.assign(
+					new Error(`Resumable upload: no upload URL in response (status 200; headers: ${headers})`),
+					{
+						permanent: true,
+						permanentCode: "googledrive.resumable_upload.missing_location",
+					},
+				));
+			});
+
+			await orchestrator.runSync();
+			await orchestrator.runSync();
+			await orchestrator.runSync();
+
+			expect(writeSpy).toHaveBeenCalledTimes(3);
+			expect(remoteListSpy).not.toHaveBeenCalled();
+			expect(abortWorkingView).toHaveBeenCalledTimes(3);
+			expect(deps.onStatusChange).toHaveBeenCalledWith("partial_error");
+			expect(deps.notify).toHaveBeenLastCalledWith("Sync: 1 error — Push failed (unclassified)");
+			await orchestrator.close();
+		});
+
+		it("does not quarantine uncoded permanent push failures", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(localFs, "uncoded.md", "body", 1000);
+
+			const settings = baseMockSettings({
+				backendType: "test",
+				vaultId: `test-${Math.random()}`,
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			const writeSpy = vi.spyOn(remoteFs, "write").mockRejectedValue(
+				Object.assign(new Error("uncoded permanent failure"), { permanent: true })
+			);
+
+			await orchestrator.runSync();
+			await orchestrator.runSync();
+			await orchestrator.runSync();
+
+			expect(writeSpy).toHaveBeenCalledTimes(3);
+			expect(deps.onStatusChange).toHaveBeenCalledWith("partial_error");
+			await orchestrator.close();
+		});
+
+		it.each([
+			["transient", () => new Error("network dropped")],
+			["rateLimit", () => Object.assign(new Error("rate limited"), { status: 429 })],
+		])("does not quarantine repeated %s push failures", async (_kind, makeError) => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs("actual_resolved");
+			addFile(localFs, "flaky.md", "body", 1000);
+
+			const settings = baseMockSettings({
+				backendType: "test",
+				vaultId: `test-${Math.random()}`,
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			const originalWrite = remoteFs.write.bind(remoteFs);
+			let attempts = 0;
+			const writeSpy = vi.spyOn(remoteFs, "write").mockImplementation((path, content, mtime) => {
+				attempts++;
+				return attempts <= 6
+					? Promise.reject(makeError())
+					: originalWrite(path, content, mtime);
+			});
+
+			await orchestrator.runSync();
+			await orchestrator.runSync();
+			await orchestrator.runSync();
+
+			expect(writeSpy).toHaveBeenCalledTimes(7);
+			expect(remoteFs.files.has("flaky.md")).toBe(true);
+			expect(deps.onStatusChange).toHaveBeenCalledWith("idle");
+			await orchestrator.close();
+		});
+
+		it("does not quarantine persistent pull failures", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(remoteFs, "remote.md", "body", 1000);
+
+			const settings = baseMockSettings({
+				backendType: "test",
+				vaultId: `test-${Math.random()}`,
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			const readSpy = vi.spyOn(remoteFs, "read").mockRejectedValue(
+				Object.assign(new Error("backend protocol mismatch"), { permanent: true })
+			);
+
+			await orchestrator.runSync();
+			await orchestrator.runSync();
+			await orchestrator.runSync();
+
+			expect(readSpy).toHaveBeenCalledTimes(3);
+			expect(deps.onStatusChange).toHaveBeenCalledWith("partial_error");
+			await orchestrator.close();
+		});
+
+		it("does not advance the committed cursor when a cycle has failures", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(localFs, "push.md", "body", 1000); // local-only → planned push
+
+			// Pull/scan succeed; the push write fails → result.failed.length === 1.
+			vi.spyOn(remoteFs, "write").mockRejectedValue(new Error("network dropped"));
+
+			const settings = baseMockSettings({
+				backendType: "test",
+				vaultId: `test-${Math.random()}`,
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+
+			// The cursor now commits inside commitCheckpoint (atomically with the cache).
+			// A failed cycle must NOT call it — that is exactly how the cursor is held back.
+			const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+
+			await orchestrator.runSync();
+
+			// A failed action ⇒ the checkpoint (cursor + cache) is never committed.
+			expect(commitCheckpoint).not.toHaveBeenCalled();
+			await orchestrator.close();
+		});
+
+		/**
+		 * The cursor commits atomically with the file map INSIDE commitCheckpoint (one
+		 * IndexedDB transaction — ADR 0001). If that flush fails it must propagate so
+		 * the cycle surfaces an error and the later token-state persist is skipped —
+		 * nothing is committed, so a restart's replay re-detects the un-flushed work.
+		 * See docs/adr/0001-metadata-cache-is-subordinate-to-commit-last.md.
+		 */
+		it("does not advance the committed cursor when the checkpoint flush (cache persist) fails", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			// Steady state, matching baseline → a CLEAN cycle (no failed actions), so the
+			// orchestrator reaches commitCheckpoint.
+			addFile(localFs, "synced.md", "kept", 1000);
+			addFile(remoteFs, "synced.md", "kept", 1000);
+
+			const settings = baseMockSettings({
+				backendType: "test",
+				vaultId: `test-${Math.random()}`,
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+
+			const commitCheckpoint = vi.fn().mockRejectedValue(new Error("IndexedDB write failed"));
+			remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+			const abortWorkingView = vi.fn().mockResolvedValue(undefined);
+			remoteFs.checkpoint!.abortWorkingView = abortWorkingView;
+			// readBackendState persists token state AFTER the checkpoint; a failed flush
+			// must abort before it runs, so the cursor (committed inside commitCheckpoint)
+			// is never advanced.
+			const readBackendState = vi.fn().mockReturnValue({});
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () =>
+					mockProvider({
+						readBackendState: readBackendState,
+					}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "synced.md",
+				hash: "",
+				localMtime: 1000,
+				remoteMtime: 1000,
+				localSize: 4,
+				remoteSize: 4,
+				remoteIdentityKey: "id:synced.md",
+				syncedAt: 900,
+			});
+
+			await orchestrator.runSync();
+
+			expect(commitCheckpoint).toHaveBeenCalledTimes(3);
+			expect(abortWorkingView).toHaveBeenCalledTimes(3);
+			// The flush threw → the post-checkpoint persist step never ran, and the cycle
+			// surfaces an error rather than silently reporting success.
+			expect(readBackendState).not.toHaveBeenCalled();
+			expect(deps.onStatusChange).toHaveBeenCalledWith("error");
+			await orchestrator.close();
+		});
+
+		it("aborts an observation attempt before classifying its error", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(localFs, "synced.md", "kept", 1000);
+			addFile(remoteFs, "synced.md", "kept", 1000);
+
+			const settings = baseMockSettings({
+				backendType: "test",
+				vaultId: `test-${Math.random()}`,
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			const order: string[] = [];
+			remoteFs.checkpoint!.getChangedPaths = vi.fn().mockRejectedValue(
+				Object.assign(new Error("delta failed"), { permanent: true }),
+			);
+			remoteFs.checkpoint!.abortWorkingView = vi.fn().mockImplementation(() => {
+				order.push("abort");
+				return Promise.resolve();
+			});
+			const classifyError = vi.fn().mockImplementation(() => {
+				order.push("classify");
+				return { kind: "permanent" as const };
+			});
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({ classifyError }),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "synced.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 4, remoteSize: 4, remoteIdentityKey: "id:synced.md", syncedAt: 900,
+			});
+
+			await orchestrator.runSync();
+
+			expect(order).toEqual(["abort", "classify"]);
+			expect(deps.onStatusChange).toHaveBeenCalledWith("error");
+			await orchestrator.close();
+		});
+
+		it("propagates an abort failure without retrying or aborting twice", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(localFs, "push.md", "body", 1000);
+			vi.spyOn(remoteFs, "write").mockRejectedValue(new Error("write failed"));
+			const abortError = new Error("abort invariant failed");
+			const abortWorkingView = vi.fn().mockRejectedValue(abortError);
+			remoteFs.checkpoint!.abortWorkingView = abortWorkingView;
+			const classifyError = vi.fn().mockReturnValue({ kind: "transient" });
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+			});
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({ classifyError }),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+
+			await expect(orchestrator.runSync()).rejects.toBe(abortError);
+
+			expect(abortWorkingView).toHaveBeenCalledOnce();
+			// The action's own bounded I/O retry classified the write failure three times;
+			// the abort failure itself must add no cycle-level classification or retry.
+			expect(classifyError).toHaveBeenCalledTimes(3);
+			await orchestrator.close();
+		});
+
+		it("keeps the initial cold acquisition mode across an in-call retry", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			const hasCheckpoint = vi.fn().mockResolvedValue(false);
+			remoteFs.checkpoint!.hasCheckpoint = hasCheckpoint;
+			remoteFs.checkpoint!.commitCheckpoint = vi.fn()
+				.mockRejectedValueOnce(new Error("commit failed"))
+				.mockResolvedValue(undefined);
+			const remoteList = vi.spyOn(remoteFs, "list");
+			const settings = baseMockSettings({
+				backendType: "test", vaultId: `test-${Math.random()}`,
+			});
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+
+			await orchestrator.runSync();
+
+			expect(hasCheckpoint).toHaveBeenCalledOnce();
+			expect(remoteList).toHaveBeenCalledTimes(2);
+			await orchestrator.close();
+		});
+
+		it.each(["backend state", "settings"] as const)(
+			"does not abort a committed working view when %s persistence fails",
+			async (failurePoint) => {
+				const localFs = createMockLocalFs();
+				const remoteFs = createMockRemoteFs();
+				const settings = baseMockSettings({
+					backendType: "test",
+					vaultId: `test-${Math.random()}`,
+				});
+				remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+				const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+				const abortWorkingView = vi.fn().mockResolvedValue(undefined);
+				remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+				remoteFs.checkpoint!.abortWorkingView = abortWorkingView;
+				const persistenceError = Object.assign(new Error(`${failurePoint} failed`), { permanent: true });
+				const readBackendState = failurePoint === "backend state"
+					? vi.fn().mockImplementation(() => { throw persistenceError; })
+					: vi.fn().mockReturnValue({});
+				const saveSettings = failurePoint === "settings"
+					? vi.fn().mockRejectedValue(persistenceError)
+					: vi.fn().mockResolvedValue(undefined);
+				const deps = createDeps({
+					getSettings: () => settings,
+					saveSettings,
+					localFs: () => localFs,
+					remoteFs: () => remoteFs,
+					backendProvider: () => mockProvider({
+						readBackendState,
+						classifyError: () => ({ kind: "permanent" }),
+					}),
+				});
+				const orchestrator = new SyncOrchestrator(deps);
+
+				await orchestrator.runSync();
+
+				expect(commitCheckpoint).toHaveBeenCalledOnce();
+				expect(abortWorkingView).not.toHaveBeenCalled();
+				expect(deps.onStatusChange).toHaveBeenCalledWith("error");
+				await orchestrator.close();
+			},
+		);
+	});
+
+	describe("scope-fingerprint forces a cold reconcile on scope change", () => {
+		/**
+		 * A stateful scope-fingerprint mock mirroring CachingRemoteFs's real semantics:
+		 * `commitCheckpoint({scopeFingerprint})` persists it, `getScopeFingerprint()`
+		 * reads back the last committed value (or the seed, or null).
+		 */
+		function wireScopeFingerprint(
+			remoteFs: MockFileSystem,
+			seed: string | null,
+		): void {
+			let committed = seed;
+			remoteFs.checkpoint!.getScopeFingerprint = vi.fn().mockImplementation(() => Promise.resolve(committed));
+			remoteFs.checkpoint!.commitCheckpoint = vi.fn().mockImplementation(
+				(context?: { scopeFingerprint?: string }) => {
+					if (context?.scopeFingerprint !== undefined) committed = context.scopeFingerprint;
+					return Promise.resolve();
+				},
+			);
+		}
+
+		it("reruns cold and pulls a remote-only path once enableConfigSync widens scope", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			// A remote-only file under the config dir — always existed on the remote,
+			// but out of scope until enableConfigSync is turned on. The delta cursor has
+			// already passed it (empty getChangedPaths), so only a forced cold reconcile
+			// can surface it.
+			addFile(remoteFs, `${TEST_CONFIG_DIR}/hotkeys.json`, "keys", 1000);
+
+			const settings = baseMockSettings({
+				backendType: "test",
+				vaultId: `test-${Math.random()}`,
+				enableConfigSync: false,
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			wireScopeFingerprint(remoteFs, null);
+
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+
+			// Cycle 1 with config sync off: commits a fingerprint, config dir stays
+			// out of scope, nothing pulled.
+			await orchestrator.runSync();
+			expect(localFs.files.has(`${TEST_CONFIG_DIR}/hotkeys.json`)).toBe(false);
+
+			// Turn on config sync — scope widens to include the config dir.
+			settings.enableConfigSync = true;
+			await orchestrator.runSync();
+
+			expect(localFs.files.has(`${TEST_CONFIG_DIR}/hotkeys.json`)).toBe(true);
+			await orchestrator.close();
+		});
+
+		it("reruns cold and pulls a remote-only snippet once its config scope is enabled", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			const path = `${TEST_CONFIG_DIR}/snippets/example.css`;
+			addFile(remoteFs, path, "css", 1000);
+
+			const settings = baseMockSettings({
+				backendType: "test",
+				vaultId: `test-${Math.random()}`,
+				enableConfigSync: true,
+				syncConfigSnippets: false,
+			});
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			wireScopeFingerprint(remoteFs, null);
+
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+
+			await orchestrator.runSync();
+			expect(localFs.files.has(path)).toBe(false);
+
+			settings.syncConfigSnippets = true;
+			await orchestrator.runSync();
+
+			expect(localFs.files.has(path)).toBe(true);
+			await orchestrator.close();
+		});
+
+		it("does not force cold when settings are unchanged between cycles", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs("actual_resolved");
+			addFile(remoteFs, "synced.md", "kept", 1000);
+			addFile(localFs, "synced.md", "kept", 1000);
+
+			const settings = baseMockSettings({ backendType: "test", vaultId: `test-${Math.random()}` });
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			wireScopeFingerprint(remoteFs, null);
+			const commitCheckpoint = vi.spyOn(remoteFs.checkpoint!, "commitCheckpoint");
+
+			const infoSpy = vi.fn();
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({}),
+				logger: {
+					enabled: () => true, debug: vi.fn(),
+					info: infoSpy,
+					warn: vi.fn(),
+					error: vi.fn(),
+					flush: vi.fn().mockResolvedValue(undefined),
+				} as unknown as import("../logging/logger").Logger,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+
+			await orchestrator.runSync(); // cycle 1: commits the fingerprint (migration)
+			expect(commitCheckpoint).toHaveBeenCalledOnce();
+			infoSpy.mockClear();
+
+			await orchestrator.runSync(); // cycle 2: settings unchanged → no scope change
+			const startedCall = infoSpy.mock.calls.find((c) => c[0] === "Sync started");
+			expect(startedCall?.[1]).toMatchObject({ scopeChanged: false });
+			await orchestrator.close();
+		});
+
+		it("treats a checkpoint with no committed fingerprint as changed (one-time migration)", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(remoteFs, `${TEST_CONFIG_DIR}/hotkeys.json`, "keys", 1000);
+
+			const settings = baseMockSettings({
+				backendType: "test",
+				vaultId: `test-${Math.random()}`,
+				enableConfigSync: true,
+			});
+			// Simulates a checkpoint committed by pre-fix code: hasCheckpoint is true,
+			// but getScopeFingerprint has never been set (always null).
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			wireScopeFingerprint(remoteFs, null);
+
+			const deps = createDeps({
+				getSettings: () => settings,
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => mockProvider({}),
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+
+			await orchestrator.runSync();
+
+			expect(localFs.files.has(`${TEST_CONFIG_DIR}/hotkeys.json`)).toBe(true);
+			expect(await remoteFs.checkpoint!.getScopeFingerprint!()).not.toBeNull();
+			await orchestrator.close();
+		});
+	});
+
+	describe("phantom warm deletion is prevented (not recovered)", () => {
+		it("does not delete a file missing from the listing but present on disk", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			const deps = createDeps({
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+
+			// Steady state: a.md synced on both sides with a matching baseline.
+			addFile(remoteFs, "a.md", "hello", 1000);
+			addFile(localFs, "a.md", "hello", 1000); // present on disk (stat finds it)
+			await orchestrator.state.put({
+				path: "a.md",
+				hash: "",
+				localMtime: 1000,
+				remoteMtime: 1000,
+				localSize: 5,
+				remoteSize: 5,
+				remoteIdentityKey: "id:a.md",
+				syncedAt: 900,
+			});
+
+			// Incomplete listing (index not fully loaded) — but stat() still finds
+			// a.md, so the warm confirm pass cancels the would-be deletion.
+			vi.spyOn(localFs, "list").mockResolvedValueOnce([]);
+			await orchestrator.runSync();
+
+			expect(remoteFs.files.has("a.md")).toBe(true); // NOT deleted
+			expect(await orchestrator.state.get("a.md")).toBeDefined(); // baseline intact
+			await orchestrator.close();
+		});
+	});
+
+	describe("empty-parent prune through the full cycle", () => {
+		it("prunes the remote folder a propagated local delete emptied, keeping the local folder", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(localFs, "notes/a.md", "x", 1000);
+			addFile(remoteFs, "notes/a.md", "x", 1000);
+			const settings = baseMockSettings({ backendType: "test", vaultId: `test-${Math.random()}` });
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "notes/a.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 1, remoteSize: 1, remoteIdentityKey: "id:notes/a.md", syncedAt: 900,
+			});
+			// The user deletes the last file locally; the local `notes/` folder remains.
+			await localFs.delete("notes/a.md");
+
+			await orchestrator.runSync();
+
+			expect(remoteFs.files.has("notes/a.md")).toBe(false);
+			expect(remoteFs.files.has("notes")).toBe(false);
+			expect(localFs.files.has("notes")).toBe(true);
+			await orchestrator.close();
+		});
+
+		it("prunes the local folder a propagated remote delete emptied, keeping the remote folder", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			addFile(localFs, "notes/a.md", "x", 1000);
+			addFile(remoteFs, "notes/a.md", "x", 1000);
+			const settings = baseMockSettings({ backendType: "test", vaultId: `test-${Math.random()}` });
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(true);
+			remoteFs.checkpoint!.getChangedPaths = vi.fn().mockResolvedValue({
+				modified: [], deleted: ["notes/a.md"],
+			});
+			remoteFs.checkpoint!.commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "notes/a.md", hash: "", localMtime: 1000, remoteMtime: 1000,
+				localSize: 1, remoteSize: 1, remoteIdentityKey: "id:notes/a.md", syncedAt: 900,
+			});
+			// The remote side deletes the last file; the remote `notes/` folder remains.
+			await remoteFs.delete("notes/a.md");
+
+			await orchestrator.runSync();
+
+			expect(localFs.files.has("notes/a.md")).toBe(false);
+			expect(localFs.files.has("notes")).toBe(false);
+			expect(remoteFs.files.has("notes")).toBe(true);
+			await orchestrator.close();
+		});
+
+		it("prunes the source folder of a propagated local rename on the receiving side only", async () => {
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			const hash = await sha256(new TextEncoder().encode("x").buffer);
+			addFile(localFs, "archive/a.md", "x", 2000);
+			await localFs.mkdir("notes"); // the user's now-empty source folder remains locally
+			addFile(remoteFs, "notes/a.md", "x", 1000);
+			const settings = baseMockSettings({ backendType: "test", vaultId: `test-${Math.random()}` });
+			const tracker = new LocalChangeTracker();
+			tracker.markRenamed("archive/a.md", "notes/a.md");
+			const deps = createDeps({
+				getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+				localTracker: tracker,
+			});
+			const orchestrator = new SyncOrchestrator(deps);
+			await orchestrator.state.put({
+				path: "notes/a.md", hash, localMtime: 1000, remoteMtime: 1000,
+				localSize: 1, remoteSize: 1, remoteIdentityKey: "id:notes/a.md", syncedAt: 900,
+			});
+
+			await orchestrator.runSync();
+
+			expect(remoteFs.files.has("archive/a.md")).toBe(true);
+			expect(remoteFs.files.has("notes")).toBe(false);
+			expect(localFs.files.has("notes")).toBe(true);
+			await orchestrator.close();
+		});
+	});
+});

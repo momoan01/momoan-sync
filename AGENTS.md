@@ -1,0 +1,228 @@
+# Air Sync — Obsidian Plugin
+
+An Obsidian community plugin for bidirectional sync between vaults and cloud storage.
+
+This file is the **agent operating guide** for this repo. Where to look:
+
+| You need… | Read |
+|---|---|
+| What the plugin does, setup, settings (end users) | [README.md](README.md) |
+| How to contribute (human developers) | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Design principles, module map, data models, interfaces | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| The enforced rules (lint / type / design guards) and how to declare an exception | [docs/code-enforcement.md](docs/code-enforcement.md) |
+| Subsystem deep dives (sync pipeline, conflicts, Google Drive, errors) | [docs/](docs/) |
+| Running the opt-in e2e against the real Google Drive/Dropbox/OneDrive APIs | [docs/e2e-testing.md](docs/e2e-testing.md) |
+| Architecture Decision Records (why a design is the way it is — read before "optimizing" it) | [docs/adr/](docs/adr/) |
+| Generic Obsidian-plugin conventions (cross-tool baseline) | [BASE_AGENTS.md](BASE_AGENTS.md) |
+
+## Commands
+
+```bash
+npm install        # Install dependencies
+npm run dev        # Development (watch)
+npm run build      # Production build (tsc -noEmit -skipLibCheck && node esbuild.config.mjs production)
+npm test           # vitest
+npm run test:watch # vitest watch
+npm run lint       # eslint --max-warnings 0
+npm run lint:bot-repro # community Dashboard source scan with dependency types present/absent
+npm run test:e2e   # opt-in e2e vs real Google Drive/Dropbox/OneDrive (creds-gated; NOT in the gate/CI; backends run in parallel — see docs/e2e-testing.md)
+npm run test:e2e:google   # …only Google Drive
+npm run test:e2e:dropbox  # …only Dropbox
+npm run test:e2e:onedrive # …only OneDrive
+```
+
+## The gate
+
+Always pass `npm run lint && npm run lint:bot-repro && npm run build && npm run test:coverage` after
+making changes. `npm run lint` includes `eslint-plugin-obsidianmd`; `lint:bot-repro`
+also verifies production source when runtime or Vitest dependency declarations are
+independently unavailable, matching the community Dashboard failure mode. Both must be green before pushing. The
+full set of enforced rules, the test-pinned principles, and how to declare an exception live in
+[docs/code-enforcement.md](docs/code-enforcement.md). **Fix the code rather than
+disabling a rule.**
+
+When adding or replacing a remote filesystem implementation, update the exact
+implementation-family catalog, all five shared `*.contract-harness.ts` registrations,
+the central required-contract matrix, and that backend's opt-in live E2E; then verify
+that the generic registry guard passes. Extend a registry fixture only when the backend
+needs backend-specific construction data. Contract definitions and harnesses are test
+infrastructure under `tests/fs/`; remote backend harnesses are registered only by the
+central `tests/fs/remote-backend-contracts.test.ts` unit composition root.
+
+## Coding conventions
+
+- TypeScript strict mode; prefer `async/await`.
+- `main.ts` handles lifecycle only; delegate logic to separate modules. The ~200-300
+  line lint cap is a prompt to consider a responsibility split, not a reduction target:
+  split a concept out if natural, else raise the per-file cap with a justifying comment —
+  never contort code to shave lines (see [code-enforcement.md](docs/code-enforcement.md) §6).
+- Register listeners via `this.register*` (prevent leaks).
+- Mobile compatible (`isDesktopOnly: false`) — no Node/Electron APIs (lint-enforced).
+- Minimize network calls; require explicit disclosure. Use `requestUrl()`, never `fetch`.
+- Command IDs are immutable once published.
+- **The Backend Module API is the backend extension boundary.** `src/backend-api/`
+  (`BackendModule` / `BackendRuntimeContext` / `RemoteBackendAdapter`) is the public
+  contract; its imports must stay inside itself (guarded by
+  `backend-module-boundary-guard.test.mjs` in `npm run lint:bot-repro`). A backend
+  module implements provider operations only — never `IFileSystem`, the metadata cache,
+  cursor, scope, checkpoint, or stores; core owns those via `ManagedRemoteFs`. Module
+  runtime shape is validated (`src/fs/modules/validate-module.ts`), not merely typed.
+  Canonical ids are `googledrive`/`onedrive`/`dropbox`; `*-custom` are settings aliases
+  only and are never registered as modules. See
+  [adr-20260920-backend-module-boundary.md](docs/adr/adr-20260920-backend-module-boundary.md).
+- **The remote filesystem owns the path↔identity bijection and namespace reconciliation.**
+  A filesystem holds one object per path, so the remote filesystem — the backend layer in
+  front of the sync engine — is the only layer that observes two live provider objects
+  claiming one derived address, and the only layer allowed to settle it. It renames the
+  non-keeper on the backend through the identity-addressed rename capability, updates its
+  derived cache from the provider's answer, aborts its working view, and reports that the
+  cycle must be retried. The sync engine consumes only a 1:1 view — `list`, `stat` and
+  `getChangedPaths` carry no collision — and must not plan or publish for a cycle the
+  filesystem reports as reconciled. The keeper policy (the claimant holding a committed
+  `SyncRecord`) and the scope filter are per-call arguments; the filesystem reads no sync
+  state and persists no collision record. This is one backend rename issued from the
+  backend layer, not an admitted sync action. See
+  [adr-20260922-backend-layer-namespace-reconciliation.md](docs/adr/adr-20260922-backend-layer-namespace-reconciliation.md).
+- **Sync durable authority is closed to two states:** the remote delta cursor commits
+  only after a wholly clean cycle, and each file's `SyncRecord` commits only after its
+  admitted I/O succeeds. The remote metadata cache is a derived projection, written as
+  a complete final snapshot atomically with the cursor; it is never an authority or a
+  mutation ledger. Keep `sync-state-ownership-guard.test.mjs` green. Its TypeScript AST
+  inventory covers every `SyncOrchestrator` instance field, every `commitCheckpoint`
+  property/element access, and the production import, reference, constructor, and mutation
+  ownership of `SyncStateStore`, `MetadataStore`, `IDBHelper`, and direct `indexedDB.open`.
+  Any intentional new cursor/`SyncStateStore` writer, persistent-store owner, or
+  orchestrator field requires the guard fixture plus ADR 0001 and enforcement-document
+  updates in the same change.
+- **Cycle evidence never becomes another state owner.** Observation records only
+  current facts; Admission alone may normalize an identity candidate and authorize its action.
+  Never persist evidence, Admission dispositions/failure reasons (including
+  `identity_postcondition_unproven`), pending work, or recovery instructions. Do not add
+  another in-memory correctness owner: keep only bounded execution bookkeeping that is
+	  discarded with the cycle.
+- **Every remote working view is attempt-bounded.** A checkpoint-capable attempt must
+  finish with exactly one lifecycle result: commit only after a wholly clean cycle, or
+  abort on every incomplete outcome/exception before classification or retry. Abort may
+  clear only live derived cache/cursor/scope state; it must not clear the durable
+  checkpoint or mutate the provider. (A namespace reconciliation rename is the remote
+  filesystem's own operation, described above, not part of abort; its cycle does not
+  commit.) Wait for scheduled sibling effects to settle before
+  aborting. Never add a prior-failure/recovery field to compensate for an unclosed view.
+- **Re-evaluate current facts; do not add stopped-state recovery branches.** COLD,
+  WARM, and HOT are acquisition strategies only. They must produce the same Admission
+  decision for the same complete component facts. A decision may depend on that
+  component's current endpoints and committed `SyncRecord`, never on a prior error,
+  Admission failure, database version, global record count, or recovery marker. A
+  schema cold-start uses the same rules as any vault with those current facts.
+- No migration code — on IndexedDB schema changes, cold-start (drop all stores and
+  recreate). Settings schema changes use sensible defaults for missing fields via
+  `Object.assign({}, DEFAULT_SETTINGS, stored)`.
+  - **Sanctioned exception: `settings-normalize.ts`.** Three one-time *normalizations*
+    run on load: `liftActiveBackendData` (lifts the active backend out of the old
+    nested per-type `backendData` map into the flat single-bag shape, discarding the
+    rest), `normalizeConflictStrategy` (coerces the removed `"ask"` strategy to its
+    effective `"duplicate"`), and `normalizeBackendModuleSettings` (canonicalizes a
+    legacy `*-custom` id to its module id and coerces the one `authMode` representation
+    — a stored `"custom"`/`"default"` string, or the boolean implied by a legacy alias —
+    to the persisted boolean, preserving every other field). These reshape-or-discard an
+    incompatible old shape rather than transforming data field-by-field, and exist so a
+    vault upgrading from the old shape stays connected instead of silently breaking the
+    resolver / stranding foreign-backend params. All three are idempotent (a no-op on the
+    current shape). Do not grow this list without the same "reshape/discard, not
+    transform" justification.
+- Sync correctness has exactly two durable publication points: a file's `SyncRecord`
+  after that admitted action succeeds, and the remote cursor/derived cache/scope
+  checkpoint after a wholly clean cycle. Do not persist operation intent, rename
+  evidence, Admission failures, retry instructions, or recovery markers. COLD/WARM/HOT
+  must re-observe current facts and enter the same Admission contract.
+- Within Admission, `identity-component-decision.ts` alone binds current identity and
+  topology before calling the pure content comparer. `identity-component-report-family.ts`
+  is subordinate, not another policy stage. Fact graphs and observations cannot carry
+  proposed actions. Retired optimizer/normalization APIs must not return; the AST guard
+  pins these imports and fact-only carriers and prohibits retained proof state.
+- Execute the exact admitted component order through publication: independent singleton
+  transfers and same-key matches may pool; settle them and active priority effects before
+  the globally serial component interval. Defer priority throughout that interval. A
+  failed action blocks its suffix. Parent publication consumes existing ordered successful
+  child receipts, never a separate registry. Exact source/destination CAS is storage
+  mechanism, not identity policy. No action-kind regrouping, DAG, or recovery queue.
+- Every conflict uses the same capture, policy-required preservation, executor effects,
+  terminal proof, and publication route. The resolver never mutates original paths.
+  Do not reintroduce an ordinary/rename execution switch or compensating rollback.
+  Read witnesses remain only in the current result; preservation outputs are verified
+  before destructive work and before publication. A newly observed destination is a
+  precondition failure, never permission to delete an unadmitted version.
+
+### Project-specific gotchas
+
+- **The vault index can under-report before layout-ready and can retain stale casing
+  aliases after a case-only rename.** Read it only via
+  `LocalFs.list()` (lint-enforced — `getAllLoadedFiles()` is restricted outside
+  `src/fs/local/`). `LocalFs.list()` does NOT gate on layout-ready itself — it's a
+  pure low-level read; the **gate is the orchestrator** (`runSync`/`shouldSync`
+  early-return until `isLayoutReady`), and the only path to `list()` runs through it.
+  For case-fold collisions, `LocalFs.list()` resolves actual spelling through the raw
+  adapter and removes only aliases that resolve to the same physical path; it must keep
+  genuinely distinct case-sensitive siblings. `LocalFs.stat()` likewise uses the raw
+  adapter as the authoritative casing/absence boundary.
+  Any new caller of `list()` must likewise be in a layout-ready-gated context. Also
+  never derive a deletion from listing-absence alone — confirm against the
+  authoritative `LocalFs.stat()` (falls back to the adapter).
+- **Dot-prefixed/hidden paths** (`.airsync`, `.obsidian`, nested `foo/.bar`) are
+  excluded from the vault index: `vault.createBinary()` returns `null` or throws
+  `File already exists` for them. `LocalFs` composes two authorities: the disk
+  authority (`DiskSurface`, the raw `DataAdapter`) owns existence, actual casing,
+  occupancy, and mutation of paths the index cannot represent; the index authority
+  (`VaultSurface`, `Vault`/`FileManager`) owns mutation of representable paths (so the
+  index and its events stay coherent) and the discovery snapshot. Routing a path by
+  `isDotPrefixed()` between them is mechanism, not policy. Whether a hidden path *syncs*
+  is separate policy (`syncDotPaths` + `ignorePatterns`, both must pass), enforced in
+  `SyncOrchestrator.isExcluded()`.
+- **Requested paths are addresses, not topology facts.** A cache-backed backend may
+  use caller spelling to locate an object, but `requested_echo` must never re-key a
+  stable identity or its descendants. Only provider-resolved metadata, or the
+  successful endpoint of an explicit provider rename, may change cached topology.
+  Case-only parent transitions are decided once by Admission from complete current-cycle
+  facts: child content is handled at the existing provider path, followed by one parent
+  folder rename. Do not add per-child recovery, a new status/action, or cross-cycle state.
+- **Directory occupancy is a first-class filesystem semantic.** `IFileSystem.hasChildren`
+  answers "does this directory hold anything" from the backend's authority — the disk
+  authority for the local vault (the index omits hidden children), the derived cache for
+  a remote backend — with no per-child metadata. Empty-parent cleanup is a consequence of
+  an admitted delete/file-rename, not a new action kind: Admission attaches
+  `pruneEmptyAncestors` (the removed source path's deepest-first ancestry, scope-filtered,
+  root-excluded) and execution runs one deduplicated pass after all serial removals —
+  each candidate directory read at most once per cycle — deleting a directory only after
+  `IFileSystem.hasChildren` proves it empty. It runs on the action's target filesystem —
+  the side emptied by the opposite-side operation — so the origin side keeps its folder.
+  Never prune from listing absence, the sync root, an out-of-scope directory, or a
+  directory holding an ignored/hidden child.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the rationale behind these.
+
+## Build artifacts
+
+`main.js`, `manifest.json`, `styles.css` → placed in the vault's
+`.obsidian/plugins/air-sync/` (the folder name matches the manifest `id`). Never commit
+`node_modules/` or `main.js`.
+
+## Releases
+
+Releases are tag-driven: pushing a tag that matches the version triggers
+`.github/workflows/release.yml`, which builds and publishes a GitHub release with
+`main.js`, `manifest.json`, `styles.css` attached (with build provenance). The workflow
+creates the release with an **empty body** — release notes are added afterward.
+
+Steps:
+
+1. Bump the version (SemVer, no `v` prefix) in every file that carries it:
+   - `manifest.json` → `version`
+   - `package.json` → `version`
+   - `package-lock.json` → both `version` fields (root and `packages.""`)
+   - `versions.json` → add a `"x.y.z": "<minAppVersion>"` entry by hand (the `npm version` / `version-bump.mjs` script only adds it when `minAppVersion` changes, so it won't for a same-minAppVersion bump)
+2. Gate: `npm run lint && npm run lint:bot-repro && npm run build && npm run test:coverage` must all pass before tagging.
+3. Commit as `Bump version to x.y.z`, push to `main`.
+4. Tag `x.y.z` (must match the version exactly, no `v` prefix) and push the tag — this fires the release workflow.
+5. After the run finishes (`gh run watch <id>`), attach notes: `gh release edit x.y.z --notes-file <file>`.
+
+Release notes are public and user-facing (English): lead with what changed for the user, group under Fixed / Added, keep mechanism detail brief.

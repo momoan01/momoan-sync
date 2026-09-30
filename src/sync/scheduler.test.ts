@@ -1,0 +1,739 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import "fake-indexeddb/auto";
+
+// DOM-event handlers captured via the registerWindowEvent / registerDocumentEvent
+// deps below (in production the plugin wires these through Component#registerDomEvent).
+const windowListeners = new Map<string, EventListener>();
+const documentListeners = new Map<string, EventListener>();
+
+// The visibility handler reads document.visibilityState; stub a visible document.
+vi.stubGlobal("document", { visibilityState: "visible" as string });
+
+import { SyncScheduler } from "./scheduler";
+import { SyncOrchestrator as RuntimeSyncOrchestrator } from "./orchestrator";
+import type { SyncSchedulerDeps } from "./scheduler";
+import type { TAbstractFile } from "obsidian";
+import { TFolder } from "../platform/obsidian";
+import { LocalChangeTracker } from "./local-tracker";
+import { createChecksumRegistry } from "../fs/modules/checksum-registry";
+
+const checksumRegistry = createChecksumRegistry();
+import {
+	addFile, createMockLocalFs, createMockRemoteFs, mockSettings, readText,
+} from "../__mocks__/sync-test-helpers";
+
+type VaultHandler = (file: TAbstractFile) => void;
+type RenameHandler = (file: TAbstractFile, oldPath: string) => void;
+type WorkspaceHandler = (...args: unknown[]) => Promise<void> | void;
+type TestFolder = TAbstractFile & { children: TAbstractFile[] };
+
+const TestFolderConstructor = TFolder as unknown as new (path: string) => TestFolder;
+
+function createDeps(
+	overrides: Partial<SyncSchedulerDeps> = {},
+	opts: { layoutReady?: boolean } = {},
+) {
+	const vaultHandlers = new Map<string, WorkspaceHandler>();
+	const workspaceHandlers = new Map<string, WorkspaceHandler>();
+	let layoutReady = opts.layoutReady ?? true;
+	const layoutReadyCbs: (() => void)[] = [];
+	const fireLayoutReady = () => {
+		layoutReady = true;
+		const cbs = layoutReadyCbs.splice(0);
+		for (const cb of cbs) cb();
+	};
+
+	const runSync = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
+	const pullSingle = vi
+		.fn<(path: string) => Promise<"untracked" | undefined>>()
+		.mockResolvedValue(undefined);
+
+	const deps: SyncSchedulerDeps & {
+		vaultHandlers: Map<string, WorkspaceHandler>;
+		workspaceHandlers: Map<string, WorkspaceHandler>;
+		runSync: typeof runSync;
+		pullSingle: typeof pullSingle;
+		fireLayoutReady: () => void;
+	} = {
+		workspace: {
+			on: vi.fn((event: string, handler: WorkspaceHandler) => {
+				workspaceHandlers.set(event, handler);
+				return {};
+			}),
+			get layoutReady() {
+				return layoutReady;
+			},
+			onLayoutReady: (cb: () => void) => {
+				if (layoutReady) cb();
+				else layoutReadyCbs.push(cb);
+			},
+		},
+		vault: {
+			on: vi.fn((event: string, handler: WorkspaceHandler) => {
+				vaultHandlers.set(event, handler);
+				return {};
+			}),
+		} as unknown as SyncSchedulerDeps["vault"],
+		remoteFs: () => createMockRemoteFs(),
+		localTracker: new LocalChangeTracker(),
+		orchestrator: { runSync, pullSingle, isSyncing: () => false },
+		isExcluded: () => false,
+		registerEvent: vi.fn(),
+		registerWindowEvent: (type: keyof WindowEventMap, cb: () => void) => {
+			windowListeners.set(type, cb);
+		},
+		registerDocumentEvent: (type: keyof DocumentEventMap, cb: () => void) => {
+			documentListeners.set(type, cb);
+		},
+		vaultHandlers,
+		workspaceHandlers,
+		runSync,
+		pullSingle,
+		fireLayoutReady,
+		...overrides,
+	};
+	return deps;
+}
+
+function makeFile(path: string): TAbstractFile {
+	return { path } as TAbstractFile;
+}
+
+function makeFolder(path: string, children: Array<string | TAbstractFile> = []): TAbstractFile {
+	const folder = new TestFolderConstructor(path);
+	folder.children = children.map((child) => typeof child === "string" ? makeFile(child) : child);
+	return folder;
+}
+
+describe("SyncScheduler", () => {
+	let deps: ReturnType<typeof createDeps>;
+	let scheduler: SyncScheduler;
+
+	beforeEach(() => {
+		vi.useFakeTimers();
+		// Reset captured handlers so a stale closure from a prior test can't leak.
+		windowListeners.clear();
+		documentListeners.clear();
+		// Reset visibility (a test may set it hidden) so each starts foregrounded.
+		(document as unknown as { visibilityState: string }).visibilityState = "visible";
+		deps = createDeps();
+		scheduler = new SyncScheduler(deps);
+		scheduler.start();
+	});
+
+	// Foreground signals (focus / visibilitychange→visible) only sync after a
+	// departure (ADR 0007). These helpers drive a departure and a return.
+	const fireBlur = () => windowListeners.get("blur")!(new Event("blur"));
+	const fireFocus = () => windowListeners.get("focus")!(new Event("focus"));
+	const fireVisibility = (state: string) => {
+		(document as unknown as { visibilityState: string }).visibilityState = state;
+		documentListeners.get("visibilitychange")!(new Event("visibilitychange"));
+	};
+
+	describe("layout-ready gate", () => {
+		it("defers event wiring until the vault layout is ready", () => {
+			const d = createDeps({}, { layoutReady: false });
+			const s = new SyncScheduler(d);
+			s.start();
+
+			// Not ready: no events wired, so nothing can trigger a sync.
+			expect(d.vaultHandlers.size).toBe(0);
+
+			// Layout becomes ready → events wire and now drive sync.
+			d.fireLayoutReady();
+			const handler = d.vaultHandlers.get("modify") as VaultHandler;
+			expect(handler).toBeDefined();
+			handler(makeFile("note.md"));
+			vi.advanceTimersByTime(5000);
+			expect(d.runSync).toHaveBeenCalled();
+		});
+	});
+
+	describe("vault events", () => {
+		it("marks path dirty on create", () => {
+			const handler = deps.vaultHandlers.get("create") as VaultHandler;
+			handler(makeFile("note.md"));
+			expect(deps.localTracker.getDirtyPaths().has("note.md")).toBe(true);
+		});
+
+		it("marks path dirty on modify", () => {
+			const handler = deps.vaultHandlers.get("modify") as VaultHandler;
+			handler(makeFile("note.md"));
+			expect(deps.localTracker.getDirtyPaths().has("note.md")).toBe(true);
+		});
+
+		it("marks path dirty on delete", () => {
+			const handler = deps.vaultHandlers.get("delete") as VaultHandler;
+			handler(makeFile("note.md"));
+			expect(deps.localTracker.getDirtyPaths().has("note.md")).toBe(true);
+		});
+
+		it("records rename pair and marks both paths dirty on rename", () => {
+			const handler = deps.vaultHandlers.get("rename") as RenameHandler;
+			handler(makeFile("new.md"), "old.md");
+			expect(deps.localTracker.getDirtyPaths().has("new.md")).toBe(true);
+			expect(deps.localTracker.getDirtyPaths().has("old.md")).toBe(true);
+			expect(deps.localTracker.getRenamePairs().get("new.md")).toBe(
+				"old.md",
+			);
+		});
+
+		it("tracks only the included destination when the old endpoint is excluded", () => {
+			scheduler.destroy();
+			deps = createDeps({ isExcluded: (p: string) => p === "old.md" });
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+
+			const handler = deps.vaultHandlers.get("rename") as RenameHandler;
+			handler(makeFile("new.md"), "old.md");
+			expect(deps.localTracker.getDirtyPaths()).toEqual(new Set(["new.md"]));
+			expect(deps.localTracker.getRenamePairs().size).toBe(0);
+		});
+
+		it("tracks only the included source when the new endpoint is excluded", () => {
+			scheduler.destroy();
+			deps = createDeps({ isExcluded: (p: string) => p === "new.md" });
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+
+			const handler = deps.vaultHandlers.get("rename") as RenameHandler;
+			handler(makeFile("new.md"), "old.md");
+			expect(deps.localTracker.getDirtyPaths()).toEqual(new Set(["old.md"]));
+			expect(deps.localTracker.getRenamePairs().size).toBe(0);
+		});
+
+		it("ignores a rename when both endpoints are excluded", () => {
+			scheduler.destroy();
+			deps = createDeps({ isExcluded: () => true });
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+
+			const handler = deps.vaultHandlers.get("rename") as RenameHandler;
+			handler(makeFile("new.md"), "old.md");
+			vi.advanceTimersByTime(5000);
+
+			expect(deps.localTracker.getDirtyPaths().size).toBe(0);
+			expect(deps.localTracker.getRenamePairs().size).toBe(0);
+			expect(deps.runSync).not.toHaveBeenCalled();
+		});
+
+		it.each(["old", "new"] as const)(
+			"expands a folder rename to the included child when the %s tree is excluded",
+			(excluded) => {
+			scheduler.destroy();
+			deps = createDeps({ isExcluded: (path) => path === excluded || path.startsWith(`${excluded}/`) });
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+
+			const handler = deps.vaultHandlers.get("rename") as RenameHandler;
+			handler(makeFolder("new", ["new/a.md"]), "old");
+
+			expect(deps.localTracker.getFolderRenamePairs().size).toBe(0);
+			expect(deps.localTracker.getRenamePairs().size).toBe(0);
+			expect(deps.localTracker.getDirtyPaths()).toEqual(
+				new Set([excluded === "old" ? "new/a.md" : "old/a.md"]),
+			);
+			},
+		);
+
+		it("records only an included child rename when excluded roots contain it", () => {
+			scheduler.destroy();
+			deps = createDeps({
+				isExcluded: (path) => path === "old" || path === "new",
+			});
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+
+			const handler = deps.vaultHandlers.get("rename") as RenameHandler;
+			handler(makeFolder("new", ["new/a.md"]), "old");
+
+			expect(deps.localTracker.getFolderRenamePairs().size).toBe(0);
+			expect(deps.localTracker.getRenamePairs()).toEqual(new Map([["new/a.md", "old/a.md"]]));
+			expect(deps.localTracker.getDirtyPaths()).toEqual(new Set(["old/a.md", "new/a.md"]));
+		});
+
+		it("finds an included descendant below an excluded nested folder", () => {
+			scheduler.destroy();
+			deps = createDeps({
+				isExcluded: (path) => !path.endsWith("a.md"),
+			});
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+
+			const nested = makeFolder("new/nested", ["new/nested/a.md"]);
+			const handler = deps.vaultHandlers.get("rename") as RenameHandler;
+			handler(makeFolder("new", [nested]), "old");
+
+			expect(deps.localTracker.getFolderRenamePairs().size).toBe(0);
+			expect(deps.localTracker.getRenamePairs()).toEqual(
+				new Map([["new/nested/a.md", "old/nested/a.md"]]),
+			);
+		});
+
+		it("ignores a folder edge only when roots and descendants are all excluded", () => {
+			scheduler.destroy();
+			deps = createDeps({ isExcluded: () => true });
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+
+			const handler = deps.vaultHandlers.get("rename") as RenameHandler;
+			handler(makeFolder("new", ["new/a.md"]), "old");
+
+			expect(deps.localTracker.getFolderRenamePairs().size).toBe(0);
+			expect(deps.localTracker.getDirtyPaths().size).toBe(0);
+		});
+
+		it("skips excluded paths", () => {
+			scheduler.destroy();
+			deps = createDeps({
+				isExcluded: (p: string) => p.startsWith("excluded/"),
+			});
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+
+			const handler = deps.vaultHandlers.get("create") as VaultHandler;
+			handler(makeFile("excluded/note.md"));
+			expect(
+				deps.localTracker.getDirtyPaths().has("excluded/note.md"),
+			).toBe(false);
+		});
+
+		it("triggers debounced sync on vault change", () => {
+			const handler = deps.vaultHandlers.get("modify") as VaultHandler;
+			handler(makeFile("note.md"));
+			vi.advanceTimersByTime(5000);
+			expect(deps.runSync).toHaveBeenCalled();
+		});
+
+		it("coalesces rapid vault changes into a single sync", () => {
+			const handler = deps.vaultHandlers.get("modify") as VaultHandler;
+			handler(makeFile("a.md"));
+			vi.advanceTimersByTime(2000);
+			handler(makeFile("b.md"));
+			vi.advanceTimersByTime(2000);
+			handler(makeFile("c.md"));
+			vi.advanceTimersByTime(5000);
+			expect(deps.runSync).toHaveBeenCalledTimes(1);
+		});
+
+		it("does not trigger sync for excluded paths", () => {
+			scheduler.destroy();
+			deps = createDeps({ isExcluded: () => true });
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+
+			const handler = deps.vaultHandlers.get("modify") as VaultHandler;
+			handler(makeFile("ignored.md"));
+			vi.advanceTimersByTime(5000);
+			expect(deps.runSync).not.toHaveBeenCalled();
+		});
+
+		it("skips debounced sync on vault change when remoteFs is null", () => {
+			scheduler.destroy();
+			deps = createDeps({ remoteFs: () => null });
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+
+			const handler = deps.vaultHandlers.get("modify") as VaultHandler;
+			handler(makeFile("note.md"));
+			vi.advanceTimersByTime(5000);
+			expect(deps.runSync).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("file-open priority sync", () => {
+		it("re-arms the vault debounce when an opened new file remains dirty after a failed cycle", async () => {
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs("actual_resolved");
+			remoteFs.priority = { observe: vi.fn(), read: vi.fn() };
+			const tracker = new LocalChangeTracker();
+			const settings = mockSettings({ vaultId: `failed-new-file-${Math.random()}` });
+			const runtime = new RuntimeSyncOrchestrator({
+				getSettings: () => settings, saveSettings: vi.fn().mockResolvedValue(undefined),
+				configDir: () => ".cfg", pluginId: () => "air-sync",
+				localFs: () => localFs, remoteFs: () => remoteFs, backendProvider: () => null,
+				checksumRegistry,
+				onStatusChange: vi.fn(), onProgress: vi.fn(), notify: vi.fn(),
+				isMobile: () => false, localTracker: tracker,
+			});
+			const runSync = vi.spyOn(runtime, "runSync");
+			const writeRemote = remoteFs.write.bind(remoteFs);
+			let rejectUpload = true;
+			const upload = vi.spyOn(remoteFs, "write").mockImplementation(
+				(path, content, mtime) => rejectUpload
+					? Promise.reject(new Error("remote unavailable"))
+					: writeRemote(path, content, mtime),
+			);
+			scheduler.destroy();
+			deps = createDeps({ orchestrator: runtime, localTracker: tracker, remoteFs: () => remoteFs });
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+			try {
+				await localFs.write("note.md", new TextEncoder().encode("content").buffer, Date.now());
+				await deps.vaultHandlers.get("create")!(makeFile("note.md"));
+				await vi.advanceTimersByTimeAsync(5000);
+				await runSync.mock.results[0]!.value;
+
+				expect(await runtime.state.get("note.md")).toBeUndefined();
+				expect(tracker.getDirtyPaths().has("note.md")).toBe(true);
+				rejectUpload = false;
+
+				await deps.workspaceHandlers.get("file-open")!(makeFile("note.md"));
+				await vi.advanceTimersByTimeAsync(4999);
+				expect(runSync).toHaveBeenCalledOnce();
+				await vi.advanceTimersByTimeAsync(1);
+				expect(runSync).toHaveBeenCalledTimes(2);
+				await runSync.mock.results[1]!.value;
+
+				expect(upload).toHaveBeenCalled();
+				expect(readText(remoteFs, "note.md")).toBe("content");
+				expect(await runtime.state.get("note.md")).toBeDefined();
+			} finally {
+				scheduler.destroy();
+				for (const result of runSync.mock.results) {
+					if (result.type === "return") await result.value;
+				}
+				await runtime.close();
+				vi.useRealTimers();
+			}
+		});
+
+		it.each(["open-first", "create-first"] as const)(
+			"keeps a new file's upload behind the vault debounce across open, rename, and modify (%s)",
+			async (eventOrder) => {
+				vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+				const localFs = createMockLocalFs();
+				const remoteFs = createMockRemoteFs("actual_resolved");
+				remoteFs.priority = { observe: vi.fn(), read: vi.fn() };
+				const tracker = new LocalChangeTracker();
+				const settings = mockSettings({
+					vaultId: `new-file-${Math.random()}`,
+					conflictStrategy: "auto_merge",
+				});
+				const onStatusChange = vi.fn();
+				const runtime = new RuntimeSyncOrchestrator({
+					getSettings: () => settings, saveSettings: vi.fn().mockResolvedValue(undefined),
+					configDir: () => ".cfg", pluginId: () => "air-sync",
+					localFs: () => localFs, remoteFs: () => remoteFs, backendProvider: () => null,
+					checksumRegistry,
+					onStatusChange, onProgress: vi.fn(), notify: vi.fn(),
+					isMobile: () => false, localTracker: tracker,
+				});
+				const runSync = vi.spyOn(runtime, "runSync");
+				const upload = vi.spyOn(remoteFs, "write");
+				scheduler.destroy();
+				deps = createDeps({ orchestrator: runtime, localTracker: tracker, remoteFs: () => remoteFs });
+				scheduler = new SyncScheduler(deps);
+				scheduler.start();
+				try {
+					await localFs.write("Untitled.md", new ArrayBuffer(0), Date.now());
+					// File-open ordering is not a timing authority: a missing baseline
+					// always routes back to the scheduler-owned debounce.
+					const created = makeFile("Untitled.md");
+					if (eventOrder === "open-first") {
+						await deps.workspaceHandlers.get("file-open")!(created);
+						await deps.vaultHandlers.get("create")!(created);
+					} else {
+						await deps.vaultHandlers.get("create")!(created);
+						await deps.workspaceHandlers.get("file-open")!(created);
+					}
+					expect(runSync).not.toHaveBeenCalled();
+					expect(upload).not.toHaveBeenCalled();
+
+					await vi.advanceTimersByTimeAsync(1000);
+					await localFs.rename("Untitled.md", "final.md");
+					await deps.vaultHandlers.get("rename")!(makeFile("final.md"), "Untitled.md");
+					await deps.workspaceHandlers.get("file-open")!(makeFile("final.md"));
+					await vi.advanceTimersByTimeAsync(4000);
+					expect(runSync).not.toHaveBeenCalled();
+
+					await localFs.write(
+						"final.md",
+						new TextEncoder().encode("final content").buffer,
+						Date.now(),
+					);
+					await deps.vaultHandlers.get("modify")!(makeFile("final.md"));
+					await vi.advanceTimersByTimeAsync(4999);
+					expect(runSync).not.toHaveBeenCalled();
+					expect(upload).not.toHaveBeenCalled();
+					await vi.advanceTimersByTimeAsync(1);
+					expect(runSync).toHaveBeenCalledOnce();
+					await runSync.mock.results[0]!.value;
+
+					expect(upload.mock.calls.map(([path]) => path)).toEqual(["final.md"]);
+					expect(readText(remoteFs, "final.md")).toBe("final content");
+					expect([...remoteFs.files.keys()]).toEqual(["final.md"]);
+					expect([...localFs.files.keys()]).toEqual(["final.md"]);
+					expect(await runtime.state.get("final.md")).toBeDefined();
+					expect(onStatusChange).not.toHaveBeenCalledWith("partial_error");
+				} finally {
+					scheduler.destroy();
+					for (const result of runSync.mock.results) {
+						if (result.type === "return") await result.value;
+					}
+					await runtime.close();
+					vi.useRealTimers();
+				}
+			},
+		);
+
+		it("debounces an untracked open through the normal vault-change timer", async () => {
+			deps.pullSingle.mockResolvedValue("untracked");
+			await deps.workspaceHandlers.get("file-open")!(makeFile("new.md"));
+
+			vi.advanceTimersByTime(4999);
+			expect(deps.runSync).not.toHaveBeenCalled();
+			vi.advanceTimersByTime(1);
+			expect(deps.runSync).toHaveBeenCalledOnce();
+		});
+
+		it("coalesces create, file-open, and rename until the final quiet interval", async () => {
+			deps.pullSingle.mockResolvedValue("untracked");
+			const created = makeFile("Untitled.md");
+			(deps.vaultHandlers.get("create") as VaultHandler)(created);
+			await deps.workspaceHandlers.get("file-open")!(created);
+			vi.advanceTimersByTime(2000);
+			(deps.vaultHandlers.get("rename") as RenameHandler)(makeFile("final.md"), "Untitled.md");
+
+			vi.advanceTimersByTime(4999);
+			expect(deps.runSync).not.toHaveBeenCalled();
+			vi.advanceTimersByTime(1);
+			expect(deps.runSync).toHaveBeenCalledOnce();
+			expect(deps.localTracker.getRenamePairs().get("final.md")).toBe("Untitled.md");
+		});
+
+		it("does not revive the debounce after destroy while an untracked open settles", async () => {
+			let resolveOpen!: (value: "untracked") => void;
+			deps.pullSingle.mockReturnValue(new Promise<"untracked">((resolve) => {
+				resolveOpen = resolve;
+			}));
+			const opened = deps.workspaceHandlers.get("file-open")!(makeFile("new.md"));
+
+			scheduler.destroy();
+			resolveOpen("untracked");
+			await opened;
+			vi.advanceTimersByTime(5000);
+
+			expect(deps.runSync).not.toHaveBeenCalled();
+		});
+
+		it("routes an opened file without stale cache or baseline prechecks", async () => {
+			const handler = deps.workspaceHandlers.get("file-open")!;
+			await handler({ path: "note.md" });
+
+			expect(deps.pullSingle).toHaveBeenCalledWith("note.md");
+		});
+
+		it("lets the priority owner reject an untracked path", async () => {
+			const handler = deps.workspaceHandlers.get("file-open")!;
+			await handler({ path: "unknown.md" });
+			expect(deps.pullSingle).toHaveBeenCalledWith("unknown.md");
+		});
+
+		it("reaches detached observation and local write from the public file-open event", async () => {
+			vi.useRealTimers();
+			const localFs = createMockLocalFs();
+			const remoteFs = createMockRemoteFs();
+			const local = addFile(localFs, "note.md", "old", 1000);
+			const localStat = await localFs.stat("note.md");
+			if (!localStat) throw new Error("test setup failed");
+			const remote = addFile(remoteFs, "note.md", "new", 2000);
+			remote.identityKey = "remote-id";
+			const priorityRead = vi.fn().mockResolvedValue({
+				kind: "content" as const,
+				content: remoteFs.files.get("note.md")!.content.slice(0),
+			});
+			remoteFs.priority = {
+				observe: vi.fn().mockResolvedValue({
+					kind: "current", path: "note.md", identityKey: "remote-id", token: "v2",
+					entity: { ...remote },
+					occupant: {
+						kind: "current", path: "note.md", identityKey: "remote-id", token: "v2",
+						entity: { ...remote },
+					},
+				}),
+				read: priorityRead,
+			};
+			const tracker = new LocalChangeTracker();
+			const settings = mockSettings({ vaultId: `scheduler-${Math.random()}` });
+			const runtime = new RuntimeSyncOrchestrator({
+				getSettings: () => settings,
+				saveSettings: vi.fn().mockResolvedValue(undefined),
+				configDir: () => ".cfg",
+				pluginId: () => "air-sync",
+				localFs: () => localFs,
+				remoteFs: () => remoteFs,
+				backendProvider: () => null,
+				checksumRegistry,
+				onStatusChange: vi.fn(), onProgress: vi.fn(), notify: vi.fn(),
+				isMobile: () => false, localTracker: tracker,
+			});
+			await runtime.state.put({
+				path: "note.md", hash: localStat.hash,
+				localMtime: local.mtime, remoteMtime: 1000,
+				localSize: local.size, remoteSize: local.size,
+				remoteIdentityKey: "remote-id", syncedAt: 900,
+			});
+			scheduler.destroy();
+			deps = createDeps({
+				orchestrator: runtime, localTracker: tracker, remoteFs: () => remoteFs,
+			});
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+
+			await deps.workspaceHandlers.get("file-open")!({ path: "note.md" });
+
+			expect(priorityRead).toHaveBeenCalledOnce();
+			expect(readText(localFs, "note.md")).toBe("new");
+			await runtime.close();
+		});
+
+		it("skips pull when file is null", async () => {
+			const handler = deps.workspaceHandlers.get("file-open")!;
+			await handler(null);
+			expect(deps.pullSingle).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("focus event", () => {
+		it("triggers sync on focus after a departure (alt-tab / split-view return)", () => {
+			fireBlur(); // depart
+			fireFocus(); // return
+			expect(deps.runSync).toHaveBeenCalled();
+		});
+
+		it("skips sync on focus when remoteFs is null", () => {
+			scheduler.destroy();
+			deps = createDeps({ remoteFs: () => null });
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+
+			fireBlur();
+			fireFocus();
+			expect(deps.runSync).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("online event", () => {
+		it("triggers sync on network restore (no departure needed)", () => {
+			const handler = windowListeners.get("online");
+			expect(handler).toBeDefined();
+			handler!(new Event("online"));
+			expect(deps.runSync).toHaveBeenCalled();
+		});
+
+		it("skips sync on online event when remoteFs is null", () => {
+			scheduler.destroy();
+			deps = createDeps({ remoteFs: () => null });
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+
+			const handler = windowListeners.get("online");
+			handler!(new Event("online"));
+			expect(deps.runSync).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("visibility event", () => {
+		it("triggers sync when app becomes visible after backgrounding", () => {
+			fireVisibility("hidden"); // depart
+			fireVisibility("visible"); // resume
+			expect(deps.runSync).toHaveBeenCalled();
+		});
+
+		it("skips sync on visibility change when remoteFs is null", () => {
+			scheduler.destroy();
+			deps = createDeps({ remoteFs: () => null });
+			scheduler = new SyncScheduler(deps);
+			scheduler.start();
+
+			fireVisibility("hidden");
+			fireVisibility("visible");
+			expect(deps.runSync).not.toHaveBeenCalled();
+		});
+	});
+
+	// Foreground signals (focus / visibilitychange→visible) sync only on a genuine
+	// return — after the app actually left the foreground. This drops the
+	// redundant cold-start signal (the mobile deferred-to-first-touch focus, which
+	// arrives with no preceding departure) while still syncing every real resume,
+	// without a timing window. Departure is OR'd across blur + visibilitychange→
+	// hidden so phone/tablet/desktop are all covered (ADR 0007).
+	describe("departure gating (ADR 0007)", () => {
+		it("skips a foreground signal with no departure (cold-start trailing focus)", () => {
+			fireFocus(); // no preceding departure
+			fireVisibility("visible");
+			expect(deps.runSync).not.toHaveBeenCalled();
+		});
+
+		it("clears departed after the resume sync — a second foreground signal is a no-op", () => {
+			fireBlur();
+			fireFocus(); // genuine return → one sync
+			fireFocus(); // departed cleared → no second sync
+			expect(deps.runSync).toHaveBeenCalledTimes(1);
+		});
+
+		it("a blur departure arms a later visibilitychange→visible too", () => {
+			fireBlur(); // desktop/tablet app-switch away (no visibilitychange)
+			fireVisibility("visible"); // return
+			expect(deps.runSync).toHaveBeenCalledTimes(1);
+		});
+
+		it("keeps departed set when a foreground signal is dropped mid-sync, so a later return still syncs", () => {
+			// The load-bearing "never miss a resume" guarantee: a return landing on an
+			// in-flight cycle (which may predate the departure) is dropped WITHOUT
+			// clearing departed, so the next signal still re-checks. Reordering the
+			// isSyncing() guard to clear departed first would break this silently.
+			fireBlur(); // departed = true
+			deps.orchestrator.isSyncing = () => true;
+			fireFocus(); // dropped (in flight) — must NOT clear departed
+			expect(deps.runSync).not.toHaveBeenCalled();
+
+			deps.orchestrator.isSyncing = () => false;
+			fireFocus(); // departed survived → resume syncs now
+			expect(deps.runSync).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	// The asymmetry that IS the trigger classification (ADR 0004): a signal
+	// (focus/online/visibility) is a content-less "re-check everything" request,
+	// so it is dropped while a sync is already in flight — the in-flight cycle
+	// already does that scan. A vault change carries a real local edit, so it
+	// must still drive a re-run (via debounce → syncPending) even mid-sync.
+	// Pins the load-bearing `isSyncing()` guard so a future "cleanup" can't
+	// delete it silently (deleting it makes a signal set syncPending and run a
+	// redundant WARM full scan).
+	describe("trigger classification (ADR 0004)", () => {
+		it("discards a signal (focus/online/visibility) while a sync is in flight", () => {
+			fireBlur(); // depart, so focus/visibility would otherwise sync
+			deps.orchestrator.isSyncing = () => true;
+
+			fireFocus();
+			windowListeners.get("online")!(new Event("online"));
+			fireVisibility("visible");
+
+			expect(deps.runSync).not.toHaveBeenCalled();
+		});
+
+		it("still drives a vault change (via debounce) while a sync is in flight", () => {
+			deps.orchestrator.isSyncing = () => true;
+
+			const handler = deps.vaultHandlers.get("modify") as VaultHandler;
+			handler(makeFile("note.md"));
+			vi.advanceTimersByTime(5000);
+
+			expect(deps.runSync).toHaveBeenCalled();
+		});
+	});
+
+	describe("destroy", () => {
+		it("cancels debounced sync", () => {
+			const handler = deps.vaultHandlers.get("modify") as VaultHandler;
+			handler(makeFile("note.md"));
+			scheduler.destroy();
+			vi.advanceTimersByTime(5000);
+			expect(deps.runSync).not.toHaveBeenCalled();
+		});
+	});
+});
