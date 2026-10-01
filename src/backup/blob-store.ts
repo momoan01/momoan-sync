@@ -1,0 +1,23 @@
+import type { BackupManifest, PendingBackupManifest } from "./types";
+
+/**
+ * Durable backup storage boundary. Production implementations must target a
+ * location outside the Vault sync root; the Backup Engine never assumes the
+ * store shares authority with Sync state.
+ */
+export interface BackupStore {
+	/** Persist the non-restorable in-progress marker before snapshot writes begin. */
+	beginSnapshot(manifest: PendingBackupManifest): Promise<void>;
+	/** Content-addressed blob lookup used to deduplicate across snapshots. */
+	hasBlob(contentHash: string): Promise<boolean>;
+	/** Persist bytes under their SHA-256 content hash. */
+	putBlob(contentHash: string, content: ArrayBuffer): Promise<void>;
+	/** Read a blob for integrity verification and restore. */
+	getBlob(contentHash: string): Promise<ArrayBuffer | null>;
+	/** Atomically replace the pending marker with the complete manifest. */
+	commitSnapshot(manifest: BackupManifest): Promise<void>;
+	/** Return only completed/restorable manifests. */
+	getManifest(snapshotId: string): Promise<BackupManifest | null>;
+	/** List only completed/restorable manifests. */
+	listManifests(): Promise<BackupManifest[]>;
+}
