@@ -12,7 +12,7 @@ const MUTATING_SYNC_STATE_METHODS = new Set([
 ]);
 
 const ORCHESTRATOR_INSTANCE_FIELDS = [
-	"syncMutex", "stateStore", "syncPending", "coldPreviewRequested", "latestShadowPreview", "priorityCoordinator",
+	"syncMutex", "stateStore", "recoveryJournal", "syncPending", "coldPreviewRequested", "latestShadowPreview", "priorityCoordinator",
 	"localMutationBarrier", "activeBatch", "sessionId", "deps",
 ];
 const CHECKPOINT_ACCESSORS = ["src/sync/sync-cycle-finalization.ts"];

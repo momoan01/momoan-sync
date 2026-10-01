@@ -1,4 +1,4 @@
-/* eslint max-lines: ["error", 1034] -- the executor owns all fixed protocols, direction-specific transfer proof, immediate pre-effect observation, and proof-gated commit routing. Re-pinned from 970 for the identity-addressed namespace repair: which addressing a rename uses, and the fact that the repair route runs none of the publication machinery, must be readable against the path-addressed protocol it deliberately bypasses. Re-pinned from 1020 for the structural auth-failure normalization (a separately bundled module's AuthError class identity is not authoritative and its plain shape may arrive wrapped by ContentProofError), which adds the unwrap/normalize at each cycle-abort site. */
+/* eslint max-lines: ["error", 1070] -- the executor owns all fixed protocols, direction-specific transfer proof, immediate pre-effect observation, and proof-gated commit routing. Re-pinned from 970 for the identity-addressed namespace repair: which addressing a rename uses, and the fact that the repair route runs none of the publication machinery, must be readable against the path-addressed protocol it deliberately bypasses. Re-pinned from 1020 for the structural auth-failure normalization (a separately bundled module's AuthError class identity is not authoritative and its plain shape may arrive wrapped by ContentProofError), which adds the unwrap/normalize at each cycle-abort site. */
 import type { IFileSystem } from "../fs/interface";
 import type { ChecksumRegistry } from "../fs/modules/checksum-registry";
 import type { FileEntity } from "../fs/types";
@@ -31,6 +31,8 @@ import type { LocalMutationBarrier } from "./local-mutation-barrier";
 import { sameSynchronizedContent } from "./content-identity";
 import { hasChanged, hasRemoteChanged } from "./change-compare";
 import { sha256 } from "../utils/hash";
+import { requiresRecoveryCapture } from "./destructive-action";
+import type { RecoveryJournal } from "../recovery/journal";
 export type { BlockedAction, CompletedAction, ExecutionResult, FailedAction, ResolvedConflict } from "./execution-result";
 export { toConflictRecords } from "./execution-result";
 
@@ -86,6 +88,11 @@ export interface ExecutionContext {
 	onPhaseChange?: (phase: "transfer" | "conflict" | "structural") => void;
 	/** Test seam and dependency boundary for the configured resolver. */
 	conflictResolver?: typeof resolveConflict;
+	/** Durable pre-effect recovery material. Production requires this for destructive actions. */
+	recoveryJournal?: RecoveryJournal;
+	cycleId?: string;
+	recoveryCaptures?: ReadonlyMap<SyncAction, string>;
+	requireRecoveryCapture?: boolean;
 }
 
 /**
@@ -378,6 +385,7 @@ async function executeVerifiedAction(
 	action: SyncAction, ctx: ExecutionContext, completed: readonly CompletedAction[], onRateLimit?: () => void,
 ): Promise<Omit<CompletedAction, "action">> {
 	await checkPublicationInputs(action, ctx, completed);
+	const recoveryId = await captureRecovery(action, ctx);
 	const io = () => runActionIO(action, ctx);
 	// Renames cannot replay safely after their source has already moved.
 	const entities = action.action === "rename_local" || action.action === "rename_remote"
@@ -387,6 +395,7 @@ async function executeVerifiedAction(
 	const remoteEntity = terminalProof?.remoteEntity ?? entities.remoteEntity;
 	const terminalRecord = await commitAction(action, localEntity, remoteEntity,
 		ctx.committer, terminalProof, completed);
+	await completeRecovery(recoveryId, ctx);
 	return { localEntity, remoteEntity, terminalProof, terminalRecord };
 }
 
@@ -397,6 +406,25 @@ function localMutationPaths(action: SyncAction): string[] {
 	if (action.action !== "rename_local") return [];
 	return [action.oldPath, action.path,
 		...(action.descendants?.flatMap(({ oldPath, newPath }) => [oldPath, newPath]) ?? [])];
+}
+
+async function captureRecovery(action: SyncAction, ctx: ExecutionContext): Promise<string | undefined> {
+	if (!requiresRecoveryCapture(action)) return undefined;
+	const prior = ctx.recoveryCaptures?.get(action);
+	if (prior) return prior;
+	if (!ctx.recoveryJournal || !ctx.cycleId) {
+		if (ctx.requireRecoveryCapture) {
+			throw new ContentProofError("external_io_failure", `Recovery capture unavailable: ${action.path}`);
+		}
+		return undefined;
+	}
+	return ctx.recoveryJournal.captureAction(action, {
+		localFs: ctx.localFs, remoteFs: ctx.remoteFs, checksumRegistry: ctx.checksumRegistry,
+	}, ctx.cycleId);
+}
+
+async function completeRecovery(id: string | undefined, ctx: ExecutionContext): Promise<void> {
+	if (id) await ctx.recoveryJournal?.markApplied(id);
 }
 
 async function runActionIO(
@@ -825,6 +853,7 @@ async function executeConflictAction(
 		}
 		validateConflictContract(action);
 		if (action.protocol?.kind === "preservation_cover") {
+			const recoveryId = await captureRecovery(action, ctx);
 			const execute = () => executePreservationCover(action, ctx, (duplicatePaths) => {
 				preservationProgress = preservationResolution(duplicatePaths);
 			});
@@ -832,6 +861,7 @@ async function executeConflictAction(
 			const resolution = ctx.mutationBarrier
 				? await ctx.mutationBarrier.run(paths, execute)
 				: await execute();
+			await completeRecovery(recoveryId, ctx);
 			result.conflicts.push({ action, resolution });
 			result.succeeded.push({ action });
 			return;
@@ -861,12 +891,14 @@ async function executeConflictAction(
 		// the transfer pool's AIMD).
 		const execute = async () => {
 			await checkPublicationInputs(action, ctx, result.succeeded);
+			const recoveryId = await captureRecovery(action, ctx);
 			const resolution = await (ctx.conflictResolver ?? resolveConflict)(
 				conflictCtx, action.conflictPolicy,
 			);
 			const { localEntity, remoteEntity, terminalProof } = await executePreparedConflictEffects(action, ctx, resolution);
 			const terminalRecord = await commitAction(action, localEntity, remoteEntity, ctx.committer,
 				terminalProof, result.succeeded);
+			await completeRecovery(recoveryId, ctx);
 			return { resolution, localEntity, remoteEntity, terminalProof, terminalRecord };
 		};
 		const mutationPaths = action.remoteIdentitySource

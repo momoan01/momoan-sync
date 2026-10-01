@@ -36,6 +36,7 @@ import { PriorityCoordinator } from "./priority-coordinator";
 import { LocalMutationBarrier } from "./local-mutation-barrier";
 import { PriorityBatchState } from "./priority-batch-state";
 import { syncOpenedFilePriority } from "./opened-file-priority";
+import { RecoveryJournal } from "../recovery/journal";
 
 export type { SyncStatus };
 
@@ -71,6 +72,7 @@ const MAX_RETRIES = 3;
 export class SyncOrchestrator {
 	private syncMutex = new AsyncMutex();
 	private stateStore: SyncStateStore;
+	private readonly recoveryJournal: RecoveryJournal;
 	private syncPending = false;
 	private coldPreviewRequested = false;
 	private latestShadowPreview: ShadowPreviewReport | null = null;
@@ -85,6 +87,7 @@ export class SyncOrchestrator {
 		this.deps = deps;
 		const vaultId = deps.getSettings().vaultId;
 		this.stateStore = new SyncStateStore(vaultId);
+		this.recoveryJournal = new RecoveryJournal(vaultId);
 	}
 
 	getLatestShadowPreview(): ShadowPreviewReport | null {
@@ -104,7 +107,7 @@ export class SyncOrchestrator {
 	}
 
 	async close(): Promise<void> {
-		await this.stateStore.close();
+		await Promise.all([this.stateStore.close(), this.recoveryJournal.close()]);
 	}
 
 	async clearSyncState(): Promise<void> {
@@ -545,10 +548,14 @@ export class SyncOrchestrator {
 		const total = admission.executable.actions.length;
 
 		const classifyError = (err: unknown) => provider?.classifyError?.(err) ?? classifyHttpError(err);
+		const cycleId = crypto.randomUUID();
 		const ctx: ExecutionContext = {
 			localFs,
 			remoteFs,
 			checksumRegistry: this.deps.checksumRegistry,
+			recoveryJournal: this.recoveryJournal,
+			cycleId,
+			requireRecoveryCapture: true,
 			committer: {
 				stateStore: this.stateStore,
 				enableThreeWayMerge: settings.enableThreeWayMerge,
