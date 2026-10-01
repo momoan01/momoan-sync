@@ -16,10 +16,12 @@ import { parseLines } from "../utils/parse-lines";
 import { isDotPrefixed } from "../utils/path";
 import { renderConfigSyncSettings } from "./config-sync-settings";
 import { createBackupRecoveryUiState, renderBackupRecoverySettings } from "./backup-recovery-settings";
+import { createRecoveryJournalUiState, renderRecoveryJournalSettings } from "./recovery-journal-settings";
 
 export class AirSyncSettingTab extends PluginSettingTab {
 	plugin: AirSyncPlugin;
 	private readonly backupRecovery = createBackupRecoveryUiState();
+	private readonly recoveryJournal = createRecoveryJournalUiState();
 
 	constructor(app: App, plugin: AirSyncPlugin) {
 		super(app, plugin);
@@ -118,6 +120,8 @@ export class AirSyncSettingTab extends PluginSettingTab {
 
 		renderBackupRecoverySettings(
 			containerEl, this.plugin, this.backupRecovery, () => this.renderContent());
+		renderRecoveryJournalSettings(
+			containerEl, this.plugin, this.recoveryJournal, () => this.renderContent());
 
 		// --- Advanced settings ---
 		new Setting(containerEl).setName("Advanced").setHeading();
