@@ -1,4 +1,4 @@
-import { errorMessage } from "../backend-api";
+import { errorMessage, isBackendErrorShape } from "../backend-api";
 import type { IFileSystem } from "../fs/interface";
 import type { ExecutionResult } from "./execution-result";
 import type { AdmissionResult } from "./plan-admission";
@@ -98,7 +98,9 @@ export async function runSyncCycleAttempt<T>(
 				const input = finalization(attempt.value);
 				const completion = completionOf(input);
 				if (completion === "clean") await checkpoint?.commitCheckpoint({ scopeFingerprint: input.scopeFingerprint });
-				return { kind: "returned" as const, value: attempt.value, completion };
+				const targetChanged = input.result.failed.some(({ error }) =>
+					isBackendErrorShape(error) && error.kind === "target_changed");
+				return { kind: "returned" as const, value: attempt.value, completion, targetChanged };
 			} catch (error) {
 				return { kind: "threw" as const, error };
 			}
@@ -107,7 +109,12 @@ export async function runSyncCycleAttempt<T>(
 			await abortWorkingView(checkpoint);
 			throw closeout.error;
 		}
-		if (closeout.completion !== "clean") await abortWorkingView(checkpoint);
+		if (closeout.completion !== "clean") {
+			// A stale durable projection would restore the same rejected version next cycle.
+			// Reset only the remote checkpoint; the SyncRecord baseline remains intact.
+			if (closeout.targetChanged) await checkpoint?.resetCheckpoint();
+			else await abortWorkingView(checkpoint);
+		}
 		return { value: closeout.value, completion: { kind: closeout.completion } };
 	});
 }

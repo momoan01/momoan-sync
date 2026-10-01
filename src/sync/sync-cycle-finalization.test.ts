@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { toError } from "../backend-api";
 import type { IncrementalCheckpoint } from "../fs/interface";
 import type { ExecutionResult } from "./execution-result";
 import {
@@ -12,15 +13,17 @@ import type { PathObservation, ScopeProjection, SyncAction } from "./types";
 function checkpoint(commitCheckpoint: IncrementalCheckpoint["commitCheckpoint"]): {
 	value: IncrementalCheckpoint;
 	abortWorkingView: ReturnType<typeof vi.fn>;
+	resetCheckpoint: ReturnType<typeof vi.fn>;
 } {
 	const abortWorkingView = vi.fn().mockResolvedValue(undefined);
+	const resetCheckpoint = vi.fn().mockResolvedValue(undefined);
 	return { value: {
 		getChangedPaths: vi.fn().mockResolvedValue(null),
 		hasCheckpoint: vi.fn().mockResolvedValue(true),
 		abortWorkingView,
-		resetCheckpoint: vi.fn().mockResolvedValue(undefined),
+		resetCheckpoint,
 		commitCheckpoint,
-	}, abortWorkingView };
+	}, abortWorkingView, resetCheckpoint };
 }
 
 function admission(
@@ -95,9 +98,70 @@ describe("finalizeSyncCycle", () => {
 			});
 
 			expect(commitCheckpoint).not.toHaveBeenCalled();
+			expect(cycleCheckpoint.resetCheckpoint).not.toHaveBeenCalled();
 			expect(cycleCheckpoint.abortWorkingView).toHaveBeenCalledOnce();
 		},
 	);
+
+	it.each([
+		{ name: "structural target_changed", error: toError({ kind: "target_changed", message: "changed" }), reset: true },
+		{ name: "permission", error: toError({ kind: "permission", message: "denied" }), reset: false },
+		{ name: "unverifiable", error: toError({ kind: "unverifiable", message: "unproven" }), reset: false },
+		{ name: "backend permanent", error: toError({ kind: "permanent", message: "invalid" }), reset: false },
+		{ name: "generic permanent", error: new Error("failed"), reset: false },
+		{ name: "invalid structural shape", error: toError({ kind: "target_changed", message: "changed", retryAfterMs: "invalid" }), reset: false },
+	])("resets only for $name, regardless of permanent classification", async ({ error, reset }) => {
+		const admitted = admission([{ path: "note.md", action: "push" }], {
+			isConfiguredScopeCompatible: () => true, byEndpoint: new Map([["note.md", "included"]]),
+		});
+		const commit = vi.fn().mockResolvedValue(undefined);
+		const remote = checkpoint(commit);
+		const completion = await finalizeSyncCycle({ admission: admitted,
+			result: { succeeded: [], superseded: [], conflicts: [], blocked: [],
+				failed: [{ action: admitted.executable.actions[0]!, error, classification: "permanent" }] },
+			checkpoint: remote.value, scopeFingerprint: "scope" });
+		expect(completion).toEqual({ kind: "incomplete" });
+		expect(commit).not.toHaveBeenCalled();
+		expect(remote.resetCheckpoint).toHaveBeenCalledTimes(reset ? 1 : 0);
+		expect(remote.abortWorkingView).toHaveBeenCalledTimes(reset ? 0 : 1);
+	});
+
+	it("settles siblings before resetting when any failed action has a changed target", async () => {
+		const admitted = admission([], { isConfiguredScopeCompatible: () => true, byEndpoint: new Map() });
+		const commit = vi.fn().mockResolvedValue(undefined);
+		const remote = checkpoint(commit);
+		const events: string[] = [];
+		remote.resetCheckpoint.mockImplementation(() => { events.push("reset"); });
+		const action: SyncAction = { action: "push", path: "note.md" };
+		const input = { admission: admitted, scopeFingerprint: "scope",
+			result: { succeeded: [], superseded: [], conflicts: [], blocked: [], failed: [
+				{ action, error: new Error("other failure") },
+				{ action, error: toError({ kind: "target_changed", message: "changed" }) },
+			] } };
+		const closed = await runSyncCycleAttempt(remote.value, () => Promise.resolve(input), (close) => {
+			events.push("siblings settled"); return close();
+		}, (value) => value);
+		expect(closed.completion).toEqual({ kind: "incomplete" });
+		expect(events).toEqual(["siblings settled", "reset"]);
+		expect(commit).not.toHaveBeenCalled();
+		expect(remote.resetCheckpoint).toHaveBeenCalledOnce();
+		expect(remote.abortWorkingView).not.toHaveBeenCalled();
+	});
+
+	it("does not abort or repeat a failed checkpoint reset", async () => {
+		const admitted = admission([], { isConfiguredScopeCompatible: () => true, byEndpoint: new Map() });
+		const commit = vi.fn().mockResolvedValue(undefined);
+		const remote = checkpoint(commit);
+		const error = new Error("reset failed");
+		remote.resetCheckpoint.mockRejectedValue(error);
+		await expect(finalizeSyncCycle({ admission: admitted,
+			result: { succeeded: [], superseded: [], conflicts: [], blocked: [], failed: [
+				{ action: { action: "push", path: "note.md" }, error: toError({ kind: "target_changed", message: "changed" }) },
+			] }, checkpoint: remote.value, scopeFingerprint: "scope" })).rejects.toBe(error);
+		expect(remote.resetCheckpoint).toHaveBeenCalledOnce();
+		expect(commit).not.toHaveBeenCalled();
+		expect(remote.abortWorkingView).not.toHaveBeenCalled();
+	});
 
 	it("does not advance the checkpoint after admission rejects an action", async () => {
 		const failedAdmission = admission(

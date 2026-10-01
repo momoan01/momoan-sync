@@ -1,6 +1,10 @@
 import "fake-indexeddb/auto";
 import { describe, expect, it, vi } from "vitest";
 import type { RemoteChange, RemoteObject } from "../../../src/backend-api";
+import { toError } from "../../../src/backend-api";
+import { finalizeSyncCycle } from "../../../src/sync/sync-cycle-finalization";
+import { admitBatchObservation } from "../../../src/sync/plan-admission";
+import { captureBatchObservation } from "../../../src/sync/sync-cycle-planning";
 import { ManagedRemoteFs } from "../../../src/fs/managed/managed-remote-fs";
 import { RemoteObjectValidationError } from "../../../src/fs/managed/remote-object-validation";
 import { MetadataStore } from "../../../src/store/metadata-store";
@@ -227,6 +231,50 @@ describe("ManagedRemoteFs — checkpoint durability", () => {
 		const fs2 = makeFs(adapter, "abort-replay");
 		expect(await fs2.hasCheckpoint()).toBe(true);
 		expect((await fs2.getChangedPaths())?.deleted).toContain("a.md");
+	});
+
+	it("cold-scans after finalization discards a committed stale version rejected by provider CAS", async () => {
+		const adapter = new FakeRemoteAdapter("root", "parent_id");
+		const id = adapter.seedFile("a.md", "old");
+		const fs1 = makeFs(adapter, "target-changed-closeout");
+		await fs1.list();
+		await fs1.commitCheckpoint({ scopeFingerprint: "scope" });
+		expect(adapter.nodeById(id)?.versionToken).toBe("v1");
+		adapter.simulateUpdate("a.md", "provider v2");
+		expect(adapter.nodeById(id)?.versionToken).toBe("v2");
+		const listAll = vi.spyOn(adapter, "listAll");
+		const update = vi.spyOn(adapter, "updateFile");
+		const fs2 = makeFs(adapter, "target-changed-closeout");
+		expect(await fs2.hasCheckpoint()).toBe(true);
+		expect((await fs2.stat("a.md"))?.identityKey).toBe(id);
+		expect(listAll).not.toHaveBeenCalled();
+		const error = await fs2.write("a.md", bytes("stale push"), 2_000).then(
+			() => { throw new Error("stale write must fail closed"); },
+			(error: unknown) => toError(error),
+		);
+		expect(error).toMatchObject({ kind: "target_changed" });
+		expect(update.mock.calls[0]?.[0].expected).toEqual({ id, versionToken: "v1" });
+		const admitted = admitBatchObservation(captureBatchObservation([], [], [], {
+			byEndpoint: new Map(), isConfiguredScopeCompatible: () => true,
+		}, "fake:root"));
+		const reset = vi.spyOn(fs2, "resetCheckpoint");
+		const abort = vi.spyOn(fs2, "abortWorkingView");
+		const commit = vi.spyOn(fs2, "commitCheckpoint");
+		expect(await finalizeSyncCycle({ admission: admitted,
+			result: { succeeded: [], superseded: [], conflicts: [], blocked: [],
+				failed: [{ action: { action: "push", path: "a.md" }, error }] },
+			checkpoint: fs2.checkpoint, scopeFingerprint: "scope" })).toEqual({ kind: "incomplete" });
+		expect(reset).toHaveBeenCalledOnce();
+		expect(abort).not.toHaveBeenCalled();
+		expect(commit).not.toHaveBeenCalled();
+		expect(await fs2.hasCheckpoint()).toBe(false);
+		expect(await fs2.getScopeFingerprint()).toBeNull();
+		expect(await makeFs(adapter, "target-changed-closeout").hasCheckpoint()).toBe(false);
+		expect((await fs2.list()).map((entry) => entry.path)).toEqual(["a.md"]);
+		expect(listAll).toHaveBeenCalledOnce();
+		expect(decode(await fs2.read("a.md"))).toBe("provider v2");
+		expect(update).toHaveBeenCalledOnce();
+		expect(adapter.nodeById(id)?.versionToken).toBe("v2");
 	});
 
 	it("carries the committed scope fingerprint across a restart and discards it on reset", async () => {
