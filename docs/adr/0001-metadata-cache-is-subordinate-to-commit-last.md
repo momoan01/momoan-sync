@@ -284,3 +284,19 @@ opened-file mutation are suppressed. Write retains its existing publication owne
 The latestShadowPreview field contains only a detached, read-only, whitelisted
 report projection after attempt abort. It is replaced per preview, never persisted,
 and never consumed by observation, Admission, or execution as authority.
+
+
+### Momoan recovery material and mass-change safety boundary (M4)
+
+The orchestrator owns `RecoveryJournal`; `src/recovery/store.ts` is the exact additional
+`IDBHelper` importer, reference, and constructor inventoried by the ownership guard.
+Its independent database holds verified pre-effect bytes and endpoint metadata before
+destructive actions. `captured` / `applied` describe retained recovery material only:
+the journal is never read by observation or Admission as sync authority, never drives
+replay, and never publishes SyncRecords or checkpoints. The two commit-last sync
+authorities remain unchanged. A capture failure prevents the destructive effect.
+
+`massGuardColdRequested` is a bounded request for cold re-observation after a guarded
+Write plan. That attempt aborts without executor effects or checkpoint publication.
+A guarded full observation pre-captures its complete destructive plan before execution.
+Shadow reports the same predicate without performing recovery captures or mutations.

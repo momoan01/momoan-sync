@@ -1567,11 +1567,12 @@ describe("SyncOrchestrator", () => {
 			deps.localFs = () => localFs;
 			deps.remoteFs = () => remoteFs;
 
-			// Add files with matching hash so optimizer can verify content unchanged
+			// Use byte-valid matching hashes so recovery capture can verify the content.
+			const hash = await sha256(new TextEncoder().encode("content").buffer);
 			const localEntity = addFile(localFs, "new.md", "content", 1000);
-			localEntity.hash = "h1";
+			localEntity.hash = hash;
 			const remoteEntity = addFile(remoteFs, "old.md", "content", 1000);
-			remoteEntity.hash = "h1";
+			remoteEntity.hash = hash;
 
 			// Set up tracker with rename pair (do NOT initialize — cold mode
 			// lists all files so the "local deleted" entry survives filtering)
@@ -1581,7 +1582,7 @@ describe("SyncOrchestrator", () => {
 			// Seed baseline for old.md so change detector sees it as previously synced
 			await orchestrator.state.put({
 				path: "old.md",
-				hash: "h1",
+				hash,
 				localMtime: 1000,
 				remoteMtime: 1000,
 				localSize: 7,

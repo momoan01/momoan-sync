@@ -37,6 +37,7 @@ import { LocalMutationBarrier } from "./local-mutation-barrier";
 import { PriorityBatchState } from "./priority-batch-state";
 import { syncOpenedFilePriority } from "./opened-file-priority";
 import { RecoveryJournal } from "../recovery/journal";
+import { evaluateMassChangeGuard, type MassChangeGuardVerdict } from "./mass-change-guard";
 
 export type { SyncStatus };
 
@@ -75,6 +76,7 @@ export class SyncOrchestrator {
 	private readonly recoveryJournal: RecoveryJournal;
 	private syncPending = false;
 	private coldPreviewRequested = false;
+	private massGuardColdRequested = false;
 	private latestShadowPreview: ShadowPreviewReport | null = null;
 	private readonly priorityCoordinator = new PriorityCoordinator();
 	private readonly localMutationBarrier = new LocalMutationBarrier();
@@ -222,8 +224,9 @@ export class SyncOrchestrator {
 				const scopeChanged = remoteFs.checkpoint?.getScopeFingerprint
 					? (await remoteFs.checkpoint.getScopeFingerprint()) !== scopeFingerprint
 					: false;
-				const forceFullScan = noCheckpoint || scopeChanged || this.coldPreviewRequested;
+				const forceFullScan = noCheckpoint || scopeChanged || this.coldPreviewRequested || this.massGuardColdRequested;
 				this.coldPreviewRequested = false;
+				this.massGuardColdRequested = false;
 				const result = await this.executeWithRetry(
 					forceFullScan, scopeChanged, snapshot, scopeFingerprint, conflictStrategy, executionMode,
 				);
@@ -483,7 +486,8 @@ export class SyncOrchestrator {
 			// Signal the cycle out of the normal executor entirely: it plans nothing and
 			// publishes nothing. `executePlan` must not run on it, because its first act is
 			// to move the batch back to the transfer phase.
-			return { settings, provider, admission: empty, namespaceReconciled: true };
+			return { settings, provider, admission: empty, namespaceReconciled: true,
+				massGuardFollowUp: false, massGuard: undefined as MassChangeGuardVerdict | undefined };
 		}
 
 		// The namespace is settled, so the engine consumes a 1:1 view. The filesystem's
@@ -521,6 +525,23 @@ export class SyncOrchestrator {
 		// were already settled below the boundary, so Admission sees a 1:1 view.
 		const admission = admitBatchObservation(planning.snapshot, conflictStrategy);
 		logSyncCyclePlan(this.deps.logger, admission);
+		const massGuard = executionMode === "write"
+			? evaluateMassChangeGuard(admission.executable, planning.snapshot.baselinePaths.size)
+			: undefined;
+		if (massGuard?.kind === "guard" && !observedFullScan) {
+			this.massGuardColdRequested = true;
+			this.deps.logger?.warn("Mass Change Guard requested a cold re-observation", {
+				...massGuard.metrics, reasons: massGuard.reasons,
+			});
+			const followUp = admitBatchObservation(captureBatchObservation([], [], [], {
+				byEndpoint: new Map(), isConfiguredScopeCompatible: () => true,
+			}, namespace), conflictStrategy);
+			this.activeBatch = new PriorityBatchState(followUp);
+			this.activeBatch.blockCheckpoint();
+			this.activeBatch.abort();
+			return { settings, provider, admission: followUp, namespaceReconciled: false,
+				massGuardFollowUp: true, massGuard };
+		}
 		const { folderRenamePairs } = snapshot;
 
 		if (folderRenamePairs.size > 0) {
@@ -530,13 +551,14 @@ export class SyncOrchestrator {
 			});
 		}
 		this.activeBatch = new PriorityBatchState(admission);
-		return { settings, provider, admission, namespaceReconciled: false };
+		return { settings, provider, admission, namespaceReconciled: false,
+			massGuardFollowUp: false, massGuard };
 		} finally {
 			preparationPermit.release();
 		}
 		})();
-		const { settings, provider, admission, namespaceReconciled } = prepared;
-		if (executionMode === "shadow" || namespaceReconciled) {
+		const { settings, provider, admission, namespaceReconciled, massGuardFollowUp, massGuard } = prepared;
+		if (executionMode === "shadow" || namespaceReconciled || massGuardFollowUp) {
 			// The reconciled cycle never reaches the executor. Its batch stays in the abort
 			// state for the rest of the cycle, so a queued file-open priority keeps
 			// deferring and cannot publish a local write or a SyncRecord.
@@ -549,12 +571,23 @@ export class SyncOrchestrator {
 
 		const classifyError = (err: unknown) => provider?.classifyError?.(err) ?? classifyHttpError(err);
 		const cycleId = crypto.randomUUID();
+		const recoveryCaptures = massGuard?.kind === "guard" && observedFullScan
+			? await this.recoveryJournal.capturePlan(admission.executable.actions, {
+				localFs, remoteFs, checksumRegistry: this.deps.checksumRegistry,
+			}, cycleId)
+			: undefined;
+		if (recoveryCaptures) {
+			this.deps.logger?.warn("Mass Change Guard safety capture completed", {
+				captured: recoveryCaptures.size, ...massGuard!.metrics,
+			});
+		}
 		const ctx: ExecutionContext = {
 			localFs,
 			remoteFs,
 			checksumRegistry: this.deps.checksumRegistry,
 			recoveryJournal: this.recoveryJournal,
 			cycleId,
+			recoveryCaptures,
 			requireRecoveryCapture: true,
 			committer: {
 				stateStore: this.stateStore,

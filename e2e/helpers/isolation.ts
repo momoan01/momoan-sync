@@ -40,7 +40,7 @@ export async function cleanupGoogleDriveParent(
 ): Promise<void> {
 	// Trash, not permanent-delete: the drive.file scope can't hard-delete (403).
 	// The per-run unique names keep reruns clean despite trashed leftovers.
-	await client.deleteFile(parentId, false);
+	await client.deleteFile(parentId);
 }
 
 // ── Dropbox ───────────────────────────────────────────────────────────────

@@ -72,3 +72,16 @@ describe("ShadowPreviewReport Authorized Plan projection", () => {
   expect(shadowPreviewSummary(createShadowPreview(admission, true, false))).toBe("Create 1 · Update 0 · Rename 0 · Delete 0 · Conflicts 0");
  });
 });
+
+
+it("surfaces the same Mass Change Guard verdict used by Write", () => {
+ const entries = Array.from({ length: 10 }, (_, index) => ({
+  path: `mass-${index}.md`,
+  local: undefined,
+  remote: entity(`mass-${index}.md`, "h0", `id:mass-${index}.md`),
+  prevSync: baseline(`mass-${index}.md`),
+ }));
+ const report = createShadowPreview(admitted(entries), true, false);
+ expect(report.massChange.kind).toBe("guard");
+ expect(report.diagnostics.join(" ")).toContain("Mass Change Guard");
+});

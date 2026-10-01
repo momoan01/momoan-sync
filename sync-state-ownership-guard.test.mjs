@@ -12,7 +12,7 @@ const MUTATING_SYNC_STATE_METHODS = new Set([
 ]);
 
 const ORCHESTRATOR_INSTANCE_FIELDS = [
-	"syncMutex", "stateStore", "recoveryJournal", "syncPending", "coldPreviewRequested", "latestShadowPreview", "priorityCoordinator",
+	"syncMutex", "stateStore", "recoveryJournal", "syncPending", "coldPreviewRequested", "massGuardColdRequested", "latestShadowPreview", "priorityCoordinator",
 	"localMutationBarrier", "activeBatch", "sessionId", "deps",
 ];
 const CHECKPOINT_ACCESSORS = ["src/sync/sync-cycle-finalization.ts"];
@@ -31,9 +31,9 @@ const SYNC_STATE_STORE = {
 	],
 };
 const IDB_HELPER = {
-	imports: ["src/store/metadata-store.ts", "src/sync/state.ts"],
-	references: ["src/store/metadata-store.ts", "src/sync/state.ts"],
-	constructors: ["src/store/metadata-store.ts", "src/sync/state.ts"],
+	imports: ["src/recovery/store.ts", "src/store/metadata-store.ts", "src/sync/state.ts"],
+	references: ["src/recovery/store.ts", "src/store/metadata-store.ts", "src/sync/state.ts"],
+	constructors: ["src/recovery/store.ts", "src/store/metadata-store.ts", "src/sync/state.ts"],
 };
 const METADATA_STORE = {
 	imports: [
