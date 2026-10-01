@@ -91,6 +91,10 @@ class MemoryStore implements BackupStore {
 	getManifest(id: string): Promise<BackupManifest | null> {
 		return Promise.resolve(id === this.manifest.snapshotId ? this.manifest : null);
 	}
+	deleteManifest(): Promise<void> { return Promise.reject(new Error("unused")); }
+	listBlobHashes(): Promise<string[]> { return Promise.resolve([...this.blobs.keys()]); }
+	deleteBlob(): Promise<void> { return Promise.reject(new Error("unused")); }
+	hasPendingSnapshots(): Promise<boolean> { return Promise.resolve(false); }
 	listManifests(): Promise<BackupManifest[]> { return Promise.resolve([this.manifest]); }
 }
 

@@ -20,4 +20,12 @@ export interface BackupStore {
 	getManifest(snapshotId: string): Promise<BackupManifest | null>;
 	/** List only completed/restorable manifests. */
 	listManifests(): Promise<BackupManifest[]>;
+	/** Delete only a complete manifest. Failure must prevent subsequent blob GC. */
+	deleteManifest(snapshotId: string): Promise<void>;
+	/** Enumerate only valid SHA-256 blob names; unknown files are never GC targets. */
+	listBlobHashes(): Promise<string[]>;
+	/** Idempotently remove one validated blob hash, after reference re-observation. */
+	deleteBlob(contentHash: string): Promise<void>;
+	/** Any pending marker blocks retention; no stale-marker cleanup is implied. */
+	hasPendingSnapshots(): Promise<boolean>;
 }

@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { addFile, createMockLocalFs, deferred } from "../__mocks__/sync-test-helpers";
 import type { BackupStore } from "./blob-store";
 import type { DesktopRestoreRequest } from "./desktop-restore";
+import type { RetentionPolicy } from "./retention";
 import { BackupService } from "./service";
 import type { BackupManifest, PendingBackupManifest } from "./types";
 
@@ -22,6 +23,14 @@ class MemoryStore implements BackupStore {
 	getManifest(id: string): Promise<BackupManifest | null> {
 		return Promise.resolve(this.manifests.find((manifest) => manifest.snapshotId === id) ?? null);
 	}
+	deleteManifest(id: string): Promise<void> {
+		const index = this.manifests.findIndex((manifest) => manifest.snapshotId === id);
+		if (index >= 0) this.manifests.splice(index, 1);
+		return Promise.resolve();
+	}
+	listBlobHashes(): Promise<string[]> { return Promise.resolve([...this.blobs.keys()]); }
+	deleteBlob(hash: string): Promise<void> { this.blobs.delete(hash); return Promise.resolve(); }
+	hasPendingSnapshots(): Promise<boolean> { return Promise.resolve(this.pending !== null); }
 	listManifests(): Promise<BackupManifest[]> { return Promise.resolve([...this.manifests]); }
 }
 
@@ -41,6 +50,46 @@ function createService(
 }
 
 describe("backup service", () => {
+	it("excludes snapshot, restore and another retention while retention is running", async () => {
+		const store = new MemoryStore();
+		const gate = deferred<BackupManifest[]>();
+		const list = vi.spyOn(store, "listManifests").mockImplementation(() => gate.promise);
+		const service = createService(store);
+		const policy: RetentionPolicy = { recentWindowMs: 0, recentCount: 0, dailyGenerations: 0, weeklyGenerations: 0, monthlyGenerations: 0 };
+		const first = service.applyRetention(policy, new Date("2026-10-15T12:00:00.000Z"));
+		await expect(service.backupNow()).rejects.toThrow("already running");
+		await expect(service.restoreSnapshot("snapshot", "/restore")).rejects.toThrow("already running");
+		await expect(service.applyRetention(policy, new Date())).rejects.toThrow("already running");
+		gate.resolve([]);
+		expect(await first).toEqual({ retainedSnapshots: [], deletedSnapshots: [], deletedBlobs: [], reclaimedBlobCount: 0 });
+		list.mockRestore();
+		await expect(service.backupNow()).resolves.toMatchObject({ complete: true });
+	});
+
+	it.each(["snapshot", "restore"] as const)("blocks retention while %s holds the existing running guard", async (operation) => {
+		const store = new MemoryStore();
+		const manifest = await createService(store).backupNow();
+		const gate = deferred<BackupStore>();
+		const service = createService(store, { createStore: () => gate.promise,
+			restoreSnapshot: (request) => Promise.resolve({ snapshotId: request.manifest.snapshotId,
+				targetDirectory: "/restore", restoredFiles: 0, restoredDirectories: 0 }) });
+		const first = operation === "snapshot" ? service.backupNow() : service.restoreSnapshot(manifest.snapshotId, "/restore");
+		const policy: RetentionPolicy = { recentWindowMs: 0, recentCount: 0, dailyGenerations: 0, weeklyGenerations: 0, monthlyGenerations: 0 };
+		await expect(service.applyRetention(policy, new Date())).rejects.toThrow("already running");
+		gate.resolve(store);
+		await first;
+	});
+
+	it("releases the running guard after a pending-blocked retention failure", async () => {
+		const store = new MemoryStore();
+		await store.beginSnapshot({ version: 1, snapshotId: "pending", vaultId: "other", trigger: "manual",
+			createdAt: "2026-10-15T12:00:00.000Z", complete: false });
+		const service = createService(store);
+		const policy: RetentionPolicy = { recentWindowMs: 0, recentCount: 0, dailyGenerations: 0, weeklyGenerations: 0, monthlyGenerations: 0 };
+		await expect(service.applyRetention(policy, new Date())).rejects.toThrow("pending snapshots");
+		await expect(service.backupNow()).resolves.toMatchObject({ complete: true });
+	});
+
 	it("creates a manual whole-Vault snapshot through the configured desktop store", async () => {
 		const source = createMockLocalFs();
 		addFile(source, "note.md", "hello");

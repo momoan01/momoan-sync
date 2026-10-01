@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { DesktopBackupStore, validateExternalBackupDirectory } from "./desktop-store";
 import type { DesktopBackupFileOps } from "./desktop-runtime";
 import type { BackupManifest, PendingBackupManifest } from "./types";
@@ -115,6 +115,59 @@ describe("desktop backup store", () => {
 		expect(await store.listManifests()).toEqual([complete]);
 		expect(await store.getManifest("snapshot-1")).toEqual(complete);
 		expect(await ops.exists("/backup/meta/pending/snapshot-1.json")).toBe(false);
+	});
+
+	it("deletes only a complete manifest and never removes a pending marker", async () => {
+		const ops = new MemoryDesktopOps();
+		const store = new DesktopBackupStore("/backup", ops);
+		await store.beginSnapshot(pending);
+		expect(await store.hasPendingSnapshots()).toBe(true);
+		await expect(store.deleteManifest(pending.snapshotId)).rejects.toThrow("Complete backup manifest is missing");
+		expect(await ops.exists("/backup/meta/pending/snapshot-1.json")).toBe(true);
+		await store.commitSnapshot(complete);
+		expect(await store.hasPendingSnapshots()).toBe(false);
+		await store.deleteManifest(complete.snapshotId);
+		expect(await store.listManifests()).toEqual([]);
+	});
+
+	it("lists valid blob files only and idempotently deletes one hash without touching unrelated files", async () => {
+		const ops = new MemoryDesktopOps();
+		const store = new DesktopBackupStore("/backup", ops);
+		const hash = "a".repeat(64);
+		await store.putBlob(hash, new ArrayBuffer(1));
+		ops.files.set("/backup/blobs/notes.txt", "unrelated");
+		ops.files.set("/backup/blobs/" + "A".repeat(64), "unknown");
+		ops.files.set("/backup/blobs/.temporary", "partial");
+		ops.directories.add("/backup/blobs/" + "b".repeat(64));
+		expect(await store.listBlobHashes()).toEqual([hash]);
+		await store.deleteBlob(hash);
+		await store.deleteBlob(hash);
+		await expect(store.deleteBlob("../outside")).rejects.toThrow("Invalid backup content hash");
+		await expect(store.deleteManifest("../outside")).rejects.toThrow("Invalid backup snapshot id");
+		expect(await store.listBlobHashes()).toEqual([]);
+		expect(ops.files.size).toBe(3);
+		expect(ops.directories.has("/backup/blobs/" + "b".repeat(64))).toBe(true);
+	});
+
+	it("refuses malformed manifests instead of treating them as deletable", async () => {
+		const ops = new MemoryDesktopOps();
+		const store = new DesktopBackupStore("/backup", ops);
+		const remove = vi.spyOn(ops, "remove");
+		ops.files.set("/backup/manifests/bad.json", JSON.stringify({ ...complete, snapshotId: "bad", complete: false }));
+		await expect(store.deleteManifest("bad")).rejects.toThrow("Invalid backup manifest");
+		expect(remove).not.toHaveBeenCalled();
+	});
+
+	it("surfaces unlink errors and conservatively detects unknown pending files", async () => {
+		const ops = new MemoryDesktopOps();
+		const store = new DesktopBackupStore("/backup", ops);
+		await store.beginSnapshot(pending);
+		await store.commitSnapshot(complete);
+		ops.files.set("/backup/meta/pending/unknown.tmp", "unknown");
+		expect(await store.hasPendingSnapshots()).toBe(true);
+		vi.spyOn(ops, "remove").mockRejectedValue(new Error("permission denied"));
+		await expect(store.deleteManifest(complete.snapshotId)).rejects.toThrow("permission denied");
+		expect(await store.getManifest(complete.snapshotId)).toEqual(complete);
 	});
 
 	it("stores content-addressed blobs idempotently", async () => {

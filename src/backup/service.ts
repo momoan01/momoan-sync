@@ -4,6 +4,8 @@ import {
 	type DesktopRestoreMaterializer,
 } from "./desktop-restore";
 import { createDesktopBackupStore } from "./desktop-store";
+import { applyBackupRetention, type BackupRetentionResult } from "./garbage-collection";
+import type { RetentionPolicy } from "./retention";
 import { verifyBackupSnapshot } from "./integrity";
 import { createBackupSnapshot } from "./snapshot";
 import type { BackupSource } from "./source";
@@ -46,6 +48,17 @@ export class BackupService {
 				vaultId: this.deps.getVaultId(),
 				trigger,
 			});
+		} finally {
+			this.running = false;
+		}
+	}
+
+	async applyRetention(policy: RetentionPolicy, referenceTime: Date): Promise<BackupRetentionResult> {
+		if (this.running) throw new Error("Backup is already running");
+		this.running = true;
+		try {
+			const { store } = await this.openStore();
+			return await applyBackupRetention(store, this.deps.getVaultId(), referenceTime, policy);
 		} finally {
 			this.running = false;
 		}

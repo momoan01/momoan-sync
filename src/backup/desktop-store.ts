@@ -1,5 +1,6 @@
 import type { BackupStore } from "./blob-store";
 import { createNodeBackupFileOps, type DesktopBackupFileOps } from "./desktop-runtime";
+import { assertCompleteBackupManifest } from "./manifest";
 import type { BackupManifest, PendingBackupManifest } from "./types";
 
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -66,6 +67,30 @@ export class DesktopBackupStore implements BackupStore {
 			manifests.push(parseManifest(await this.ops.readText(this.ops.join(directory, name)), snapshotId));
 		}
 		return manifests.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+	}
+
+	async deleteManifest(snapshotId: string): Promise<void> {
+		// Validate/read before unlink: pending, malformed and unknown states are not deletions.
+		if (!await this.getManifest(snapshotId)) throw new Error("Complete backup manifest is missing: " + snapshotId);
+		await this.ops.remove(this.manifestPath(snapshotId));
+	}
+
+	async listBlobHashes(): Promise<string[]> {
+		const directory = this.ops.join(this.root, "blobs");
+		const hashes: string[] = [];
+		for (const name of (await this.ops.listNames(directory)).sort()) {
+			if (HASH_RE.test(name) && !await this.ops.isDirectory(this.blobPath(name))) hashes.push(name);
+		}
+		return hashes;
+	}
+
+	async deleteBlob(contentHash: string): Promise<void> {
+		validateHash(contentHash);
+		await this.ops.remove(this.blobPath(contentHash));
+	}
+
+	async hasPendingSnapshots(): Promise<boolean> {
+		return (await this.ops.listNames(this.ops.join(this.root, "meta", "pending"))).length > 0;
 	}
 
 	private async ensureLayout(): Promise<void> {
@@ -144,13 +169,7 @@ function serialize(value: BackupManifest | PendingBackupManifest): string {
 
 function parseManifest(text: string, expectedSnapshotId: string): BackupManifest {
 	const value: unknown = JSON.parse(text);
-	if (typeof value !== "object" || value === null) throw new Error("Invalid backup manifest");
-	const record = value as Record<string, unknown>;
-	if (record.version !== 1 || record.complete !== true || record.snapshotId !== expectedSnapshotId ||
-		typeof record.vaultId !== "string" || typeof record.trigger !== "string" ||
-		typeof record.createdAt !== "string" || typeof record.manifestHash !== "string" ||
-		!Array.isArray(record.entries)) {
-		throw new Error(`Invalid backup manifest: ${expectedSnapshotId}`);
-	}
-	return value as BackupManifest;
+	assertCompleteBackupManifest(value);
+	if (value.snapshotId !== expectedSnapshotId) throw new Error("Invalid backup manifest: " + expectedSnapshotId);
+	return value;
 }
