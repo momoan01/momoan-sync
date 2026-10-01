@@ -226,3 +226,13 @@ Steps:
 5. After the run finishes (`gh run watch <id>`), attach notes: `gh release edit x.y.z --notes-file <file>`.
 
 Release notes are public and user-facing (English): lead with what changed for the user, group under Fixed / Added, keep mechanism detail brief.
+
+
+### Momoan Shadow execution boundary (M3)
+
+Shadow uses the same current observation and Admission as Write, but skips the
+executor and closes every working checkpoint view by abort. It publishes neither
+SyncRecords nor checkpoints, history, tracker acknowledgment, or backend settings.
+The bounded coldPreviewRequested flag selects full observation for one queued
+preview; it is not a recovery marker or durable authority. Namespace repair and
+opened-file mutation are suppressed. Write retains its existing publication owners.

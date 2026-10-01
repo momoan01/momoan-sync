@@ -1,6 +1,14 @@
 import type { ConflictStrategy } from "./sync/types";
 
+export type SyncExecutionMode = "shadow" | "write";
+
+/** Missing/unknown persisted modes fail closed to preview. */
+export function syncExecutionMode(settings: Pick<AirSyncSettings, "syncMode">): SyncExecutionMode {
+	return settings.syncMode === "write" ? "write" : "shadow";
+}
+
 export interface AirSyncSettings {
+	syncMode?: SyncExecutionMode;
 	/** Unique identifier for this vault (used as IndexedDB key) */
 	vaultId: string;
 	/** Selected backend type (e.g. "googledrive") */
@@ -56,6 +64,7 @@ export interface AirSyncSettings {
 }
 
 export const DEFAULT_SETTINGS: AirSyncSettings = {
+	syncMode: "shadow",
 	vaultId: "",
 	backendType: "googledrive",
 	conflictStrategy: "auto_merge",

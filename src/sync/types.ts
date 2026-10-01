@@ -135,7 +135,7 @@ export interface ConflictRecord {
 export type { RenamePair };
 
 /** Sync service status */
-export type SyncStatus = "idle" | "syncing" | "error" | "partial_error" | "not_connected";
+export type SyncStatus = "shadow_ready" | "idle" | "syncing" | "error" | "partial_error" | "not_connected";
 
 /** Action types produced by the decision engine and optimizer */
 export type SyncActionType =

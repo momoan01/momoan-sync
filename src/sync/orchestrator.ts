@@ -1,4 +1,4 @@
-import type { AirSyncSettings } from "../settings";
+import { syncExecutionMode, type AirSyncSettings, type SyncExecutionMode } from "../settings";
 import type { IFileSystem } from "../fs/interface";
 import type { ChecksumRegistry } from "../fs/modules/checksum-registry";
 import type { IBackendProvider } from "../fs/backend";
@@ -71,6 +71,7 @@ export class SyncOrchestrator {
 	private syncMutex = new AsyncMutex();
 	private stateStore: SyncStateStore;
 	private syncPending = false;
+	private coldPreviewRequested = false;
 	private readonly priorityCoordinator = new PriorityCoordinator();
 	private readonly localMutationBarrier = new LocalMutationBarrier();
 	private activeBatch: PriorityBatchState | null = null;
@@ -145,6 +146,11 @@ export class SyncOrchestrator {
 	 * subsequent runSync then sees no checkpoint and goes cold.
 	 */
 	async rescan(): Promise<void> {
+		if (syncExecutionMode(this.deps.getSettings()) === "shadow") {
+			this.coldPreviewRequested = true;
+			await this.runSync();
+			return;
+		}
 		await this.syncMutex.run(() => this.deps.remoteFs()?.checkpoint?.resetCheckpoint());
 		await this.runSync();
 	}
@@ -193,6 +199,7 @@ export class SyncOrchestrator {
 				const snapshot = this.deps.localTracker.snapshot();
 				const settings = this.deps.getSettings();
 				const conflictStrategy = settings.conflictStrategy;
+				const executionMode = syncExecutionMode(settings);
 
 				const scopeFingerprint = await computeScopeFingerprint(
 					settings,
@@ -205,12 +212,17 @@ export class SyncOrchestrator {
 				const scopeChanged = remoteFs.checkpoint?.getScopeFingerprint
 					? (await remoteFs.checkpoint.getScopeFingerprint()) !== scopeFingerprint
 					: false;
-				const forceFullScan = noCheckpoint || scopeChanged;
+				const forceFullScan = noCheckpoint || scopeChanged || this.coldPreviewRequested;
+				this.coldPreviewRequested = false;
 				const result = await this.executeWithRetry(
-					forceFullScan, scopeChanged, snapshot, scopeFingerprint, conflictStrategy,
+					forceFullScan, scopeChanged, snapshot, scopeFingerprint, conflictStrategy, executionMode,
 				);
 				if (!result) return; // Fatal error already handled
 
+				if (executionMode === "shadow") {
+					this.deps.onStatusChange("shadow_ready");
+					continue; // No production history, tracker closeout, or Synced notification.
+				}
 				const { succeeded, failed, blocked, conflicts } = result;
 				if (result.outcome.completion.kind === "follow_up") {
 					// Nothing failed; convergence needs one more cycle. Queue it the way any
@@ -261,7 +273,7 @@ export class SyncOrchestrator {
 
 			// One notice per burst, gated on its OWN setting (`enableLogging` controls
 			// only whether logs are written — it used to double as this gate).
-			if (this.deps.getSettings().showSyncNotifications) {
+			if (syncExecutionMode(this.deps.getSettings()) === "write" && this.deps.getSettings().showSyncNotifications) {
 				this.deps.notify(summary.message);
 			}
 		});
@@ -276,6 +288,7 @@ export class SyncOrchestrator {
 		snapshot: TrackerSnapshot,
 		scopeFingerprint: string,
 		conflictStrategy: ConflictStrategy,
+		executionMode: SyncExecutionMode,
 	): Promise<SyncCycleResult | null> {
 		let lastError: unknown = null;
 		let lastKind: ErrorKind | null = null;
@@ -285,7 +298,7 @@ export class SyncOrchestrator {
 			try {
 				this.deps.logger?.info("Sync started", { forceFullScan, scopeChanged, attempt });
 				lastOutcome = await this.executeSyncOnce(
-					forceFullScan, snapshot, scopeFingerprint, conflictStrategy,
+					forceFullScan, snapshot, scopeFingerprint, conflictStrategy, executionMode,
 				);
 				const { execution, admissionFailures } = lastOutcome;
 				return {
@@ -346,6 +359,10 @@ export class SyncOrchestrator {
 	}
 
 	async pullSingle(path: string): Promise<"untracked" | undefined> {
+		if (syncExecutionMode(this.deps.getSettings()) === "shadow") {
+			if (!this.isExcluded(path)) await this.runSync();
+			return;
+		}
 		if (this.isExcluded(path)) {
 			this.deps.logger?.debug("pullSingle: skipped — out of sync scope", { path });
 			return;
@@ -386,7 +403,8 @@ export class SyncOrchestrator {
 	}
 
 	getStatus(): SyncStatus {
-		return this.syncMutex.isLocked ? "syncing" : "idle";
+		return this.syncMutex.isLocked ? "syncing"
+			: syncExecutionMode(this.deps.getSettings()) === "shadow" ? "shadow_ready" : "idle";
 	}
 
 	private async executeSyncOnce(
@@ -394,6 +412,7 @@ export class SyncOrchestrator {
 		snapshot: TrackerSnapshot,
 		scopeFingerprint: string,
 		conflictStrategy: ConflictStrategy,
+		executionMode: SyncExecutionMode,
 	) {
 		const localFs = this.deps.localFs();
 		const remoteFs = this.deps.remoteFs();
@@ -417,13 +436,18 @@ export class SyncOrchestrator {
 		// keeper decision (committed SyncRecords) and the scope filter, and retries when
 		// the namespace changed. A cycle that reconciled does not plan or publish
 		// anything: it closes as a follow-up and re-observes settled facts next cycle.
-		const reconciliation = remoteFs.namespaceReconciliation
+		const reconciliation = executionMode === "shadow"
+						? { kind: "suppressed" as const, delta: undefined }
+						: remoteFs.namespaceReconciliation
 			? await remoteFs.namespaceReconciliation.reconcileNamespace({
 				isInScope: (path) => !this.isExcluded(path),
 				keeper: (path, claimantIds) => this.namespaceKeeper(path, claimantIds),
 			})
 			: { kind: "settled" as const };
-		if (reconciliation.kind === "failed") {
+		if (reconciliation.kind === "suppressed" && remoteFs.namespaceReconciliation) {
+						this.deps.logger?.info("Namespace reconciliation suppressed in shadow; repair status unverified");
+					}
+					if (reconciliation.kind === "failed") {
 			// A refused repair is not a follow-up loop: rethrowing the provider's own error
 			// routes it through the attempt's classification, backoff and MAX_RETRIES, so a
 			// permanent refusal surfaces as an error instead of endless `syncing`.
@@ -500,7 +524,7 @@ export class SyncOrchestrator {
 		}
 		})();
 		const { settings, provider, admission, namespaceReconciled } = prepared;
-		if (namespaceReconciled) {
+		if (executionMode === "shadow" || namespaceReconciled) {
 			// The reconciled cycle never reaches the executor. Its batch stays in the abort
 			// state for the rest of the cycle, so a queued file-open priority keeps
 			// deferring and cannot publish a local write or a SyncRecord.
@@ -540,9 +564,13 @@ export class SyncOrchestrator {
 			}, (close) => this.priorityCoordinator.finalize(close), ({ admission, execution }) => {
 				this.activeBatch?.setPhase("finalizing");
 				return { admission, result: execution, scopeFingerprint,
-					checkpointBlocked: this.activeBatch?.isCheckpointBlocked };
+					checkpointBlocked: this.activeBatch?.isCheckpointBlocked,
+					readOnly: executionMode === "shadow" };
 			});
 			const { settings, provider, admission, execution } = closed.value;
+			if (executionMode === "shadow") {
+				return { execution, admissionFailures: admission.failures, completion: closed.completion };
+			}
 			// Settings are supplementary, after the attempt's working view is closed.
 			if (provider?.readBackendState) {
 				settings.backendData = { ...settings.backendData, ...provider.readBackendState() };

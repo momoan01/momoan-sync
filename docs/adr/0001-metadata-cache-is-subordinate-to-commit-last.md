@@ -270,3 +270,13 @@ FS (`resetCheckpoint()`), not by editing settings.
   same-cycle conflict's duplicate"*, with the phase-barrier / lane-concurrency tests in the
   same file pinning the schedule. Cross-ref [ADR 0006](0006-remote-rename-detection-is-order-independent.md):
   rename *detection* is order-independent; rename *execution* stays serial — orthogonal.
+
+
+### Momoan Shadow execution boundary (M3)
+
+Shadow uses the same current observation and Admission as Write, but skips the
+executor and closes every working checkpoint view by abort. It publishes neither
+SyncRecords nor checkpoints, history, tracker acknowledgment, or backend settings.
+The bounded coldPreviewRequested flag selects full observation for one queued
+preview; it is not a recovery marker or durable authority. Namespace repair and
+opened-file mutation are suppressed. Write retains its existing publication owners.

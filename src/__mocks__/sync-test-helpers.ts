@@ -453,7 +453,9 @@ export function readText(
 export function mockSettings(
 	overrides: Partial<AirSyncSettings> = {},
 ): AirSyncSettings {
+	// Existing mutation regression fixtures explicitly exercise the retained Write path.
 	return {
+		syncMode: "write",
 		vaultId: "test-vault",
 		backendType: "test",
 		conflictStrategy: "auto_merge",

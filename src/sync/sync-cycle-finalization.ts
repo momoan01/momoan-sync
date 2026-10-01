@@ -10,6 +10,7 @@ interface SyncCycleFinalizationInput {
 	checkpoint: IFileSystem["checkpoint"];
 	scopeFingerprint: string;
 	checkpointBlocked?: boolean;
+	readOnly?: boolean;
 }
 
 /**
@@ -25,6 +26,7 @@ interface SyncCycleFinalizationInput {
  * other cycle that did not finish.
  */
 export type SyncCycleCompletion =
+	| { readonly kind: "shadow" }
 	| { readonly kind: "clean" }
 	| { readonly kind: "follow_up" }
 	| { readonly kind: "incomplete" };
@@ -46,6 +48,7 @@ async function abortWorkingView(checkpoint: IFileSystem["checkpoint"]): Promise<
 }
 
 function completionOf(input: Omit<SyncCycleFinalizationInput, "checkpoint">): SyncCycleCompletion["kind"] {
+	if (input.readOnly) return "shadow";
 	if (!everyActionFinished(input)) return "incomplete";
 	const failed = input.admission.dispositions.filter((disposition) => disposition.kind === "failed");
 	if (input.checkpointBlocked) return "follow_up";
