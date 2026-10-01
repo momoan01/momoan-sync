@@ -63,6 +63,18 @@ describe("backup service", () => {
 		expect(store.manifests).toEqual([manifest]);
 	});
 
+	it("creates a required safety snapshot with the requested trigger", async () => {
+		const store = new MemoryStore();
+		const source = createMockLocalFs();
+		addFile(source, "note.md", "hello");
+		const service = createService(store, { source });
+
+		const manifest = await service.createSnapshot("mass_change_guard");
+
+		expect(manifest.trigger).toBe("mass_change_guard");
+		expect(store.manifests).toEqual([manifest]);
+	});
+
 	it("lists and verifies completed snapshots for the current Vault", async () => {
 		const store = new MemoryStore();
 		const source = createMockLocalFs();

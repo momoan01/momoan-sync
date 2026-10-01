@@ -15,9 +15,11 @@ import { getBackendSettingsRenderer } from "./backend-settings";
 import { parseLines } from "../utils/parse-lines";
 import { isDotPrefixed } from "../utils/path";
 import { renderConfigSyncSettings } from "./config-sync-settings";
+import { createBackupRecoveryUiState, renderBackupRecoverySettings } from "./backup-recovery-settings";
 
 export class AirSyncSettingTab extends PluginSettingTab {
 	plugin: AirSyncPlugin;
+	private readonly backupRecovery = createBackupRecoveryUiState();
 
 	constructor(app: App, plugin: AirSyncPlugin) {
 		super(app, plugin);
@@ -114,35 +116,8 @@ export class AirSyncSettingTab extends PluginSettingTab {
 			);
 		}
 
-		new Setting(containerEl).setName("Backup").setHeading();
-		if (Platform.isMobile) {
-			new Setting(containerEl)
-				.setName("Local snapshots")
-				.setDesc("Local vault snapshots are desktop-only. File recovery, safety journal, and drive trash remain available on mobile.");
-		} else {
-			new Setting(containerEl)
-				.setName("Backup folder")
-				.setDesc("Existing absolute folder outside this vault. Momoan sync will create blobs, manifests, and metadata inside it.")
-				.addText((text) => text
-					.setPlaceholder("Absolute folder path")
-					.setValue(this.plugin.settings.backupDirectory)
-					.onChange(async (value) => {
-						this.plugin.settings.backupDirectory = value;
-						await this.plugin.saveSettings();
-					}));
-			new Setting(containerEl)
-				.setName("Local snapshot")
-				.setDesc(this.plugin.settings.backupDirectory
-					? "Create a content-addressed snapshot of the whole Vault now."
-					: "Choose an external backup folder first.")
-				.addButton((button) => button
-					.setButtonText("Backup now")
-					.setDisabled(!this.plugin.settings.backupDirectory.trim())
-					.onClick(async () => {
-						button.setDisabled(true);
-						try { await this.plugin.backupNow(); } finally { this.renderContent(); }
-					}));
-		}
+		renderBackupRecoverySettings(
+			containerEl, this.plugin, this.backupRecovery, () => this.renderContent());
 
 		// --- Advanced settings ---
 		new Setting(containerEl).setName("Advanced").setHeading();

@@ -13,6 +13,7 @@ import type {
 	BackupRestoreResult,
 	BackupRestoreSelection,
 	BackupSnapshotSummary,
+	BackupSnapshotTrigger,
 } from "./types";
 
 export interface BackupServiceDeps {
@@ -30,7 +31,11 @@ export class BackupService {
 
 	constructor(private readonly deps: BackupServiceDeps) {}
 
-	async backupNow(): Promise<BackupManifest> {
+	backupNow(): Promise<BackupManifest> {
+		return this.createSnapshot("manual");
+	}
+
+	async createSnapshot(trigger: BackupSnapshotTrigger): Promise<BackupManifest> {
 		if (this.running) throw new Error("Backup is already running");
 		this.running = true;
 		try {
@@ -39,7 +44,7 @@ export class BackupService {
 				store,
 				source: this.deps.source,
 				vaultId: this.deps.getVaultId(),
-				trigger: "manual",
+				trigger,
 			});
 		} finally {
 			this.running = false;

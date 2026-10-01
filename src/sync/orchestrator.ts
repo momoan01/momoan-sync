@@ -38,6 +38,7 @@ import { PriorityBatchState } from "./priority-batch-state";
 import { syncOpenedFilePriority } from "./opened-file-priority";
 import { RecoveryJournal } from "../recovery/journal";
 import { evaluateMassChangeGuard, type MassChangeGuardVerdict } from "./mass-change-guard";
+import { requireMassChangeSafetySnapshot } from "./mass-change-safety-snapshot";
 
 export type { SyncStatus };
 
@@ -66,6 +67,7 @@ export interface SyncOrchestratorDeps {
 	logger?: Logger;
 	/** Persist a cycle's resolved conflicts to the audit history (once per cycle). */
 	recordConflicts?: (records: ConflictRecord[]) => Promise<void>;
+	createMassChangeSafetySnapshot?: () => Promise<{ readonly snapshotId: string }>;
 }
 
 const MAX_RETRIES = 3;
@@ -571,16 +573,15 @@ export class SyncOrchestrator {
 
 		const classifyError = (err: unknown) => provider?.classifyError?.(err) ?? classifyHttpError(err);
 		const cycleId = crypto.randomUUID();
+		if (massGuard?.kind === "guard" && observedFullScan) {
+			await requireMassChangeSafetySnapshot(this.deps.createMassChangeSafetySnapshot, this.deps.logger, massGuard);
+		}
 		const recoveryCaptures = massGuard?.kind === "guard" && observedFullScan
 			? await this.recoveryJournal.capturePlan(admission.executable.actions, {
 				localFs, remoteFs, checksumRegistry: this.deps.checksumRegistry,
 			}, cycleId)
 			: undefined;
-		if (recoveryCaptures) {
-			this.deps.logger?.warn("Mass Change Guard safety capture completed", {
-				captured: recoveryCaptures.size, ...massGuard!.metrics,
-			});
-		}
+		if (recoveryCaptures) this.deps.logger?.warn("Mass Change Guard safety capture completed", { captured: recoveryCaptures.size, ...massGuard!.metrics });
 		const ctx: ExecutionContext = {
 			localFs,
 			remoteFs,

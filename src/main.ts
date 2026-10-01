@@ -37,7 +37,7 @@ export default class AirSyncPlugin extends Plugin {
 	private readonly checksumRegistry = createChecksumRegistry();
 	private logger!: Logger;
 	private conflictHistory!: ConflictHistory;
-	private backupService!: BackupService;
+	backupService!: BackupService;
 
 	async onload() {
 		const secretStore: ISecretStore = {
@@ -165,6 +165,7 @@ export default class AirSyncPlugin extends Plugin {
 			isBackendConnecting: () => this.backendManager.isConnecting(),
 			isLayoutReady: () => this.app.workspace.layoutReady,
 			recordConflicts: (records) => this.conflictHistory.append(records),
+			createMassChangeSafetySnapshot: () => this.backupService.createSnapshot("mass_change_guard"),
 		});
 
 		this.scheduler = new SyncScheduler({
