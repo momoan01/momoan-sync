@@ -83,7 +83,7 @@ class FakeGoogleDrive {
 		for (let i = 0; i < folderIds.length; i++) {
 			const parentId = folderIds[i]!;
 			for (const file of this.nodes.values()) {
-				if (!file.parents?.includes(parentId)) continue;
+				if (!file.parents?.includes(parentId) || file.trashed === true) continue;
 				descendants.push(this.copy(file));
 				if (file.mimeType === FOLDER_MIME) folderIds.push(file.id);
 			}
@@ -268,7 +268,7 @@ class FakeGoogleDrive {
 
 	listChildrenByName(parentId: string, name: string): Promise<GoogleDriveFile[]> {
 		return Promise.resolve([...this.nodes.values()]
-			.filter((n) => n.parents?.includes(parentId) && n.name === name)
+			.filter((n) => n.parents?.includes(parentId) && n.name === name && n.trashed !== true)
 			.map((n) => this.copy(n)));
 	}
 
@@ -309,10 +309,11 @@ class FakeGoogleDrive {
 	}
 
 	deleteFile(fileId: string): Promise<void> {
-		for (const id of [fileId, ...this.descendantsOf(fileId)]) {
-			this.nodes.delete(id);
-			this.contents.delete(id);
-		}
+		const file = this.nodes.get(fileId);
+		if (!file) return Promise.reject(Object.assign(new Error(`File not found: ${fileId}`), { status: 404 }));
+		const trashed = { ...file, trashed: true };
+		this.place(trashed, this.contents.get(fileId));
+		this.events.push({ type: "file", fileId, removed: false, file: this.copy(trashed) });
 		return Promise.resolve();
 	}
 
@@ -367,7 +368,7 @@ class FakeGoogleDrive {
 
 	replaceWithNewId(path: string): string {
 		const old = [...this.nodes.values()].find((n) => n.name === path);
-		if (old) this.nodes.delete(old.id);
+		if (old) void this.deleteFile(old.id);
 		const id = this.id("f");
 		this.place({ id, name: path, mimeType: "text/plain", parents: [ROOT], modifiedTime: MODIFIED, size: "3", md5Checksum: "replacement" });
 		return id;

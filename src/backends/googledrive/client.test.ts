@@ -448,3 +448,20 @@ describe("GoogleDriveClient 401 retry", () => {
 		mockRequestUrl.mockRestore();
 	});
 });
+
+
+describe("M4 GoogleDriveClient trash-only deletion", () => {
+	it("uses PATCH trashed=true and exposes no permanent delete switch", async () => {
+		const mockRequestUrl = (await spyRequestUrl()).mockResolvedValue(mockRes({}));
+		const { GoogleDriveClient } = await import("./client");
+		const client = new GoogleDriveClient(() => Promise.resolve("access"), testTransport());
+
+		await client.deleteFile("file-id");
+
+		expect(mockRequestUrl).toHaveBeenCalledTimes(1);
+		const request = mockRequestUrl.mock.calls[0]![0] as RequestUrlParam;
+		expect(request.method).toBe("PATCH");
+		expect(request.url).toContain("/files/file-id");
+		expect(request.body).toBe(JSON.stringify({ trashed: true }));
+	});
+});

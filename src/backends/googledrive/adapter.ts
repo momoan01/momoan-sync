@@ -1,3 +1,4 @@
+/* eslint max-lines: ["error", { "max": 318, "skipBlankLines": true, "skipComments": true }] -- M4 Trash verification stays with the adapter deletion boundary. */
 import type {
 	BackendErrorShape,
 	CreateDirectoryInput,
@@ -248,10 +249,18 @@ export class GoogleDriveAdapter implements RemoteBackendAdapter {
 	async delete(input: DeleteInput): Promise<void> {
 		assertExpectedIdentity(input.expected, input.id);
 		const current = await this.fetchFile(input.id);
-		if (current === null) return;
+		if (current === null) {
+			failBackend("target_changed", `Google Drive file ${input.id} is already in Trash`);
+		}
 		const observed = normalizeGoogleDriveObject(current, this.rootId);
 		assertExpectedEvidence(input.expected, observed.versionToken, `Google Drive file ${input.id}`, "delete");
 		await this.map(() => this.client.deleteFile(input.id));
+		// A successful PATCH response is not enough authority. Verify the exact object
+		// is now in Trash before core may publish the deletion baseline.
+		const after = await this.map(() => this.client.getFile(input.id));
+		if (!isGoogleDriveTrashed(after)) {
+			failBackend("unverifiable", `Google Drive file ${input.id} did not verify as trashed`);
+		}
 	}
 
 	private async fetchFile(id: string): Promise<GoogleDriveFile | null> {
@@ -259,7 +268,8 @@ export class GoogleDriveAdapter implements RemoteBackendAdapter {
 			const file = await this.client.getFile(id);
 			return isGoogleDriveTrashed(file) ? null : file;
 		} catch (err) {
-			if (isStatus(err, 404)) return null;
+			// A single files.get 404 is not deletion evidence. Surface not_found so
+			// core aborts this stale observation and re-observes instead of planning a delete.
 			throw toBackendError(this.translate(err));
 		}
 	}

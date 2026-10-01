@@ -182,3 +182,43 @@ describe("GoogleDriveAdapter keeps out-of-subtree objects out of the view", () =
 		expect(await adapter.getByPath("u.pdf")).toEqual([]);
 	});
 });
+
+
+describe("M4 GoogleDriveAdapter deletion authority", () => {
+	it("does not convert a direct files.get 404 into absence", async () => {
+		const getFile = vi.fn().mockRejectedValue(Object.assign(new Error("missing"), { status: 404 }));
+		const adapter = new GoogleDriveAdapter(stubClient({ getFile }), "root");
+
+		await expect(adapter.getById("gone")).rejects.toMatchObject({ kind: "not_found" });
+	});
+
+	it("accepts trashed=true as explicit deletion evidence", async () => {
+		const getFile = vi.fn().mockResolvedValue({ ...file("gone", ["root"]), trashed: true });
+		const adapter = new GoogleDriveAdapter(stubClient({ getFile }), "root");
+
+		await expect(adapter.getById("gone")).resolves.toBeNull();
+	});
+
+	it("verifies Drive Trash after an authorized remote delete", async () => {
+		const before = file("f1", ["root"], "2");
+		const after = { ...before, version: "3", trashed: true };
+		const getFile = vi.fn().mockResolvedValueOnce(before).mockResolvedValueOnce(after);
+		const deleteFile = vi.fn().mockResolvedValue(undefined);
+		const adapter = new GoogleDriveAdapter(stubClient({ getFile, deleteFile }), "root");
+
+		await adapter.delete({ id: "f1", expected: { id: "f1", versionToken: "googledrive:v:2" } });
+
+		expect(deleteFile).toHaveBeenCalledWith("f1");
+		expect(getFile).toHaveBeenCalledTimes(2);
+	});
+
+	it("fails closed when trash mutation cannot be verified", async () => {
+		const before = file("f1", ["root"], "2");
+		const getFile = vi.fn().mockResolvedValueOnce(before).mockResolvedValueOnce({ ...before, version: "3" });
+		const deleteFile = vi.fn().mockResolvedValue(undefined);
+		const adapter = new GoogleDriveAdapter(stubClient({ getFile, deleteFile }), "root");
+
+		await expect(adapter.delete({ id: "f1", expected: { id: "f1", versionToken: "googledrive:v:2" } }))
+			.rejects.toMatchObject({ kind: "unverifiable" });
+	});
+});

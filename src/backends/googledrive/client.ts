@@ -296,23 +296,16 @@ export class GoogleDriveClient {
 		return updated;
 	}
 
-	/** Delete a file or folder (trash or permanent) */
-	async deleteFile(fileId: string, permanent = false): Promise<void> {
-		if (permanent) {
-			await this.request("deleteFile", {
-				url: `${GOOGLE_DRIVE_API}/files/${fileId}`,
-				method: "DELETE",
-			});
-		} else {
-			await this.request("trashFile", {
-				url: `${GOOGLE_DRIVE_API}/files/${fileId}`,
-				method: "PATCH",
-				headers: {
-					"Content-Type": "application/json",
-				},
-				body: JSON.stringify({ trashed: true }),
-			});
-		}
+	/** Move a file or folder to Drive Trash. Momoan has no production hard-delete route. */
+	async deleteFile(fileId: string): Promise<void> {
+		await this.request("trashFile", {
+			url: `${GOOGLE_DRIVE_API}/files/${fileId}`,
+			method: "PATCH",
+			headers: {
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ trashed: true }),
+		});
 	}
 
 	/** Get the start page token for changes.list */
