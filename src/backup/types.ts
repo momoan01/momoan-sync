@@ -40,3 +40,24 @@ export interface BackupIntegrityResult {
 	readonly missingBlobs: readonly string[];
 	readonly corruptBlobs: readonly string[];
 }
+
+export type BackupRestoreSelection =
+	| { readonly kind: "all" }
+	| { readonly kind: "file"; readonly path: string }
+	| { readonly kind: "folder"; readonly path: string };
+
+export interface BackupRestoreResult {
+	readonly snapshotId: string;
+	readonly targetDirectory: string;
+	readonly restoredFiles: number;
+	readonly restoredDirectories: number;
+}
+
+export interface BackupSnapshotSummary {
+	readonly snapshotId: string;
+	readonly createdAt: string;
+	readonly trigger: BackupSnapshotTrigger;
+	readonly fileCount: number;
+	readonly directoryCount: number;
+	readonly totalBytes: number;
+}

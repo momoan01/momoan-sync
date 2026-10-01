@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { addFile, createMockLocalFs, deferred } from "../__mocks__/sync-test-helpers";
 import type { BackupStore } from "./blob-store";
+import type { DesktopRestoreRequest } from "./desktop-restore";
 import { BackupService } from "./service";
 import type { BackupManifest, PendingBackupManifest } from "./types";
 
@@ -22,6 +23,21 @@ class MemoryStore implements BackupStore {
 		return Promise.resolve(this.manifests.find((manifest) => manifest.snapshotId === id) ?? null);
 	}
 	listManifests(): Promise<BackupManifest[]> { return Promise.resolve([...this.manifests]); }
+}
+
+function createService(
+	store: MemoryStore,
+	overrides: Partial<ConstructorParameters<typeof BackupService>[0]> = {},
+): BackupService {
+	return new BackupService({
+		source: createMockLocalFs(),
+		getVaultId: () => "vault-1",
+		getBackupDirectory: () => "/outside",
+		getVaultBasePath: () => "/vault",
+		isMobile: () => false,
+		createStore: () => Promise.resolve(store),
+		...overrides,
+	});
 }
 
 describe("backup service", () => {
@@ -47,6 +63,86 @@ describe("backup service", () => {
 		expect(store.manifests).toEqual([manifest]);
 	});
 
+	it("lists and verifies completed snapshots for the current Vault", async () => {
+		const store = new MemoryStore();
+		const source = createMockLocalFs();
+		addFile(source, "note.md", "hello");
+		const service = createService(store, { source });
+		const manifest = await service.backupNow();
+
+		const summaries = await service.listSnapshots();
+		const integrity = await service.verifySnapshot(manifest.snapshotId);
+
+		expect(summaries).toEqual([{
+			snapshotId: manifest.snapshotId,
+			createdAt: manifest.createdAt,
+			trigger: "manual",
+			fileCount: 1,
+			directoryCount: 0,
+			totalBytes: 5,
+		}]);
+		expect(integrity.ok).toBe(true);
+	});
+
+	it("restores only after integrity verification and preserves explicit selection", async () => {
+		const store = new MemoryStore();
+		const source = createMockLocalFs();
+		addFile(source, "note.md", "hello");
+		const requests: DesktopRestoreRequest[] = [];
+		const service = createService(store, {
+			source,
+			restoreSnapshot: (value) => {
+				requests.push(value);
+				return Promise.resolve({
+					snapshotId: value.manifest.snapshotId,
+					targetDirectory: "/restore/output",
+					restoredFiles: 1,
+					restoredDirectories: 0,
+				});
+			},
+		});
+		const manifest = await service.backupNow();
+
+		const result = await service.restoreSnapshot(
+			manifest.snapshotId,
+			"/restore",
+			{ kind: "file", path: "note.md" },
+		);
+
+		expect(requests[0]?.selection).toEqual({ kind: "file", path: "note.md" });
+		expect(requests[0]?.backupDirectory).toBe("/outside");
+		expect(result.restoredFiles).toBe(1);
+	});
+
+	it("blocks restore when snapshot integrity no longer holds", async () => {
+		const store = new MemoryStore();
+		const source = createMockLocalFs();
+		addFile(source, "note.md", "hello");
+		const service = createService(store, {
+			source,
+			restoreSnapshot: () => Promise.reject(new Error("must not run")),
+		});
+		const manifest = await service.backupNow();
+		const file = manifest.entries.find((entry) => entry.kind === "file");
+		if (!file?.contentHash) throw new Error("expected backup file");
+		store.blobs.set(file.contentHash, new TextEncoder().encode("tampered").buffer);
+
+		await expect(service.restoreSnapshot(manifest.snapshotId, "/restore"))
+			.rejects.toThrow("integrity verification");
+	});
+
+	it("does not expose another Vault's snapshot through recovery APIs", async () => {
+		const store = new MemoryStore();
+		const source = createMockLocalFs();
+		addFile(source, "note.md", "hello");
+		const owner = createService(store, { source });
+		const manifest = await owner.backupNow();
+		const otherVault = createService(store, { getVaultId: () => "vault-2" });
+
+		expect(await otherVault.listSnapshots()).toEqual([]);
+		await expect(otherVault.verifySnapshot(manifest.snapshotId)).rejects.toThrow("current Vault");
+	});
+
 	it("keeps local snapshots disabled on mobile", async () => {
 		const service = new BackupService({
 			source: createMockLocalFs(),
@@ -57,6 +153,7 @@ describe("backup service", () => {
 			createStore: () => Promise.reject(new Error("must not run")),
 		});
 		await expect(service.backupNow()).rejects.toThrow("unavailable on mobile");
+		await expect(service.listSnapshots()).rejects.toThrow("unavailable on mobile");
 	});
 
 	it("serializes manual backup requests instead of racing one store", async () => {
