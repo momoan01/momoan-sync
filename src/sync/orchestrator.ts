@@ -1,3 +1,4 @@
+import { createShadowPreview, shadowPreviewSummary, type ShadowPreviewReport } from "./shadow-preview";
 import { syncExecutionMode, type AirSyncSettings, type SyncExecutionMode } from "../settings";
 import type { IFileSystem } from "../fs/interface";
 import type { ChecksumRegistry } from "../fs/modules/checksum-registry";
@@ -72,6 +73,7 @@ export class SyncOrchestrator {
 	private stateStore: SyncStateStore;
 	private syncPending = false;
 	private coldPreviewRequested = false;
+	private latestShadowPreview: ShadowPreviewReport | null = null;
 	private readonly priorityCoordinator = new PriorityCoordinator();
 	private readonly localMutationBarrier = new LocalMutationBarrier();
 	private activeBatch: PriorityBatchState | null = null;
@@ -83,6 +85,10 @@ export class SyncOrchestrator {
 		this.deps = deps;
 		const vaultId = deps.getSettings().vaultId;
 		this.stateStore = new SyncStateStore(vaultId);
+	}
+
+	getLatestShadowPreview(): ShadowPreviewReport | null {
+		return this.latestShadowPreview ? structuredClone(this.latestShadowPreview) : null;
 	}
 
 	get state(): SyncStateStore {
@@ -200,6 +206,7 @@ export class SyncOrchestrator {
 				const settings = this.deps.getSettings();
 				const conflictStrategy = settings.conflictStrategy;
 				const executionMode = syncExecutionMode(settings);
+				if (executionMode === "shadow") this.latestShadowPreview = null;
 
 				const scopeFingerprint = await computeScopeFingerprint(
 					settings,
@@ -419,6 +426,7 @@ export class SyncOrchestrator {
 		if (!localFs || !remoteFs) {
 			throw new Error("Cannot sync: local or remote filesystem is not available");
 		}
+		let observedFullScan = forceFullScan;
 		try {
 			const closed = await runSyncCycleAttempt(remoteFs.checkpoint, async () => {
 		const preparationPermit = await this.priorityCoordinator.acquireNormalPermit();
@@ -489,7 +497,8 @@ export class SyncOrchestrator {
 				forceFullScan,
 			});
 
-		const { renamePairs } = snapshot;
+		observedFullScan = changeSet.temperature === "cold";
+					const { renamePairs } = snapshot;
 
 		const planning = await prepareSyncCycleSnapshotForExecution(
 			changeSet,
@@ -569,6 +578,8 @@ export class SyncOrchestrator {
 			});
 			const { settings, provider, admission, execution } = closed.value;
 			if (executionMode === "shadow") {
+				this.latestShadowPreview = createShadowPreview(admission, observedFullScan, !!remoteFs.namespaceReconciliation);
+				this.deps.logger?.info("Shadow preview complete", { summary: shadowPreviewSummary(this.latestShadowPreview) });
 				return { execution, admissionFailures: admission.failures, completion: closed.completion };
 			}
 			// Settings are supplementary, after the attempt's working view is closed.

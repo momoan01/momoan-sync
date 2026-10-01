@@ -1,3 +1,5 @@
+import { syncExecutionMode } from "../settings";
+import { shadowPreviewSummary } from "../sync/shadow-preview";
 import {
 	App,
 	Notice,
@@ -44,6 +46,21 @@ export class AirSyncSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl).setName("Sync").setHeading();
+		const shadow = syncExecutionMode(this.plugin.settings) === "shadow";
+		if (shadow) {
+			new Setting(containerEl).setName("Shadow mode · Google Drive")
+				.setDesc("No files will be changed.")
+				.addButton(button => button.setButtonText("Run preview").onClick(async () => {
+					button.setDisabled(true);
+					try { await this.plugin.runSync(); } finally { this.renderContent(); }
+				}));
+			const preview = this.plugin.getLatestShadowPreview();
+			if (preview) {
+				new Setting(containerEl).setName("Latest preview").setDesc(shadowPreviewSummary(preview));
+				new Setting(containerEl).setName("Preview diagnostics")
+					.setDesc("Blocked " + preview.blockedCount + " · Admission failures " + preview.admissionFailureCount + ". " + preview.diagnostics.join(" "));
+			}
+		}
 
 		new Setting(containerEl)
 			.setName("Conflict strategy")
@@ -101,13 +118,13 @@ export class AirSyncSettingTab extends PluginSettingTab {
 		new Setting(containerEl).setName("Advanced").setHeading();
 
 		new Setting(containerEl)
-			.setName("Rescan vault")
+			.setName(shadow ? "Cold preview" : "Rescan vault")
 			.setDesc(
-				"Discard the remote sync checkpoint and fully reconcile against the remote on the next sync. Use this if sync seems stuck or incomplete after an interrupted sync. It compares files rather than re-downloading them, and keeps your sync history."
+				shadow ? "Run a full observation preview without changing files or the saved checkpoint." : "Discard the remote sync checkpoint and fully reconcile against the remote on the next sync. Use this if sync seems stuck or incomplete after an interrupted sync. It compares files rather than re-downloading them, and keeps your sync history."
 			)
 			.addButton((button) =>
-				button.setButtonText("Rescan").onClick(() => {
-					new Notice("Starting a full rescan");
+				button.setButtonText(shadow ? "Run cold preview" : "Rescan").onClick(() => {
+					new Notice(shadow ? "Starting a full preview" : "Starting a full rescan");
 					void this.plugin.rescan();
 				})
 			);

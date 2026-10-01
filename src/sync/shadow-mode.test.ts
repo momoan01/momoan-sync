@@ -4,7 +4,7 @@ import { DEFAULT_SETTINGS, syncExecutionMode } from "../settings";
 import { SyncOrchestrator, type SyncOrchestratorDeps } from "./orchestrator";
 import { LocalChangeTracker } from "./local-tracker";
 import { createChecksumRegistry } from "../fs/modules/checksum-registry";
-import { addFile, confirmMockPath, createMockLocalFs, createMockRemoteFs, mockSettings } from "../__mocks__/sync-test-helpers";
+import { addFile, deferred, confirmMockPath, createMockLocalFs, createMockRemoteFs, mockSettings } from "../__mocks__/sync-test-helpers";
 import * as executor from "./plan-executor";
 import * as admissionModule from "./plan-admission";
 import * as detector from "./change-detector";
@@ -90,5 +90,48 @@ describe("M3 shadow zero-mutation contract", () => {
  });
  it("Write rescan retains reset, reconciliation, execution and commit semantics", async () => {
   const f = fixture("write"); await f.engine.rescan(); expect(f.checkpoint.resetCheckpoint).toHaveBeenCalledOnce(); expect(f.reconcile).toHaveBeenCalled(); expect(f.checkpoint.commitCheckpoint).toHaveBeenCalled(); expect(f.acknowledge).toHaveBeenCalled();
+ });
+});
+
+
+describe("M3 preview session lifecycle", () => {
+ it("publishes the exact admitted plan after abort, with a detached read-only accessor", async () => {
+  const f = fixture(); const admit = vi.spyOn(admissionModule, "admitBatchObservation"); expect(f.engine.getLatestShadowPreview()).toBeNull();
+  await f.engine.runSync(); readOnly(f); const report = f.engine.getLatestShadowPreview();
+  const result = admit.mock.results[0]?.value as ReturnType<typeof admissionModule.admitBatchObservation>;
+  expect(report?.actions.map(({ path, action }) => ({ path, action }))).toEqual(result.executable.actions.map(({ path, action }) => ({ path, action })));
+  expect(report?.actionCount).toBe(result.executable.actions.length); expect(report?.namespaceReconciliation).toBe("suppressed_unverified");
+  if (!report) throw new Error("Missing preview"); Object.assign(report, { actionCount: -1 }); expect(f.engine.getLatestShadowPreview()?.actionCount).toBeGreaterThan(0);
+  expect(f.status).not.toHaveBeenCalledWith("idle");
+ });
+ it("does not retain a successful report when a new preview fails", async () => {
+  const f = fixture(); await f.engine.runSync(); expect(f.engine.getLatestShadowPreview()).not.toBeNull();
+  vi.spyOn(f.remote, "list").mockRejectedValue(new Error("Observation failed")); await f.engine.runSync(); expect(f.engine.getLatestShadowPreview()).toBeNull(); readOnly(f);
+ });
+ it("scope-change forces full preview without resetting or committing checkpoint", async () => {
+  const f = fixture(); f.remote.checkpoint = { ...f.checkpoint, getScopeFingerprint: vi.fn().mockResolvedValue("other-root") };
+  await f.engine.runSync(); expect(f.engine.getLatestShadowPreview()?.fullScan).toBe(true); readOnly(f);
+ });
+ it("retains a previously committed baseline through update/delete/conflict previews", async () => {
+  const f = fixture("write"); addFile(f.local, "conflict.md", "original", 1000); await f.engine.runSync();
+  const baseline = await f.engine.state.getAll(); const durable = f.authority().durable;
+  f.settings.syncMode = "shadow"; addFile(f.local, "local.md", "updated", 2000); f.local.files.delete("remote.md");
+  addFile(f.local, "conflict.md", "local edit", 2000); addFile(f.remote, "conflict.md", "remote edit", 3000);
+  f.tracker.markDirty("local.md"); f.tracker.markDirty("remote.md"); f.tracker.markDirty("conflict.md"); const tracker = f.tracker.snapshot();
+  vi.clearAllMocks(); await f.engine.runSync(); await f.engine.runSync();
+  for (const spy of [...f.mutations, ...f.stateWrites, f.reconcile, f.acknowledge, f.consume, f.save, f.history, f.checkpoint.commitCheckpoint, f.checkpoint.resetCheckpoint]) expect(spy).not.toHaveBeenCalled();
+  expect(await f.engine.state.getAll()).toEqual(baseline); expect(f.tracker.snapshot()).toEqual(tracker); expect(f.authority()).toEqual({ working: false, durable });
+  const report = f.engine.getLatestShadowPreview(); expect(report?.actionCounts.push).toBeGreaterThan(0); expect(report?.actionCounts.delete_remote).toBe(1); expect(report?.conflictsCount).toBe(1);
+ });
+});
+
+
+describe("Shadow opened-file coalescing", () => {
+ it("coalesces file-open during observation into another preview with zero mutation", async () => {
+  const f = fixture(); const entered = deferred<void>(); const release = deferred<void>(); const list = f.remote.list.bind(f.remote);
+  vi.spyOn(f.remote, "list").mockImplementationOnce(async () => { entered.resolve(); await release.promise; return list(); });
+  const execute = vi.spyOn(executor, "executePlan"); const cycle = f.engine.runSync(); await entered.promise;
+  await f.engine.pullSingle("remote.md"); release.resolve(); await cycle;
+  expect(execute).not.toHaveBeenCalled(); expect(f.checkpoint.abortWorkingView).toHaveBeenCalledTimes(2); readOnly(f);
  });
 });

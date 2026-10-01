@@ -133,6 +133,7 @@ export class Setting {
 				return btn;
 			},
 			setCta: () => btn,
+			setDisabled: () => btn,
 			onClick: (h: () => void) => {
 				handler = h;
 				return btn;

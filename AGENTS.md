@@ -236,3 +236,7 @@ SyncRecords nor checkpoints, history, tracker acknowledgment, or backend setting
 The bounded coldPreviewRequested flag selects full observation for one queued
 preview; it is not a recovery marker or durable authority. Namespace repair and
 opened-file mutation are suppressed. Write retains its existing publication owners.
+
+The latestShadowPreview field contains only a detached, read-only, whitelisted
+report projection after attempt abort. It is replaced per preview, never persisted,
+and never consumed by observation, Admission, or execution as authority.

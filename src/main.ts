@@ -1,5 +1,5 @@
 import { Notice, Platform, Plugin, setIcon, setTooltip } from "./platform/obsidian";
-import { DEFAULT_SETTINGS, AirSyncSettings } from "./settings";
+import { DEFAULT_SETTINGS, AirSyncSettings, syncExecutionMode } from "./settings";
 import { liftActiveBackendData, normalizeBackendModuleSettings, normalizeConflictStrategy } from "./settings-normalize";
 import { getEffectiveSyncDotPaths } from "./config-sync";
 import { AirSyncSettingTab } from "./ui/settings";
@@ -90,7 +90,7 @@ export default class AirSyncPlugin extends Plugin {
 			getLogger: () => this.logger,
 			getVaultName: () => this.app.vault.getName(),
 			onConnected: () => {
-				this.syncStatus = "idle";
+				this.syncStatus = syncExecutionMode(this.settings) === "shadow" ? "shadow_ready" : "idle";
 				this.updateStatusBar();
 			},
 			onDisconnected: () => {
@@ -199,7 +199,7 @@ export default class AirSyncPlugin extends Plugin {
 		// Commands
 		this.addCommand({
 			id: "sync-now",
-			name: "Sync now",
+			name: syncExecutionMode(this.settings) === "shadow" ? "Run preview" : "Sync now",
 			callback: () => {
 				void this.runSync();
 			},
@@ -211,7 +211,7 @@ export default class AirSyncPlugin extends Plugin {
 		syncTriggerEl.addClass("mod-clickable");
 		setIcon(syncTriggerEl, "cloud");
 		// `top` so the tooltip clears the status bar at the bottom edge.
-		setTooltip(syncTriggerEl, "Sync now", { placement: "top" });
+		setTooltip(syncTriggerEl, syncExecutionMode(this.settings) === "shadow" ? "Run preview — no files will be changed" : "Sync now", { placement: "top" });
 		this.registerDomEvent(syncTriggerEl, "click", () => {
 			void this.runSync();
 		});
@@ -278,6 +278,10 @@ export default class AirSyncPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
+	getLatestShadowPreview() {
+		return this.orchestrator.getLatestShadowPreview();
+	}
+
 	async runSync(): Promise<void> {
 		if (this.orchestrator.isSyncing()) return;
 		try {
@@ -323,18 +327,22 @@ export default class AirSyncPlugin extends Plugin {
 
 	private updateStatusBar(): void {
 		if (!this.statusBarEl) return;
+		const shadow = syncExecutionMode(this.settings) === "shadow";
 		switch (this.syncStatus) {
+			case "shadow_ready":
+				this.statusBarEl.setText(this.getLatestShadowPreview() ? "Preview complete" : "Shadow ready");
+				break;
 			case "idle":
-				this.statusBarEl.setText("Synced");
+				this.statusBarEl.setText(shadow ? "Shadow ready" : "Synced");
 				break;
 			case "syncing":
-				this.statusBarEl.setText("Syncing...");
+				this.statusBarEl.setText(shadow ? "Running preview..." : "Syncing...");
 				break;
 			case "error":
-				this.statusBarEl.setText("Sync error");
+				this.statusBarEl.setText(shadow ? "Preview error" : "Sync error");
 				break;
 			case "partial_error":
-				this.statusBarEl.setText("Synced (with errors)");
+				this.statusBarEl.setText(shadow ? "Preview has blocked actions" : "Synced (with errors)");
 				break;
 			case "not_connected":
 				this.statusBarEl.setText("Not connected");
