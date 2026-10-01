@@ -56,6 +56,8 @@ export interface DataAdapter {
 	mkdir(path: string): Promise<void>;
 	remove(path: string): Promise<void>;
 	rmdir(path: string, recursive: boolean): Promise<void>;
+	/** Desktop filesystem adapters expose the absolute Vault root. */
+	getBasePath?(): string;
 }
 
 export interface TAbstractFile {

@@ -1,4 +1,4 @@
-import type { IFileSystem } from "../fs/interface";
+import type { BackupSource } from "./source";
 import type { FileEntity } from "../fs/types";
 import { sha256 } from "../utils/hash";
 import type { BackupStore } from "./blob-store";
@@ -12,7 +12,7 @@ import type {
 
 export interface CreateBackupSnapshotRequest {
 	readonly store: BackupStore;
-	readonly source: IFileSystem;
+	readonly source: BackupSource;
 	readonly vaultId: string;
 	readonly trigger: BackupSnapshotTrigger;
 	readonly snapshotId?: () => string;
@@ -75,7 +75,7 @@ interface CapturedBackupFile {
 	readonly contentHash: string;
 }
 
-async function captureStableFile(source: IFileSystem, observed: FileEntity): Promise<CapturedBackupFile> {
+async function captureStableFile(source: BackupSource, observed: FileEntity): Promise<CapturedBackupFile> {
 	const before = await source.stat(observed.path);
 	assertSameFile(before, observed, observed.path);
 	const first = await source.read(observed.path);

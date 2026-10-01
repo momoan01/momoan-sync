@@ -19,6 +19,8 @@ import { LocalChangeTracker } from "./sync/local-tracker";
 import { Logger, getDeviceName } from "./logging/logger";
 import { ConflictHistory } from "./sync/conflict-history";
 import { handleOAuthProtocolCallback } from "./fs/oauth-callback-error";
+import { BackupService } from "./backup/service";
+import { VaultBackupSource } from "./backup/vault-source";
 
 export default class AirSyncPlugin extends Plugin {
 	settings!: AirSyncSettings;
@@ -35,6 +37,7 @@ export default class AirSyncPlugin extends Plugin {
 	private readonly checksumRegistry = createChecksumRegistry();
 	private logger!: Logger;
 	private conflictHistory!: ConflictHistory;
+	private backupService!: BackupService;
 
 	async onload() {
 		const secretStore: ISecretStore = {
@@ -47,6 +50,13 @@ export default class AirSyncPlugin extends Plugin {
 		this.localFs = new LocalFs(this.app, () =>
 			getEffectiveSyncDotPaths(this.settings, this.app.vault.configDir)
 		);
+		this.backupService = new BackupService({
+			source: new VaultBackupSource(this.app.vault.adapter),
+			getVaultId: () => this.settings.vaultId,
+			getBackupDirectory: () => this.settings.backupDirectory,
+			getVaultBasePath: () => this.app.vault.adapter.getBasePath?.() ?? null,
+			isMobile: () => Platform.isMobile,
+		});
 
 		const deviceName = getDeviceName(Platform.isMobile, this.settings.vaultId);
 		const internalDir = `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
@@ -204,6 +214,13 @@ export default class AirSyncPlugin extends Plugin {
 				void this.runSync();
 			},
 		});
+		if (!Platform.isMobile) {
+			this.addCommand({
+				id: "backup-now",
+				name: "Backup now",
+				callback: () => { void this.backupNow(); },
+			});
+		}
 
 		// Status bar: a clickable cloud icon triggers a manual sync, with the
 		// sync status shown as text beside it.
@@ -280,6 +297,19 @@ export default class AirSyncPlugin extends Plugin {
 
 	getLatestShadowPreview() {
 		return this.orchestrator.getLatestShadowPreview();
+	}
+
+	async backupNow(): Promise<void> {
+		try {
+			const manifest = await this.backupService.backupNow();
+			const files = manifest.entries.filter((entry) => entry.kind === "file").length;
+			this.logger.info("Backup completed", { snapshotId: manifest.snapshotId, files });
+			new Notice(`Backup complete · ${files} files`);
+		} catch (err) {
+			const message = errorMessage(err);
+			this.logger.warn("Backup failed", { message });
+			new Notice(`Backup failed: ${message}`);
+		}
 	}
 
 	async runSync(): Promise<void> {

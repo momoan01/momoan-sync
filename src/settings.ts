@@ -39,6 +39,8 @@ export interface AirSyncSettings {
 	screenWakeLockOnSync: boolean;
 	/** Show a notice summarizing each completed sync cycle (independent of logging) */
 	showSyncNotifications: boolean;
+	/** Existing absolute desktop directory used as the external Backup Store root. */
+	backupDirectory: string;
 
 	/** Write sync logs to .airsync/logs/{device}/{date}.log */
 	enableLogging: boolean;
@@ -80,6 +82,7 @@ export const DEFAULT_SETTINGS: AirSyncSettings = {
 	mobileMaxFileSizeMB: 10,
 	screenWakeLockOnSync: false,
 	showSyncNotifications: false,
+	backupDirectory: "",
 	enableLogging: false,
 	logLevel: "info",
 	backendData: {},

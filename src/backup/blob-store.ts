@@ -14,7 +14,7 @@ export interface BackupStore {
 	putBlob(contentHash: string, content: ArrayBuffer): Promise<void>;
 	/** Read a blob for integrity verification and restore. */
 	getBlob(contentHash: string): Promise<ArrayBuffer | null>;
-	/** Atomically replace the pending marker with the complete manifest. */
+	/** Atomically publish the complete manifest, then clear the pending marker. */
 	commitSnapshot(manifest: BackupManifest): Promise<void>;
 	/** Return only completed/restorable manifests. */
 	getManifest(snapshotId: string): Promise<BackupManifest | null>;

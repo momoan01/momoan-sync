@@ -1,0 +1,77 @@
+import { describe, expect, it } from "vitest";
+import { addFile, createMockLocalFs, deferred } from "../__mocks__/sync-test-helpers";
+import type { BackupStore } from "./blob-store";
+import { BackupService } from "./service";
+import type { BackupManifest, PendingBackupManifest } from "./types";
+
+class MemoryStore implements BackupStore {
+	readonly blobs = new Map<string, ArrayBuffer>();
+	readonly manifests: BackupManifest[] = [];
+	private pending: PendingBackupManifest | null = null;
+	beginSnapshot(manifest: PendingBackupManifest): Promise<void> { this.pending = manifest; return Promise.resolve(); }
+	hasBlob(hash: string): Promise<boolean> { return Promise.resolve(this.blobs.has(hash)); }
+	putBlob(hash: string, content: ArrayBuffer): Promise<void> { this.blobs.set(hash, content.slice(0)); return Promise.resolve(); }
+	getBlob(hash: string): Promise<ArrayBuffer | null> { return Promise.resolve(this.blobs.get(hash)?.slice(0) ?? null); }
+	commitSnapshot(manifest: BackupManifest): Promise<void> {
+		if (!this.pending) return Promise.reject(new Error("missing pending"));
+		this.pending = null;
+		this.manifests.push(manifest);
+		return Promise.resolve();
+	}
+	getManifest(id: string): Promise<BackupManifest | null> {
+		return Promise.resolve(this.manifests.find((manifest) => manifest.snapshotId === id) ?? null);
+	}
+	listManifests(): Promise<BackupManifest[]> { return Promise.resolve([...this.manifests]); }
+}
+
+describe("backup service", () => {
+	it("creates a manual whole-Vault snapshot through the configured desktop store", async () => {
+		const source = createMockLocalFs();
+		addFile(source, "note.md", "hello");
+		const store = new MemoryStore();
+		const calls: string[][] = [];
+		const service = new BackupService({
+			source,
+			getVaultId: () => "vault-1",
+			getBackupDirectory: () => " /outside ",
+			getVaultBasePath: () => "/vault",
+			isMobile: () => false,
+			createStore: (vault, backup) => { calls.push([vault, backup]); return Promise.resolve(store); },
+		});
+
+		const manifest = await service.backupNow();
+
+		expect(calls).toEqual([["/vault", "/outside"]]);
+		expect(manifest.trigger).toBe("manual");
+		expect(manifest.entries.some((entry) => entry.path === "note.md")).toBe(true);
+		expect(store.manifests).toEqual([manifest]);
+	});
+
+	it("keeps local snapshots disabled on mobile", async () => {
+		const service = new BackupService({
+			source: createMockLocalFs(),
+			getVaultId: () => "vault-1",
+			getBackupDirectory: () => "/outside",
+			getVaultBasePath: () => "/vault",
+			isMobile: () => true,
+			createStore: () => Promise.reject(new Error("must not run")),
+		});
+		await expect(service.backupNow()).rejects.toThrow("unavailable on mobile");
+	});
+
+	it("serializes manual backup requests instead of racing one store", async () => {
+		const gate = deferred<BackupStore>();
+		const service = new BackupService({
+			source: createMockLocalFs(),
+			getVaultId: () => "vault-1",
+			getBackupDirectory: () => "/outside",
+			getVaultBasePath: () => "/vault",
+			isMobile: () => false,
+			createStore: () => gate.promise,
+		});
+		const first = service.backupNow();
+		await expect(service.backupNow()).rejects.toThrow("already running");
+		gate.resolve(new MemoryStore());
+		await first;
+	});
+});

@@ -473,6 +473,7 @@ export function mockSettings(
 		mobileMaxFileSizeMB: 10,
 		screenWakeLockOnSync: false,
 		showSyncNotifications: false,
+		backupDirectory: "",
 		enableLogging: false,
 		logLevel: "info",
 		backendData: {},
