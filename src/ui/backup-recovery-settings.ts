@@ -32,7 +32,7 @@ export function renderBackupRecoverySettings(
 	rerender: () => void,
 ): void {
 	const t = settingsTranslator(plugin.settings.uiLanguage);
-	new Setting(containerEl).setName(t("Backup")).setHeading();
+	new Setting(containerEl).setName(t("Backup")).setHeading().settingEl.addClass("momoan-sync-subheading");
 	if (Platform.isMobile) {
 		new Setting(containerEl)
 			.setName(t("Local snapshots"))
@@ -73,7 +73,7 @@ export function renderBackupRecoverySettings(
 				try { await plugin.backupNow(); } finally { rerender(); }
 			}));
 
-	new Setting(containerEl).setName(t("Recovery")).setHeading();
+	new Setting(containerEl).setName(t("Recovery")).setHeading().settingEl.addClass("momoan-sync-subheading");
 	new Setting(containerEl)
 		.setName(t("Snapshots"))
 		.setDesc(snapshotListDescription(state.snapshots, t))

@@ -47,15 +47,19 @@
 
 /* Momoan product family: compact spacing, quiet surfaces, clear section hierarchy. */
 .momoan-sync-settings { --momoan-radius: 12px; max-width: 860px; margin-inline: auto; }
-.momoan-sync-settings .setting-item { padding-block: 12px; gap: 16px; }
-.momoan-sync-settings .setting-item-heading { margin-top: 24px; padding-bottom: 10px; }
+.momoan-sync-settings .setting-item { padding-block: 9px; gap: 14px; }
+.momoan-sync-settings .setting-item-heading { margin: 16px 0 4px; padding: 4px 2px 6px; }
+.momoan-sync-settings .setting-item-heading:first-child { margin-top: 0; }
+.momoan-sync-settings .momoan-sync-subheading { margin: 8px 0 2px; padding: 2px 2px 4px; }
+.momoan-sync-settings .momoan-sync-subheading .setting-item-name { color: var(--text-muted); font-size: .95em; font-weight: 600; }
 .momoan-sync-settings .setting-item-name { font-weight: 550; }
-.momoan-sync-settings .setting-item-description { line-height: 1.55; font-size: var(--font-ui-small); }
+.momoan-sync-settings .setting-item-description { line-height: 1.5; font-size: var(--font-ui-small); }
 .momoan-sync-settings input:not([type=checkbox]), .momoan-sync-settings select,
 .momoan-sync-settings button { border-radius: 8px; }
 .momoan-sync-write-confirmation .setting-item-description { line-height: 1.6; }
-.momoan-sync-write-confirmation .setting-item { padding-block: 12px; }
+.momoan-sync-write-confirmation .setting-item { padding: 10px; }
 @media (max-width: 600px) {
-  .momoan-sync-settings .setting-item { flex-wrap: wrap; }
+  .momoan-sync-settings .setting-item { flex-wrap: wrap; padding-block: 8px; gap: 10px; }
+  .momoan-sync-settings .momoan-sync-subheading { margin-top: 6px; }
   .momoan-sync-settings .setting-item-control { max-width: 100%; }
 }

@@ -38,7 +38,7 @@ export function renderRecoveryJournalSettings(
 	rerender: () => void,
 ): void {
 	const t = settingsTranslator(plugin.settings.uiLanguage);
-	new Setting(containerEl).setName(t("Recent sync recovery")).setHeading();
+	new Setting(containerEl).setName(t("Recent sync recovery")).setHeading().settingEl.addClass("momoan-sync-subheading");
 	new Setting(containerEl)
 		.setName(t("Safety journal"))
 		.setDesc(t("Captured file states from before destructive sync actions. Restoring exports a copy and never replays the sync action."))

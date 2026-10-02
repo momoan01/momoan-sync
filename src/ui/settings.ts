@@ -74,7 +74,7 @@ export class AirSyncSettingTab extends PluginSettingTab {
 		if (renderer) {
 			new Setting(containerEl)
 				.setName(provider?.displayName ?? "Backend")
-				.setHeading();
+				.setHeading().settingEl.addClass("momoan-sync-subheading");
 
 			renderer.render(
 				containerEl,
@@ -111,7 +111,7 @@ export class AirSyncSettingTab extends PluginSettingTab {
 			if (preview) {
 				new Setting(containerEl).setName(t("Latest preview")).setDesc(shadowPreviewSummary(preview).replace(/Create|Update|Rename|Delete|Conflicts/g, label => t(label)));
 				new Setting(containerEl).setName(t("Preview diagnostics"))
-					.setDesc(t("Blocked") + " " + preview.blockedCount + " · " + t("Admission failures") + " " + preview.admissionFailureCount + ". " + preview.diagnostics.join(" "));
+					.setDesc(t("Blocked") + " " + preview.blockedCount + " · " + t("Admission failures") + " " + preview.admissionFailureCount + ". " + preview.diagnostics.map(item => t(item)).join(" "));
 			}
 		}
 
