@@ -34,7 +34,7 @@ async function buildAuth(context: BackendRuntimeContext, config: Readonly<JsonOb
 		clientId: asString(config.clientId),
 		clientSecret: (await context.secrets.get("clientSecret")) ?? "",
 		transport: createContextTransport(context.http),
-		redirectUri: asString(config.redirectUri) || "obsidian://momoan-sync-auth",
+		redirectUri: asString(config.redirectUri),
 		logger: context.logger,
 	});
 }
@@ -49,8 +49,8 @@ function assertPendingFresh(config: Readonly<JsonObject>): void {
 }
 
 async function beginAuthorization(context: BackendRuntimeContext, config: Readonly<JsonObject>, folderPick: boolean): Promise<JsonPatch> {
-	if (!asString(config.clientId) || !asString(config.redirectUri) || !(await context.secrets.get("clientSecret"))) {
-		throw new Error("Client ID, client secret and redirect URI are required.");
+	if (!asString(config.clientId) || !(await context.secrets.get("clientSecret"))) {
+		throw new Error("Client ID and client secret are required.");
 	}
 	const google = await buildAuth(context, config);
 	const url = folderPick ? await google.getFolderPickerAuthorizationUrl() : await google.getAuthorizationUrl();

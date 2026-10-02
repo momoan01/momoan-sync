@@ -15,18 +15,8 @@
  */
 export const PLUGIN_REDIRECT_URI = "obsidian://momoan-sync-auth";
 
-/** Air Sync auth relay server (confidential client; server-side token exchange). */
-const GOOGLE_AUTH_SERVER_URL = "https://auth-airsync.takezo.dev";
-
-export const GOOGLE_DRIVE_AUTH = {
-	authServerUrl: GOOGLE_AUTH_SERVER_URL,
-	clientId: "135801498656-lfjor2ml3v26t9l63mkoka0bndgl9eue.apps.googleusercontent.com",
-	redirectUri: `${GOOGLE_AUTH_SERVER_URL}/google/callback`,
-	tokenRefreshUrl: `${GOOGLE_AUTH_SERVER_URL}/google/token/refresh`,
-} as const;
-
-/** Default redirect URI for user-supplied (direct) Google credentials. */
-export const DEFAULT_CUSTOM_REDIRECT_URI = "https://airsync.takezo.dev/callback";
+/** Momoan-owned static relay; tokens are exchanged only by the plugin. */
+export const DEFAULT_CUSTOM_REDIRECT_URI = "https://momoan01.github.io/momoan-sync/oauth-callback/";
 
 /**
  * Public OAuth app for the Air Sync Dropbox app (App folder permission).

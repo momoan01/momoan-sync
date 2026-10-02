@@ -13,6 +13,8 @@ import { handleOAuthProtocolCallback } from "../../src/fs/oauth-callback-error";
 
 vi.mock("obsidian");
 
+import { DEFAULT_CUSTOM_REDIRECT_URI } from "../../src/backends/shared/auth-config";
+
 const CID = "byo-client.apps.googleusercontent.com";
 const CS = "device-client-secret";
 const TOKEN = { access_token: "DEVICE-ACCESS", refresh_token: "DEVICE-REFRESH", expires_in: 3600 };
@@ -25,8 +27,8 @@ function response(body: JsonValue): BackendHttpResponse {
 		arrayBuffer: () => Promise.resolve(new TextEncoder().encode(text).buffer) };
 }
 
-function fixture(folder: JsonValue = FOLDER, failOpen = false) {
-	let config: JsonObject = { clientId: CID, redirectUri: "https://example.test/callback" };
+function fixture(folder: JsonValue = FOLDER, failOpen = false, redirectUri = DEFAULT_CUSTOM_REDIRECT_URI) {
+	let config: JsonObject = { clientId: CID, redirectUri };
 	const secrets = new Map<string, string>([[physical("googledrive", "clientSecret"), CS]]);
 	const opened: string[] = [];
 	const sink = vi.fn();
@@ -72,11 +74,34 @@ describe("Momoan BYO Google OAuth and Picker contract", () => {
 		await f.connection.completeAuth(f.callback(requireString(f.config().pendingAuthState)));
 		const body = new URLSearchParams(requireString(f.request.mock.calls[0]![0].body));
 		expect(body.get("code_verifier")).toBe(verifier);
+		expect(url.searchParams.get("redirect_uri")).toBe(DEFAULT_CUSTOM_REDIRECT_URI);
+		expect(body.get("redirect_uri")).toBe(url.searchParams.get("redirect_uri"));
+		expect(f.request.mock.calls[0]![0].url).toBe("https://oauth2.googleapis.com/token");
 		expect(body.get("client_secret")).toBe(CS);
 		expect(f.value("refresh")).toBe(TOKEN.refresh_token);
 		expectPendingCleared(f);
 		expect(JSON.stringify(f.sink.mock.calls)).not.toContain(verifier);
 		expect(JSON.stringify(f.config())).not.toContain(TOKEN.refresh_token);
+	});
+
+	it.each(["", "   "])("uses the default HTTPS callback for blank redirect %j in auth and exchange", async (redirectUri) => {
+		const f = fixture(FOLDER, false, redirectUri);
+		await f.connection.startAuth();
+		const url = new URL(f.opened[0]!);
+		expect(url.searchParams.get("redirect_uri")).toBe(DEFAULT_CUSTOM_REDIRECT_URI);
+		await f.connection.completeAuth(f.callback(requireString(f.config().pendingAuthState)));
+		const body = new URLSearchParams(requireString(f.request.mock.calls[0]![0].body));
+		expect(body.get("redirect_uri")).toBe(DEFAULT_CUSTOM_REDIRECT_URI);
+		expectPendingCleared(f);
+	});
+
+	it("keeps an explicit registered redirect identical in auth and exchange", async () => {
+		const redirect = "https://example.test/callback";
+		const f = fixture(FOLDER, false, redirect);
+		await f.connection.startAuth();
+		expect(new URL(f.opened[0]!).searchParams.get("redirect_uri")).toBe(redirect);
+		await f.connection.completeAuth(f.callback(requireString(f.config().pendingAuthState)));
+		expect(new URLSearchParams(requireString(f.request.mock.calls[0]![0].body)).get("redirect_uri")).toBe(redirect);
 	});
 
 	it("rejects state mismatch without network I/O and discards pending proof", async () => {

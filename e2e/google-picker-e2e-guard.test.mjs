@@ -3,7 +3,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import test from "node:test";
 
-const WHY_FIX = "Google Picker T3 isolation violation. WHY: the interactive real-browser flow must never enter default/aggregate/CI gates and retired PickerBuilder/API-key flows must stay deleted. FIX: invoke only e2e/vitest.google-picker-interactive.config.ts from test:e2e:google-picker and start only through GoogleAuth.getFolderPickerAuthorizationUrl.";
+const WHY_FIX = "Google Picker T3 isolation violation. WHY: the interactive real-browser flow must never enter default/aggregate/CI gates and retired PickerBuilder/API-key flows must stay deleted. FIX: invoke only e2e/vitest.google-picker-interactive.config.ts from test:e2e:google-picker and start only through GoogleAuthDirect.getFolderPickerAuthorizationUrl.";
 
 export function inspectPickerHarnessFixture(fixture) {
 	const failures = [];
@@ -12,7 +12,7 @@ export function inspectPickerHarnessFixture(fixture) {
 	if (fixture.ci.includes("test:e2e:google-picker") || fixture.ci.includes(dedicatedConfig)) failures.push("ci-invocation");
 	if (!fixture.dedicatedConfig.includes('include: ["e2e/google-picker/google-picker.interactive.ts"]')) failures.push("dedicated-include");
 	if (fixture.aggregateConfig.includes("google-picker.interactive")) failures.push("aggregate-include");
-	const forbidden = ["Picker" + "Builder", "googleapis.com/" + "picker", "PICKER_" + "API_KEY", "GOOGLE_" + "PICKER_API_KEY", "picker_" + "token"];
+	const forbidden = ["Picker" + "Builder", "googleapis.com/" + "picker", "PICKER_" + "API_KEY", "GOOGLE_" + "PICKER_API_KEY", "picker_" + "token", "auth-" + "airsync.takezo.dev", "obsidian://" + "air-sync-auth"];
 	if (forbidden.some((term) => fixture.executableSources.includes(term))) failures.push("retired-picker-surface");
 	if (!fixture.entrySource.includes("getFolderPickerAuthorizationUrl()")) failures.push("production-url-bypass");
 	return failures;

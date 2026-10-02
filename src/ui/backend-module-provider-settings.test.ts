@@ -209,6 +209,18 @@ describe("BackendModuleSettingsRenderer — custom-app connect guard", () => {
 
 
 describe("BackendModuleSettingsRenderer — Google production flow", () => {
+	it("allows Connect Google with a blank redirect and device client secret", () => {
+		const startAuth = vi.fn().mockResolvedValue(undefined);
+		const provider = { type: "googledrive", getModule: () => googleDriveModule,
+			hasCredentials: () => false, hasSettingsSecret: () => true } as unknown as BackendModuleProvider;
+		const settings = mockSettings({ backendType: "googledrive", backendData: { clientId: "BYO-CID", redirectUri: "" } });
+		new BackendModuleSettingsRenderer(provider).render(container(), settings, () => Promise.resolve(),
+			{ ...actionsSpy().actions, startAuth }, {} as never);
+		__ui.buttons.find((button) => button.label === "Connect Google")?.click();
+		expect(startAuth).toHaveBeenCalledOnce();
+		expect(__ui.notices).toEqual([]);
+	});
+
 	it("shows BYO settings and Choose folder without auth mode or backend choices", () => {
 		const startFolderPick = vi.fn().mockResolvedValue(undefined);
 		const provider = {

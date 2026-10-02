@@ -1,13 +1,14 @@
 import { FOLDER_MIME } from "../../src/backends/googledrive/types";
 
-export const PRODUCTION_WORKER_ORIGIN = "https://auth-airsync.takezo.dev";
-export const OBSIDIAN_CALLBACK_ORIGIN = "obsidian://air-sync-auth";
+export const PRODUCTION_CALLBACK_URI = "https://momoan01.github.io/momoan-sync/oauth-callback/";
+export const OBSIDIAN_CALLBACK_ORIGIN = "obsidian://momoan-sync-auth";
 
 export type PickerStage =
 	| "preflight"
 	| "browser-launch"
 	| "google-authorization"
-	| "worker-callback"
+	| "https-callback"
+	| "token-exchange"
 	| "external-navigation"
 	| "callback-envelope"
 	| "drive-folder"
@@ -34,15 +35,14 @@ export interface NavigationEvidence {
 }
 
 export interface PickerCallbackEnvelope {
-	accessToken: string;
-	expiresIn: number;
+	code: string;
 	pickedFileId: string;
 	state: string;
 }
 
 const FILE_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
-export function validateAuthorizationUrl(rawUrl: string, expectedState: string): void {
+export function validateAuthorizationUrl(rawUrl: string, expectedState: string, expectedClientId: string): void {
 	const url = new URL(rawUrl);
 	const params = url.searchParams;
 	if (
@@ -53,27 +53,33 @@ export function validateAuthorizationUrl(rawUrl: string, expectedState: string):
 		params.get("mimetypes") !== FOLDER_MIME ||
 		params.get("scope") !== "https://www.googleapis.com/auth/drive.file" ||
 		params.get("prompt") !== "consent" ||
-		params.get("state") !== expectedState
+		params.get("state") !== expectedState ||
+		params.get("client_id") !== expectedClientId ||
+		params.get("redirect_uri") !== PRODUCTION_CALLBACK_URI ||
+		params.get("response_type") !== "code" ||
+		params.get("code_challenge_method") !== "S256" ||
+		!(/^[A-Za-z0-9_-]{43}$/.test(params.get("code_challenge") ?? ""))
 	) {
 		throw new PickerE2EError("authorization-contract", "google-authorization");
 	}
 }
 
 export function selectOrderedExternalNavigation(events: readonly NavigationEvidence[]): NavigationEvidence {
-	const workers = events.filter((event) => {
+	const callbacks = events.filter((event) => {
 		try {
-			return new URL(event.url).origin === PRODUCTION_WORKER_ORIGIN;
+			const url = new URL(event.url);
+			return url.origin + url.pathname === PRODUCTION_CALLBACK_URI;
 		} catch {
 			return false;
 		}
 	});
-	for (const worker of workers) {
+	for (const callback of callbacks) {
 		const external = events.find((event) =>
-			event.sequence > worker.sequence &&
-			event.targetId === worker.targetId &&
-			event.sessionId === worker.sessionId &&
-			event.frameId === worker.frameId &&
-			(!worker.loaderId || !event.loaderId || event.loaderId === worker.loaderId) &&
+			event.sequence > callback.sequence &&
+			event.targetId === callback.targetId &&
+			event.sessionId === callback.sessionId &&
+			event.frameId === callback.frameId &&
+			(!callback.loaderId || !event.loaderId || event.loaderId === callback.loaderId) &&
 			event.url.startsWith(`${OBSIDIAN_CALLBACK_ORIGIN}?`),
 		);
 		if (external) return external;
@@ -88,23 +94,22 @@ export function parseCallbackEnvelope(attemptedUrl: string, expectedState: strin
 	} catch {
 		throw new PickerE2EError("callback-url-invalid", "callback-envelope");
 	}
-	if (url.protocol !== "obsidian:" || url.hostname !== "air-sync-auth" || url.pathname !== "") {
+	if (url.protocol !== "obsidian:" || url.hostname !== "momoan-sync-auth" || url.pathname !== "") {
 		throw new PickerE2EError("callback-route-invalid", "callback-envelope");
 	}
 	const ids = url.searchParams.getAll("picked_file_ids");
 	const state = url.searchParams.get("state");
-	const accessToken = url.searchParams.get("access_token");
-	const expiresRaw = url.searchParams.get("expires_in");
-	const expiresIn = expiresRaw === null ? Number.NaN : Number(expiresRaw);
+	const codes = url.searchParams.getAll("code");
+	const code = codes[0];
 	if (state !== expectedState) throw new PickerE2EError("callback-state-invalid", "callback-envelope");
 	if (ids.length !== 1 || !FILE_ID_PATTERN.test(ids[0] ?? "")) {
 		throw new PickerE2EError("callback-folder-id-invalid", "callback-envelope");
 	}
-	if (!accessToken) throw new PickerE2EError("callback-token-missing", "callback-envelope");
-	if (!Number.isFinite(expiresIn) || expiresIn <= 0) {
-		throw new PickerE2EError("callback-expiry-invalid", "callback-envelope");
+	if (codes.length !== 1 || !code) throw new PickerE2EError("callback-code-invalid", "callback-envelope");
+	if (url.searchParams.getAll("state").length !== 1 || url.searchParams.has("error")) {
+		throw new PickerE2EError("callback-error", "callback-envelope");
 	}
-	return { accessToken, expiresIn, pickedFileId: ids[0]!, state };
+	return { code, pickedFileId: ids[0]!, state };
 }
 
 export function safeFailure(error: unknown): string {

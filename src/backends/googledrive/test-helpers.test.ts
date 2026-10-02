@@ -34,7 +34,7 @@ export interface GoogleDriveFsInternal {
 
 /** Type for accessing private fields on GoogleDriveAuthProvider in tests */
 export interface GoogleDriveAuthProviderInternal {
-	googleAuth: import("./auth").GoogleAuth;
+	googleAuth: import("./auth").GoogleAuthDirect;
 }
 
 /** Type for accessing private fields on GoogleDriveCustomAuthProvider in tests */

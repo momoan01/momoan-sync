@@ -91,12 +91,11 @@ The bootstrap captures the OAuth redirect on a localhost loopback server (defaul
 `http://localhost:53682/callback`; override with `AIRSYNC_E2E_OAUTH_PORT`). Register that
 redirect URI once:
 
-- **Google** — the built-in auth server returns tokens to `obsidian://`, which a loopback
-  can't capture, so the e2e uses **your own** GCP OAuth client. In Google Cloud Console create
+- **Google** — the e2e uses **your own** GCP OAuth client for direct PKCE exchange. In Google Cloud Console create
   an OAuth client (Desktop app, or Web app with redirect `http://localhost:53682/callback`),
   enable the Google Drive API, and put its id/secret in `.env.e2e`
   (`AIRSYNC_E2E_GOOGLE_CLIENT_ID` / `_CLIENT_SECRET`). The Google e2e refreshes with this same
-  client; with only a refresh token (no id/secret) it falls back to the built-in auth server.
+  client; both client id and client secret are required; there is no built-in auth fallback.
 - **Dropbox** — on the app at <https://www.dropbox.com/developers/apps> add
   `http://localhost:53682/callback` under **Redirect URIs**. It uses the public PKCE client id
   (no secret).
@@ -217,15 +216,15 @@ the host its content up/downloads redirect to (e.g. OneDrive's `*.microsoftperso
 returned as `403 Host not in allowlist: …`). That is an egress-policy limit, not a test or
 credential failure — add the host to the environment's egress settings to let those tests run.
 
-## Built-in Google folder Picker probe
+## Google BYO folder Picker probe
 
-The built-in Google folder-selection flow has a separate, headed, interactive T3 probe. It
-starts with the shipped `GoogleAuth.getFolderPickerAuthorizationUrl()`, traverses Google's
-top-level folder selection and the deployed production auth Worker, and observes Chrome's
-actual attempt to navigate to `obsidian://air-sync-auth`. It then uses the access token and
-single selected id from that observed attempt with `GoogleDriveClient.getFile`, requiring the
-same id and the Google Drive folder MIME type. Reading or reconstructing a link from the Worker
-page is not accepted as success.
+The headed, interactive T3 probe starts with GoogleAuthDirect.getFolderPickerAuthorizationUrl().
+It follows Google consent/Picker and the Momoan HTTPS static callback, then observes
+Chrome's attempt to navigate to obsidian://momoan-sync-auth. It validates the observed
+code, state, and single picked_file_ids, exchanges that code directly with Google
+using its original PKCE verifier, and checks the resulting access token's selected
+folder through GoogleDriveClient.getFile. The ID and folder MIME type must match.
+See [Google OAuth callback](google-oauth-callback.md) for Web-client redirect setup.
 
 This probe is intentionally excluded from `npm test`, `npm run test:e2e`,
 `npm run test:e2e:google`, and CI. Its deterministic oracle, preflight, redaction, and isolation
@@ -242,6 +241,8 @@ account. The default human-completion deadline is 300 seconds; an override must 
 seconds.
 
 ```bash
+export AIRSYNC_E2E_GOOGLE_CLIENT_ID=your-web-client-id
+# Provide AIRSYNC_E2E_GOOGLE_CLIENT_SECRET privately via the environment or .env.e2e.
 export AIRSYNC_E2E_GOOGLE_PICKER_CHROME=/absolute/path/to/google-chrome
 export AIRSYNC_E2E_GOOGLE_PICKER_USER_DATA_DIR=/absolute/path/outside/the/repo/airsync-picker-profile
 npm run test:e2e:google-picker
@@ -260,11 +261,11 @@ Chrome is launched headful. The harness does not click Google UI, use selectors,
 sleep through failures: a human completes consent and selects exactly one folder. `SIGINT`,
 `SIGTERM`, timeout, assertion failure, and normal completion all close the owned CDP connection
 and Chrome process. Progress and errors contain only fixed stage/error-class labels. The OAuth
-URL, Worker callback, Obsidian deep link, tokens, cookies, selected id, CDP payloads, browser
+URL, HTTPS callback, Obsidian deep link, tokens, cookies, selected id, CDP payloads, browser
 stdio, screenshots, and profile contents are neither printed nor persisted.
 
 A green oracle command proves only the deterministic implementation. A live proof is verified
-only when the dedicated command reaches the production Worker, observes its later same-session
+only when the dedicated command reaches the Momoan HTTPS callback, observes its later same-session
 external-protocol navigation attempt, and passes the real Drive folder lookup. If no suitable
 display/profile/human is available, report the live criterion as unverified—do not treat it as
 skipped or green.

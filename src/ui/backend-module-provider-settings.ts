@@ -160,8 +160,8 @@ export class BackendModuleSettingsRenderer implements IBackendSettingsRenderer {
 		const module = this.provider.getModule();
 		const config = settings.backendData as JsonObject;
 		if (module.id === "googledrive") {
-			if (!config.clientId || !config.redirectUri || !this.provider.hasSettingsSecret("clientSecret")) {
-				new Notice("Client ID, client secret and redirect address are required");
+			if (!config.clientId || !this.provider.hasSettingsSecret("clientSecret")) {
+				new Notice("Client ID and client secret are required");
 				return false;
 			}
 			void actions.startAuth();

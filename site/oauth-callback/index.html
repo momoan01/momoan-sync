@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-0YnIC1/j/WbjlJ8oMBh+CwrYNzrbKmdKdUm3rOkEd6M='; base-uri 'none'; form-action 'none'">
+<title>Momoan Sync authorization</title>
+</head>
+<body>
+<h1>Return to Momoan Sync</h1>
+<p>If Obsidian did not open automatically, use the link below.</p>
+<a id="open-obsidian" href="obsidian://momoan-sync-auth" rel="noreferrer">Open Obsidian</a>
+<noscript>JavaScript is required to return authorization to Obsidian.</noscript>
+<script>(() => {
+  "use strict";
+  const incoming = new URLSearchParams(window.location.search);
+  const outgoing = new URLSearchParams();
+  for (const key of ["code", "state", "picked_file_ids", "scope", "error"]) {
+    for (const value of incoming.getAll(key)) outgoing.append(key, value);
+  }
+  const target = "obsidian://momoan-sync-auth?" + outgoing.toString();
+  const link = document.getElementById("open-obsidian");
+  link.href = target;
+  window.history.replaceState(null, "", window.location.pathname);
+  if (outgoing.has("state") && (outgoing.has("code") || outgoing.has("error"))) {
+    window.location.replace(target);
+  }
+})();</script>
+</body>
+</html>

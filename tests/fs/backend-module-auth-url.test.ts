@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { BackendModule, BackendRuntimeContext, JsonObject } from "../../src/backend-api";
-import { DROPBOX_AUTH, GOOGLE_DRIVE_AUTH, ONEDRIVE_AUTH } from "../../src/backends/shared/auth-config";
+import { DROPBOX_AUTH, DEFAULT_CUSTOM_REDIRECT_URI, ONEDRIVE_AUTH } from "../../src/backends/shared/auth-config";
 import { DEFAULT_ONEDRIVE_AUTHORITY } from "../../src/backends/onedrive/auth";
 import { dropboxModule } from "../../src/backends/dropbox/module";
 import { oneDriveModule } from "../../src/backends/onedrive/module";
@@ -111,11 +111,11 @@ describe("OneDrive auth.start client-id and authority selection", () => {
 describe("Google Drive production BYO auth", () => {
 	for (const authMode of [undefined, false, true]) {
 		it("uses BYO credentials regardless of legacy authMode=" + String(authMode), async () => {
-			const config: JsonObject = { clientId: GOOGLE_CUSTOM_CLIENT_ID, redirectUri: "https://example.test/callback" };
+			const config: JsonObject = { clientId: GOOGLE_CUSTOM_CLIENT_ID, redirectUri: "" };
 			if (authMode !== undefined) config.authMode = authMode;
 			const url = await startedUrl(googleDriveModule, config, { clientSecret: "user-secret" });
 			expect(clientId(url)).toBe(GOOGLE_CUSTOM_CLIENT_ID);
-			expect(url.toString()).not.toContain(GOOGLE_DRIVE_AUTH.clientId);
+			expect(url.searchParams.get("redirect_uri")).toBe(DEFAULT_CUSTOM_REDIRECT_URI);
 			expect(url.searchParams.get("scope")).toBe("https://www.googleapis.com/auth/drive.file");
 			expect(url.searchParams.get("code_challenge_method")).toBe("S256");
 		});

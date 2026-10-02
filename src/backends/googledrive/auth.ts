@@ -1,4 +1,3 @@
-import { toError } from "../../backend-api";
 import type { BackendLogger } from "../../backend-api";
 import type { HttpTransport } from "../../backend-api/http-transport";
 import { assertTokenResponse } from "./types";
@@ -8,14 +7,14 @@ import {
 	computeS256Challenge,
 	generateRandomString,
 } from "../../backend-api/oauth-pkce";
-import { GOOGLE_DRIVE_AUTH, DEFAULT_CUSTOM_REDIRECT_URI } from "../shared/auth-config";
+import { DEFAULT_CUSTOM_REDIRECT_URI } from "../shared/auth-config";
 
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const SCOPES = "https://www.googleapis.com/auth/drive.file";
 export const DEFAULT_CUSTOM_SCOPE = SCOPES;
 
-/** Shared interface for GoogleAuth and GoogleAuthDirect */
+/** Google BYO OAuth contract. */
 export interface IGoogleAuth {
 	setTokens(refreshToken: string, accessToken: string, expiry: number): void;
 	/**
@@ -117,107 +116,7 @@ abstract class GoogleAuthBase extends BaseOAuthTokenManager implements IGoogleAu
 	}
 }
 
-/**
- * Handles OAuth 2.0 authentication for Google Drive.
- * Token exchange is handled server-side by auth-airsync.takezo.dev
- * (confidential client with client_secret). The plugin only manages
- * CSRF state verification and token storage.
- */
-export class GoogleAuth extends GoogleAuthBase {
-	constructor(transport: HttpTransport, logger?: BackendLogger) {
-		super(transport);
-		this.logger = logger;
-	}
-
-	getAuthorizationUrl(): Promise<string> {
-		const state = this.generateState();
-		return Promise.resolve(this.buildAuthorizationUrl(state));
-	}
-
-	/**
-	 * Build Google's top-level Picker authorization flow for desktop and mobile.
-	 * This avoids the cross-site iframe boundary used by PickerBuilder: Google owns
-	 * the full-page navigation and returns the selected id as `picked_file_ids`
-	 * alongside the authorization code.
-	 */
-	getFolderPickerAuthorizationUrl(): Promise<string> {
-		const state = this.generateState({ folderPick: true });
-		return Promise.resolve(this.buildAuthorizationUrl(state, {
-			trigger_onepick: "true",
-			allow_folder_selection: "true",
-			mimetypes: "application/vnd.google-apps.folder",
-		}));
-	}
-
-	private buildAuthorizationUrl(state: string, extra: Record<string, string> = {}): string {
-		const params = new URLSearchParams({
-			client_id: GOOGLE_DRIVE_AUTH.clientId,
-			redirect_uri: GOOGLE_DRIVE_AUTH.redirectUri,
-			response_type: "code",
-			scope: SCOPES,
-			access_type: "offline",
-			prompt: "consent",
-			state,
-			...extra,
-		});
-		return `${GOOGLE_AUTH_URL}?${params.toString()}`;
-	}
-
-	/**
-	 * Accept tokens returned by the auth server callback.
-	 * The auth server already exchanged the authorization code for tokens;
-	 * we just verify the CSRF state and store the tokens.
-	 */
-	handleAuthCallback(params: Record<string, string | undefined>): Promise<void> {
-		try {
-			this.verifyAndClearState(params.state);
-			if (!params.access_token) {
-				throw new Error("Access token is missing from auth callback");
-			}
-
-			const expiresIn = parseInt(params.expires_in ?? "3600", 10);
-			if (isNaN(expiresIn) || expiresIn <= 0) {
-				throw new Error("Invalid expires_in from auth callback");
-			}
-
-			this.accessToken = params.access_token;
-			this.accessTokenExpiry = Date.now() + expiresIn * 1000;
-			if (params.refresh_token) {
-				this.refreshToken = params.refresh_token;
-			}
-
-			this.clearAuthState();
-			return Promise.resolve();
-		} catch (err: unknown) {
-			return Promise.reject(toError(err));
-		}
-	}
-
-	protected async performRefresh(): Promise<string> {
-		this.logger?.info("Refreshing access token");
-		try {
-			const response = await this.transport.request({
-				url: GOOGLE_DRIVE_AUTH.tokenRefreshUrl,
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ refresh_token: this.refreshToken }),
-			});
-
-			const token: unknown = response.json;
-			assertTokenResponse(token);
-			await this.storeTokenResponse(token);
-			return this.accessToken;
-		} catch (err) {
-			this.handleRefreshError(err);
-		}
-	}
-}
-
-/**
- * Direct OAuth 2.0 authentication using user-provided client credentials.
- * The auth server relays the authorization code back without exchanging it;
- * this class exchanges the code and refreshes tokens directly with Google.
- */
+/** Direct BYO OAuth. The static HTTPS callback relays codes, never tokens. */
 export interface GoogleAuthDirectOptions {
 	clientId: string;
 	clientSecret: string;
@@ -240,7 +139,7 @@ export class GoogleAuthDirect extends GoogleAuthBase {
 		this.clientId = options.clientId;
 		this.clientSecret = options.clientSecret;
 		this.scope = options.scope || SCOPES;
-		this.redirectUri = options.redirectUri || DEFAULT_CUSTOM_REDIRECT_URI;
+		this.redirectUri = options.redirectUri?.trim() || DEFAULT_CUSTOM_REDIRECT_URI;
 		this.includeGrantedScopes = options.includeGrantedScopes ?? false;
 		this.logger = options.logger;
 	}

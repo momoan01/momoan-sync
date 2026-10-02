@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import {
 	type NavigationEvidence,
 	PickerE2EError,
-	PRODUCTION_WORKER_ORIGIN,
+	PRODUCTION_CALLBACK_URI,
 	selectOrderedExternalNavigation,
 } from "./oracle";
 import type { PickerRuntime } from "./preflight";
@@ -202,12 +202,12 @@ export async function captureExternalNavigation(
 			rejectCapture = rejectEvidence;
 			captureTimer = setTimeout(() => {
 				rejectEvidence(new PickerE2EError(
-					events.some((event) => event.url.startsWith(PRODUCTION_WORKER_ORIGIN))
+					events.some((event) => event.url.startsWith(PRODUCTION_CALLBACK_URI))
 						? "external-navigation-timeout"
-						: "worker-navigation-timeout",
-					events.some((event) => event.url.startsWith(PRODUCTION_WORKER_ORIGIN))
+						: "https-callback-timeout",
+					events.some((event) => event.url.startsWith(PRODUCTION_CALLBACK_URI))
 						? "external-navigation"
-						: "worker-callback",
+						: "https-callback",
 				));
 			}, runtime.timeoutMs);
 			unsubscribeCapture = cdp!.onEvent((message) => {

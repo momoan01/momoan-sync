@@ -3,16 +3,16 @@ import { spyRequestUrl, mockRes, testTransport } from "./test-helpers.test";
 
 vi.mock("obsidian");
 
-describe("GoogleAuth.handleAuthCallback", () => {
+describe("GoogleAuthDirect.handleAuthCallback", () => {
 	it("stores tokens when state matches", async () => {
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+		const mockRequestUrl = (await spyRequestUrl()).mockResolvedValue(mockRes({ access_token: "access-123", refresh_token: "refresh-456", expires_in: 3600, token_type: "Bearer" }));
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 		auth.setAuthState("my-csrf");
 
+		auth.setCodeVerifier("test-verifier");
 		await auth.handleAuthCallback({
-			access_token: "access-123",
-			refresh_token: "refresh-456",
-			expires_in: "3600",
+			code: "authorization-code",
 			state: "my-csrf",
 		});
 
@@ -20,11 +20,12 @@ describe("GoogleAuth.handleAuthCallback", () => {
 		expect(tokens.accessToken).toBe("access-123");
 		expect(tokens.refreshToken).toBe("refresh-456");
 		expect(tokens.accessTokenExpiry).toBeGreaterThan(Date.now());
+		mockRequestUrl.mockRestore();
 	});
 
 	it("throws when authState is null", async () => {
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 
 		await expect(
 			auth.handleAuthCallback({
@@ -36,8 +37,8 @@ describe("GoogleAuth.handleAuthCallback", () => {
 	});
 
 	it("throws when state does not match", async () => {
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 		auth.setAuthState("correct-state");
 
 		await expect(
@@ -50,8 +51,8 @@ describe("GoogleAuth.handleAuthCallback", () => {
 	});
 
 	it("throws when state parameter is omitted", async () => {
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 		auth.setAuthState("expected-state");
 
 		await expect(
@@ -63,36 +64,38 @@ describe("GoogleAuth.handleAuthCallback", () => {
 	});
 
 	it("clears authState after successful callback", async () => {
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+		const mockRequestUrl = (await spyRequestUrl()).mockResolvedValue(mockRes({ access_token: "token", refresh_token: "refresh", expires_in: 3600, token_type: "Bearer" }));
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 		auth.setAuthState("csrf");
 
+		auth.setCodeVerifier("test-verifier");
 		await auth.handleAuthCallback({
-			access_token: "token",
-			expires_in: "3600",
+			code: "authorization-code",
 			state: "csrf",
 		});
 
 		expect(auth.getAuthState()).toBeNull();
+		mockRequestUrl.mockRestore();
 	});
 });
 
-describe("GoogleAuth.getAuthorizationUrl", () => {
-	it("returns a Google OAuth URL with state but no PKCE", async () => {
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+describe("GoogleAuthDirect.getAuthorizationUrl", () => {
+	it("returns a Google OAuth URL with state and PKCE", async () => {
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 
 		const url = await auth.getAuthorizationUrl();
 
 		expect(url).toContain("accounts.google.com");
 		expect(url).toContain("state=");
-		expect(url).not.toContain("code_challenge");
+		expect(url).toContain("code_challenge_method=S256");
 		expect(auth.getAuthState()).not.toBeNull();
 	});
 
 	it("produces a URL-safe (base64url) state that survives redirect hops", async () => {
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 		await auth.getAuthorizationUrl();
 
 		const state = auth.getAuthState();
@@ -109,8 +112,8 @@ describe("GoogleAuth.getAuthorizationUrl", () => {
 	});
 
 	it("builds the top-level Google Picker OAuth flow for folder selection", async () => {
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 
 		const url = new URL(await auth.getFolderPickerAuthorizationUrl());
 
@@ -123,7 +126,7 @@ describe("GoogleAuth.getAuthorizationUrl", () => {
 	});
 });
 
-describe("GoogleAuth.getAccessToken concurrency", () => {
+describe("GoogleAuthDirect.getAccessToken concurrency", () => {
 	it("deduplicates concurrent refresh calls", async () => {
 		let callCount = 0;
 		const mockRequestUrl = (await spyRequestUrl()).mockImplementation(
@@ -138,8 +141,8 @@ describe("GoogleAuth.getAccessToken concurrency", () => {
 			}
 		);
 
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 		auth.setTokens("refresh-token", "", 0);
 
 		const [t1, t2, t3] = await Promise.all([
@@ -167,8 +170,8 @@ describe("GoogleAuth.getAccessToken concurrency", () => {
 			}
 		);
 
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 		auth.setTokens("refresh-token", "", 0);
 
 		await expect(auth.getAccessToken()).rejects.toThrow("status 400");
@@ -200,8 +203,8 @@ describe("GoogleAuth.getAccessToken concurrency", () => {
 			}
 		);
 
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 		auth.setTokens("refresh-token", "", 0);
 
 		const now = Date.now();
@@ -243,8 +246,8 @@ describe("GoogleAuth.getAccessToken concurrency", () => {
 			}
 		);
 
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 		auth.setTokens("refresh-token", "", 0);
 
 		await expect(auth.getAccessToken()).rejects.toThrow("status 400");
@@ -258,12 +261,12 @@ describe("GoogleAuth.getAccessToken concurrency", () => {
 	});
 });
 
-describe("GoogleAuth.revokeToken", () => {
+describe("GoogleAuthDirect.revokeToken", () => {
 	it("calls Google revoke endpoint", async () => {
 		const mockRequestUrl = (await spyRequestUrl()).mockResolvedValue(mockRes({}));
 
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 		auth.setTokens("my-refresh-token", "", 0);
 
 		await auth.revokeToken();
@@ -281,8 +284,8 @@ describe("GoogleAuth.revokeToken", () => {
 			new Error("Network error")
 		);
 
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 		auth.setTokens("token", "", 0);
 
 		await expect(auth.revokeToken()).resolves.toBeUndefined();
@@ -293,8 +296,8 @@ describe("GoogleAuth.revokeToken", () => {
 	it("skips revoke when no token is set", async () => {
 		const mockRequestUrl = await spyRequestUrl();
 
-		const { GoogleAuth } = await import("./auth");
-		const auth = new GoogleAuth(testTransport());
+		const { GoogleAuthDirect } = await import("./auth");
+		const auth = new GoogleAuthDirect({ transport: testTransport(), clientId: "byo-client", clientSecret: "byo-secret" });
 
 		await auth.revokeToken();
 		expect(mockRequestUrl).not.toHaveBeenCalled();
