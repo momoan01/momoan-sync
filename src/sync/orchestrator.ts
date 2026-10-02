@@ -67,7 +67,8 @@ export interface SyncOrchestratorDeps {
 	logger?: Logger;
 	/** Persist a cycle's resolved conflicts to the audit history (once per cycle). */
 	recordConflicts?: (records: ConflictRecord[]) => Promise<void>;
-	createMassChangeSafetySnapshot?: () => Promise<{ readonly snapshotId: string }>;
+	createSafetySnapshot?: (trigger: "mass_change_guard" | "recovery_cold") => Promise<{ readonly snapshotId: string }>;
+	createSchemaMigrationSnapshot?: () => Promise<{ readonly snapshotId: string }>;
 }
 
 const MAX_RETRIES = 3;
@@ -90,7 +91,7 @@ export class SyncOrchestrator {
 	constructor(deps: SyncOrchestratorDeps) {
 		this.deps = deps;
 		const vaultId = deps.getSettings().vaultId;
-		this.stateStore = new SyncStateStore(vaultId);
+		this.stateStore = new SyncStateStore(vaultId, deps.createSchemaMigrationSnapshot);
 		this.recoveryJournal = new RecoveryJournal(vaultId);
 	}
 
@@ -226,11 +227,12 @@ export class SyncOrchestrator {
 				const scopeChanged = remoteFs.checkpoint?.getScopeFingerprint
 					? (await remoteFs.checkpoint.getScopeFingerprint()) !== scopeFingerprint
 					: false;
+				const safetyTrigger = this.massGuardColdRequested ? "mass_change_guard" : "recovery_cold";
 				const forceFullScan = noCheckpoint || scopeChanged || this.coldPreviewRequested || this.massGuardColdRequested;
 				this.coldPreviewRequested = false;
 				this.massGuardColdRequested = false;
 				const result = await this.executeWithRetry(
-					forceFullScan, scopeChanged, snapshot, scopeFingerprint, conflictStrategy, executionMode,
+					forceFullScan, scopeChanged, snapshot, scopeFingerprint, conflictStrategy, executionMode, safetyTrigger,
 				);
 				if (!result) return; // Fatal error already handled
 
@@ -304,6 +306,7 @@ export class SyncOrchestrator {
 		scopeFingerprint: string,
 		conflictStrategy: ConflictStrategy,
 		executionMode: SyncExecutionMode,
+		safetyTrigger: "mass_change_guard" | "recovery_cold",
 	): Promise<SyncCycleResult | null> {
 		let lastError: unknown = null;
 		let lastKind: ErrorKind | null = null;
@@ -313,7 +316,7 @@ export class SyncOrchestrator {
 			try {
 				this.deps.logger?.info("Sync started", { forceFullScan, scopeChanged, attempt });
 				lastOutcome = await this.executeSyncOnce(
-					forceFullScan, snapshot, scopeFingerprint, conflictStrategy, executionMode,
+					forceFullScan, snapshot, scopeFingerprint, conflictStrategy, executionMode, safetyTrigger,
 				);
 				const { execution, admissionFailures } = lastOutcome;
 				return {
@@ -428,6 +431,7 @@ export class SyncOrchestrator {
 		scopeFingerprint: string,
 		conflictStrategy: ConflictStrategy,
 		executionMode: SyncExecutionMode,
+		safetyTrigger: "mass_change_guard" | "recovery_cold",
 	) {
 		const localFs = this.deps.localFs();
 		const remoteFs = this.deps.remoteFs();
@@ -574,7 +578,7 @@ export class SyncOrchestrator {
 		const classifyError = (err: unknown) => provider?.classifyError?.(err) ?? classifyHttpError(err);
 		const cycleId = crypto.randomUUID();
 		if (massGuard?.kind === "guard" && observedFullScan) {
-			await requireMassChangeSafetySnapshot(this.deps.createMassChangeSafetySnapshot, this.deps.logger, massGuard);
+			await requireMassChangeSafetySnapshot(this.deps.createSafetySnapshot, this.deps.logger, massGuard, safetyTrigger);
 		}
 		const recoveryCaptures = massGuard?.kind === "guard" && observedFullScan
 			? await this.recoveryJournal.capturePlan(admission.executable.actions, {

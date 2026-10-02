@@ -147,6 +147,7 @@ export class Setting {
 		let value = "";
 		let handler: (next: string) => unknown = () => {};
 		const text = {
+			inputEl: { type: "text", min: "", step: "" },
 			setPlaceholder: (_placeholder: string) => text,
 			setValue: (next: string) => {
 				value = next;

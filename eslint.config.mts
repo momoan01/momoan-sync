@@ -322,6 +322,12 @@ export default defineConfig(
 		},
 	},
 	{
+		// Plugin composition root retains lifecycle registration, startup-before-sync,
+		// and settings-driven interval reconfiguration together; snapshot work is in backup/lifecycle.ts.
+		files: ["src/main.ts"],
+		rules: { "max-lines": ["error", { max: 326, skipBlankLines: true, skipComments: true }] },
+	},
+	{
 		// Startup WARM acquisition: the durable record read now starts before the
 		// local listing is awaited, and one pass over that listing builds the
 		// observations, exact-entity map, observed-path set, and deletion path set.
@@ -351,8 +357,9 @@ export default defineConfig(
 		// adds coordination here while its policy and effects remain separate modules.
 		// Shadow closeout and M4 mass-guard safety capture stay beside Write closeout so
 		// the shared lifecycle and its no-mutation follow-up boundary remain reviewable.
+		// C3-C passes attempt-local snapshot trigger provenance and the schema safety dependency.
 		files: ["src/sync/orchestrator.ts"],
-		rules: { "max-lines": ["error", { max: 500, skipBlankLines: true, skipComments: true }] },
+		rules: { "max-lines": ["error", { max: 504, skipBlankLines: true, skipComments: true }] },
 	},
 	{
 		// Exact action effects, commitAction, terminal result publication, and their

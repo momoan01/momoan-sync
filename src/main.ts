@@ -20,6 +20,7 @@ import { Logger, getDeviceName } from "./logging/logger";
 import { ConflictHistory } from "./sync/conflict-history";
 import { handleOAuthProtocolCallback } from "./fs/oauth-callback-error";
 import { BackupService } from "./backup/service";
+import { BackupLifecycle, normalizeBackupIntervalMinutes } from "./backup/lifecycle";
 import { VaultBackupSource } from "./backup/vault-source";
 
 export default class AirSyncPlugin extends Plugin {
@@ -38,6 +39,7 @@ export default class AirSyncPlugin extends Plugin {
 	private logger!: Logger;
 	private conflictHistory!: ConflictHistory;
 	backupService!: BackupService;
+	private backupLifecycle!: BackupLifecycle;
 
 	async onload() {
 		const secretStore: ISecretStore = {
@@ -165,15 +167,31 @@ export default class AirSyncPlugin extends Plugin {
 			isBackendConnecting: () => this.backendManager.isConnecting(),
 			isLayoutReady: () => this.app.workspace.layoutReady,
 			recordConflicts: (records) => this.conflictHistory.append(records),
-			createMassChangeSafetySnapshot: () => this.backupService.createSnapshot("mass_change_guard"),
+			createSafetySnapshot: (trigger) => this.backupService.createSnapshot(trigger),
+			createSchemaMigrationSnapshot: () => this.backupService.createSnapshot("schema_migration"),
 		});
+
+		this.backupLifecycle = new BackupLifecycle({
+			getSettings: () => this.settings,
+			isMobile: () => Platform.isMobile,
+			isLayoutReady: () => this.app.workspace.layoutReady,
+			createSnapshot: (trigger) => this.backupService.createSnapshot(trigger),
+			logger: this.logger,
+			setInterval: (callback, milliseconds) => window.setInterval(callback, milliseconds),
+			clearInterval: (timer) => window.clearInterval(timer),
+		});
+		this.register(() => this.backupLifecycle.stop());
 
 		this.scheduler = new SyncScheduler({
 			workspace: this.app.workspace,
 			vault: this.app.vault,
 			remoteFs: () => this.backendManager.getRemoteFs(),
 			localTracker: this.localTracker,
-			orchestrator: this.orchestrator,
+			orchestrator: {
+				runSync: () => this.runSync(),
+				pullSingle: (path) => this.backupLifecycle.withSync(() => this.orchestrator.pullSingle(path)),
+				isSyncing: () => this.orchestrator.isSyncing(),
+			},
 			isExcluded: (path) => this.orchestrator.isExcluded(path),
 			registerEvent: (ref) => this.registerEvent(ref),
 			registerWindowEvent: (type, cb) => this.registerDomEvent(window, type, cb),
@@ -242,10 +260,14 @@ export default class AirSyncPlugin extends Plugin {
 		// Run one sync once the vault index is loaded. The scheduler defers its
 		// event wiring until then, and runSync() is gated on layoutReady, so this
 		// is the first sync of the session ("caught up on open").
-		this.app.workspace.onLayoutReady(() => void this.runSync());
+		this.app.workspace.onLayoutReady(() => {
+			this.backupLifecycle.configure();
+			void this.runSync();
+		});
 	}
 
 	onunload() {
+		this.backupLifecycle.stop();
 		void this.logger.flush();
 		this.backendManager.close();
 		this.scheduler.destroy();
@@ -261,7 +283,9 @@ export default class AirSyncPlugin extends Plugin {
 			(await this.loadData()) as Partial<AirSyncSettings>,
 		);
 
-		let needsSave = false;
+		const interval = normalizeBackupIntervalMinutes(this.settings.backupIntervalMinutes);
+		let needsSave = interval !== this.settings.backupIntervalMinutes;
+		this.settings.backupIntervalMinutes = interval;
 
 		// Normalize a legacy per-type backendData map to the single active-backend bag.
 		// The legacy six backend types are the only keys the old nested shape used, so
@@ -294,6 +318,7 @@ export default class AirSyncPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+		this.backupLifecycle?.configure();
 	}
 
 	getLatestShadowPreview() {
@@ -314,6 +339,10 @@ export default class AirSyncPlugin extends Plugin {
 	}
 
 	async runSync(): Promise<void> {
+		await this.backupLifecycle.withSync(() => this.performSync());
+	}
+
+	private async performSync(): Promise<void> {
 		if (this.orchestrator.isSyncing()) return;
 		try {
 			if (!this.localFs || !this.backendManager.getRemoteFs()) {

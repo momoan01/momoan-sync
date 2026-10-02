@@ -300,3 +300,12 @@ authorities remain unchanged. A capture failure prevents the destructive effect.
 Write plan. That attempt aborts without executor effects or checkpoint publication.
 A guarded full observation pre-captures its complete destructive plan before execution.
 Shadow reports the same predicate without performing recovery captures or mutations.
+
+## M5-C3-C schema safety boundary
+
+The existing SyncStateStore schema cold-start remains drop/recreate, with the same
+publication owner. IDBHelper now preflights old version and requires a successful
+Local Snapshot before a destructive target-version upgrade. The synchronous upgrade
+callback rejects stale proof before deleting stores. These attempt-local checks add
+no sync authority or recovery marker. See
+[backup lifecycle snapshots](adr-20261002-backup-lifecycle-snapshots.md).

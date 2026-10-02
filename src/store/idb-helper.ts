@@ -2,6 +2,32 @@ export interface IDBOpenConfig {
 	dbName: string;
 	version: number;
 	onUpgrade: (db: IDBDatabase, oldVersion: number) => void;
+	/** Opt in only for destructive upgrades of user-relevant durable state. */
+	destructiveUpgrade?: { readonly createSnapshot?: () => Promise<unknown> };
+
+}
+
+/** Keep IDB names/messages while rejecting actual Error instances. */
+export function normalizeIdbError(error: unknown, fallback: string): Error {
+	if (error instanceof Error) return error;
+	if (error !== null && typeof error === "object") {
+		const normalized = new Error("message" in error && typeof error.message === "string"
+			? error.message || fallback : fallback);
+		if ("name" in error && typeof error.name === "string") normalized.name = error.name;
+		return normalized;
+	}
+	return new Error(typeof error === "string" || typeof error === "number" ||
+		typeof error === "boolean" || typeof error === "bigint" || typeof error === "symbol"
+		? String(error) : fallback);
+}
+
+export class SchemaMigrationSafetyError extends Error {
+	readonly permanent = true;
+	readonly permanentCode = "schema_migration_snapshot_failed";
+	constructor(message: string) {
+		super(message);
+		this.name = "SchemaMigrationSafetyError";
+	}
 }
 
 /**
@@ -30,19 +56,75 @@ export class IDBHelper {
 		}
 	}
 
+	/**
+	 * Unversioned open never upgrades an existing DB. Abort a new-DB probe before
+	 * creation commits; no async filesystem operation runs in an upgrade transaction.
+	 */
+	private preflightVersion(): Promise<number> {
+		return new Promise((resolve, reject) => {
+			const request = indexedDB.open(this.config.dbName);
+			let absent = false;
+			let blocked = false;
+			request.onblocked = () => {
+				blocked = true;
+				reject(new SchemaMigrationSafetyError("Schema preflight is blocked"));
+			};
+			request.onupgradeneeded = (event) => {
+				absent = event.oldVersion === 0 && !blocked;
+				request.transaction!.abort();
+			};
+			request.onsuccess = () => {
+				const version = request.result.version;
+				request.result.close();
+				if (!blocked) resolve(version);
+			};
+			request.onerror = () => {
+				if (absent) resolve(0);
+				else reject(new SchemaMigrationSafetyError(
+					"Schema preflight failed: " + (request.error?.message ?? "unknown")));
+			};
+		});
+	}
+
 	private async doOpen(): Promise<void> {
-		const { dbName, version, onUpgrade } = this.config;
+		const { dbName, version, onUpgrade, destructiveUpgrade } = this.config;
+		const observedVersion = destructiveUpgrade ? await this.preflightVersion() : undefined;
+		if (observedVersion !== undefined && observedVersion > 0 && observedVersion < version) {
+			if (!destructiveUpgrade?.createSnapshot) {
+				throw new SchemaMigrationSafetyError("Destructive schema migration requires a local snapshot");
+			}
+			try { await destructiveUpgrade.createSnapshot(); } catch (error) {
+				throw new SchemaMigrationSafetyError("Schema migration snapshot failed: " +
+					(error instanceof Error ? error.message : String(error)));
+			}
+		}
+
 		this.db = await new Promise<IDBDatabase>((resolve, reject) => {
 			const request = indexedDB.open(dbName, version);
+			let abandoned = false;
+			let upgradeError: unknown;
 			request.onblocked = () => {
+				abandoned = true;
 				reject(new Error(`IndexedDB "${dbName}" is blocked by another connection`));
 			};
 			request.onupgradeneeded = (event) => {
-				onUpgrade(request.result, event.oldVersion);
+				// Proof is attempt-local: another tab may change or remove the DB.
+				if (abandoned || (observedVersion !== undefined && event.oldVersion !== observedVersion)) {
+					upgradeError = new SchemaMigrationSafetyError("Schema version changed after preflight");
+					request.transaction!.abort();
+					return;
+				}
+				try { onUpgrade(request.result, event.oldVersion); } catch (error) {
+					upgradeError = error;
+					request.transaction!.abort();
+				}
 			};
-			request.onsuccess = () => resolve(request.result);
+			request.onsuccess = () => {
+				if (abandoned) request.result.close();
+				else resolve(request.result);
+			};
 			request.onerror = () =>
-				reject(new Error(`Failed to open IndexedDB: ${request.error?.message ?? "unknown"}`));
+				reject(normalizeIdbError(upgradeError ?? request.error, "Failed to open IndexedDB: unknown"));
 		});
 		this.db.onversionchange = () => {
 			this.db?.close();

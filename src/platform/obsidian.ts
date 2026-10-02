@@ -128,6 +128,7 @@ export interface RequestUrlResponse {
 }
 
 export interface TextComponent {
+	readonly inputEl: HTMLInputElement;
 	setPlaceholder(value: string): this;
 	setValue(value: string): this;
 	setDisabled(disabled: boolean): this;

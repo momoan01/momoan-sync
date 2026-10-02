@@ -474,6 +474,7 @@ export function mockSettings(
 		screenWakeLockOnSync: false,
 		showSyncNotifications: false,
 		backupDirectory: "",
+		backupIntervalMinutes: 0,
 		enableLogging: false,
 		logLevel: "info",
 		backendData: {},

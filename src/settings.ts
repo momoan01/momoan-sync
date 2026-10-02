@@ -41,6 +41,8 @@ export interface AirSyncSettings {
 	showSyncNotifications: boolean;
 	/** Existing absolute desktop directory used as the external Backup Store root. */
 	backupDirectory: string;
+	/** Explicit cadence; 0 disables background interval snapshots. */
+	backupIntervalMinutes: number;
 
 	/** Write sync logs to .airsync/logs/{device}/{date}.log */
 	enableLogging: boolean;
@@ -83,6 +85,7 @@ export const DEFAULT_SETTINGS: AirSyncSettings = {
 	screenWakeLockOnSync: false,
 	showSyncNotifications: false,
 	backupDirectory: "",
+	backupIntervalMinutes: 0,
 	enableLogging: false,
 	logLevel: "info",
 	backendData: {},

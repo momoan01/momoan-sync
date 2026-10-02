@@ -632,7 +632,7 @@ describe("SyncStateStore", () => {
 		await store.close();
 		const vaultId = `upgrade-vault-${Math.random()}`;
 		await seedVersion6Database(vaultId);
-		store = new SyncStateStore(vaultId);
+		store = new SyncStateStore(vaultId, () => Promise.resolve({ snapshotId: "schema-safe" }));
 
 		await store.open();
 
@@ -648,7 +648,7 @@ describe("SyncStateStore", () => {
 		await store.close();
 		const vaultId = `case-cold-start-vault-${Math.random()}`;
 		await seedVersion7Database(vaultId);
-		store = new SyncStateStore(vaultId);
+		store = new SyncStateStore(vaultId, () => Promise.resolve({ snapshotId: "schema-safe" }));
 
 		await store.open();
 
@@ -660,7 +660,7 @@ describe("SyncStateStore", () => {
 		await store.close();
 		const vaultId = `rekey-vault-${Math.random()}`;
 		await seedVersion8Database(vaultId);
-		store = new SyncStateStore(vaultId);
+		store = new SyncStateStore(vaultId, () => Promise.resolve({ snapshotId: "schema-safe" }));
 
 		await store.open();
 

@@ -69,10 +69,11 @@ function publishRecord(
 export class SyncStateStore {
 	private helper: IDBHelper;
 
-	constructor(vaultId: string) {
+	constructor(vaultId: string, createSchemaMigrationSnapshot?: () => Promise<unknown>) {
 		this.helper = new IDBHelper({
 			dbName: `${DB_NAME_PREFIX}-${sanitizeDbName(vaultId)}`,
 			version: DB_VERSION,
+			destructiveUpgrade: { createSnapshot: createSchemaMigrationSnapshot },
 			onUpgrade: (db, oldVersion) => {
 				// Cold start: drop all stores and recreate on any schema version change
 				if (oldVersion > 0) {

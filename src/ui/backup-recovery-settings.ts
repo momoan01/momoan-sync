@@ -1,3 +1,4 @@
+import { normalizeBackupIntervalMinutes } from "../backup/lifecycle";
 import { errorMessage } from "../backend-api";
 import type { BackupRestoreSelection, BackupSnapshotSummary } from "../backup/types";
 import type AirSyncPlugin from "../main";
@@ -47,6 +48,18 @@ export function renderBackupRecoverySettings(
 				plugin.settings.backupDirectory = value;
 				await plugin.saveSettings();
 			}));
+	new Setting(containerEl)
+		.setName("Snapshot interval")
+		.setDesc("Minutes between background snapshots. 0 = off. Requires an external backup folder.")
+		.addText((text) => {
+			text.inputEl.type = "number";
+			text.inputEl.min = "0";
+			text.inputEl.step = "1";
+			text.setValue(String(plugin.settings.backupIntervalMinutes)).onChange(async (value) => {
+				plugin.settings.backupIntervalMinutes = normalizeBackupIntervalMinutes(Number(value));
+				await plugin.saveSettings();
+			});
+		});
 	new Setting(containerEl)
 		.setName("Local snapshot")
 		.setDesc(plugin.settings.backupDirectory

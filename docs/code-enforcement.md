@@ -477,3 +477,11 @@ authorities remain unchanged. A capture failure prevents the destructive effect.
 Write plan. That attempt aborts without executor effects or checkpoint publication.
 A guarded full observation pre-captures its complete destructive plan before execution.
 Shadow reports the same predicate without performing recovery captures or mutations.
+
+### Mandatory schema snapshot preflight (M5-C3-C)
+
+SyncStateStore opts into IDBHelper destructive-upgrade protection. Its callback must
+complete a Local Snapshot before a target-version upgrade open; synchronous
+onupgradeneeded checks the observed oldVersion and aborts stale proof before store
+deletion. IDBHelper remains the sole direct indexedDB.open owner. See
+[backup lifecycle ADR](adr/adr-20261002-backup-lifecycle-snapshots.md).

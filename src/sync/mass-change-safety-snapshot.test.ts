@@ -34,10 +34,18 @@ describe("Mass Change Guard safety snapshot", () => {
 
 		expect(warn).toHaveBeenCalledWith("Mass Change Guard safety snapshot completed", {
 			snapshotId: "snapshot-safe",
+			trigger: "mass_change_guard",
 			tracked: 10,
 			destructive: 5,
 			topology: 0,
 			destructiveRatio: 0.5,
 		});
 	});
+});
+
+// The caller selects provenance; provider state and error-message parsing never do.
+it("passes recovery_cold through the mandatory snapshot boundary", async () => {
+	const createSnapshot = vi.fn().mockResolvedValue({ snapshotId: "recovery" });
+	await requireMassChangeSafetySnapshot(createSnapshot, undefined, verdict, "recovery_cold");
+	expect(createSnapshot).toHaveBeenCalledWith("recovery_cold");
 });
