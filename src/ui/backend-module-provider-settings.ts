@@ -1,3 +1,4 @@
+import { settingsTranslator } from "./settings-i18n";
 import type { App } from "../platform/obsidian";
 import { Notice, SecretComponent, Setting } from "../platform/obsidian";
 import type { AirSyncSettings } from "../settings";
@@ -42,13 +43,14 @@ export class BackendModuleSettingsRenderer implements IBackendSettingsRenderer {
 		actions: BackendConnectionActions,
 		app: App,
 	): void {
+		const t = settingsTranslator(settings.uiLanguage);
 		const module = this.provider.getModule();
 
 		if (module.id === "googledrive") {
-			new Setting(containerEl).setName("Google connection setup").setDesc(
+			new Setting(containerEl).setName(t("Google connection setup")).setDesc(t(
 				"Use your own Google app. Authorize each device separately. Credentials stay in the device key store.",
-			);
-			new Setting(containerEl).setName("Client secret").addComponent((controlEl) => {
+			));
+			new Setting(containerEl).setName(t("Client secret")).addComponent((controlEl) => {
 				new SecretComponent(app, controlEl).onChange((reference) => {
 					const value = reference ? app.secretStorage.getSecret(reference) : "";
 					void this.provider.setSettingsSecret("clientSecret", value ?? "");
@@ -62,6 +64,7 @@ export class BackendModuleSettingsRenderer implements IBackendSettingsRenderer {
 			// `renderBackendSettings` owns only the subtree it creates, so it composes
 			// with the other sections of the tab.
 			renderBackendSettings(containerEl, module.settings, {
+				translate: t,
 				config: () => settings.backendData as JsonObject,
 				setValue: (key, value) => onSave({ [key]: value }),
 			});
@@ -71,8 +74,9 @@ export class BackendModuleSettingsRenderer implements IBackendSettingsRenderer {
 		// user still needs the folder controls, exactly as the legacy renderers did.
 		const authed = this.provider.hasCredentials();
 		renderConnectionStatus(containerEl, {
+			translate: t,
 			connected: authed,
-			connectLabel: module.id === "googledrive" ? "Connect Google" : `Connect to ${module.displayName}`,
+			connectLabel: module.id === "googledrive" ? t("Connect Google") : `Connect to ${module.displayName}`,
 			actions,
 			onConnect: () => this.guardCustomConnect(settings, actions),
 		});
@@ -88,25 +92,26 @@ export class BackendModuleSettingsRenderer implements IBackendSettingsRenderer {
 		onSave: (updates: Record<string, unknown>) => Promise<void>,
 		app: App,
 	): void {
+		const t = settingsTranslator(settings.uiLanguage);
 		const module = this.provider.getModule();
-		const folderSetting = new Setting(containerEl).setName("Remote vault folder");
+		const folderSetting = new Setting(containerEl).setName(t("Remote vault folder"));
 		const target = module.getTarget(settings.backendData as JsonObject);
 
 		if (target) {
 			renderBoundFolderField(folderSetting, {
-				desc: "The remote folder this vault syncs into.",
+				desc: t("The remote folder this vault syncs into."),
 				folderId: target.id,
 				resolvePath: () => this.provider.getRemoteVaultDisplayPath(settings),
 			});
 			if (this.provider.picker) {
-				folderSetting.addButton((button) => button.setButtonText("Choose folder").onClick(() => void actions.startFolderPick()));
+				folderSetting.addButton((button) => button.setButtonText(t("Choose folder")).onClick(() => void actions.startFolderPick()));
 			}
 			return;
 		}
 
 		if (module.id === "googledrive") {
-			folderSetting.setDesc("Choose a Google Drive folder to finish connecting this device.");
-			if (this.provider.picker) folderSetting.addButton((button) => button.setButtonText("Choose folder").setCta().onClick(() => void actions.startFolderPick()));
+			folderSetting.setDesc(t("Choose a Google Drive folder to finish connecting this device."));
+			if (this.provider.picker) folderSetting.addButton((button) => button.setButtonText(t("Choose folder")).setCta().onClick(() => void actions.startFolderPick()));
 			return;
 		}
 
@@ -141,7 +146,7 @@ export class BackendModuleSettingsRenderer implements IBackendSettingsRenderer {
 		);
 		if (this.provider.picker) {
 			folderSetting.addButton((button) =>
-				button.setButtonText("Choose folder").onClick(() => void actions.startFolderPick()),
+				button.setButtonText(t("Choose folder")).onClick(() => void actions.startFolderPick()),
 			);
 		}
 	}
@@ -157,11 +162,12 @@ export class BackendModuleSettingsRenderer implements IBackendSettingsRenderer {
 		settings: AirSyncSettings,
 		actions: BackendConnectionActions,
 	): false | void {
+		const t = settingsTranslator(settings.uiLanguage);
 		const module = this.provider.getModule();
 		const config = settings.backendData as JsonObject;
 		if (module.id === "googledrive") {
 			if (!config.clientId || !this.provider.hasSettingsSecret("clientSecret")) {
-				new Notice("Client ID and client secret are required");
+				new Notice(t("Client ID and client secret are required"));
 				return false;
 			}
 			void actions.startAuth();

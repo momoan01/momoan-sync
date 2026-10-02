@@ -1,3 +1,4 @@
+import { settingsTranslator, type SettingsTranslator } from "./settings-i18n";
 import { createFragment, Setting } from "../platform/obsidian";
 import type AirSyncPlugin from "../main";
 import { getConfigSyncIgnorePatterns } from "../config-sync";
@@ -27,7 +28,7 @@ const CONFIG_SUBTREE_SETTINGS: ConfigSubtreeSetting[] = [
 		name: "Sync plugins",
 		paths: ["plugins/", "community-plugins.json"],
 		description:
-			"Sync installed plugins, their settings, and the active community plugin list, excluding Air Sync's own data.",
+			"Sync installed plugins, their settings, and the active community plugin list, excluding Momoan Sync's own data.",
 	},
 	{
 		key: "syncConfigSnippets",
@@ -54,15 +55,12 @@ export function renderConfigSyncSettings(
 	plugin: AirSyncPlugin,
 	rerender: () => void,
 ): void {
+	const t = settingsTranslator(plugin.settings.uiLanguage);
 	const configDir = plugin.app.vault.configDir;
 
 	new Setting(containerEl)
-		.setName("Enable Obsidian config sync")
-		.setDesc(
-			`Sync Obsidian's own config directory (${configDir}/) — hotkeys, plugin settings, and selected ` +
-				"portable folders. Device-specific window layout is deliberately excluded. This is Obsidian's " +
-				"internal metadata; syncing it across devices may cause settings loss or plugin malfunction.",
-		)
+		.setName(t("Enable Obsidian config sync"))
+		.setDesc(t("Sync Obsidian's own config directory ({dir}/) — hotkeys, plugin settings, and selected portable folders. Device-specific window layout is deliberately excluded. This is Obsidian's internal metadata; syncing it across devices may cause settings loss or plugin malfunction.", { dir: configDir }))
 		.addToggle((toggle) =>
 			toggle
 				.setValue(plugin.settings.enableConfigSync)
@@ -78,8 +76,8 @@ export function renderConfigSyncSettings(
 	for (const option of CONFIG_SUBTREE_SETTINGS) {
 		const paths = option.paths.map((path) => `${configDir}/${path}`).join(", ");
 		new Setting(containerEl)
-			.setName(option.name)
-			.setDesc(`${option.description} (${paths})`)
+			.setName(t(option.name))
+			.setDesc(`${t(option.description)} (${paths})`)
 			.addToggle((toggle) =>
 				toggle
 					.setValue(plugin.settings[option.key])
@@ -91,23 +89,23 @@ export function renderConfigSyncSettings(
 			);
 	}
 
-	renderSyncTiming(containerEl);
+	renderSyncTiming(containerEl, t);
 	renderInjectedPatterns(containerEl, plugin, configDir);
 }
 
-function renderSyncTiming(containerEl: HTMLElement): void {
+function renderSyncTiming(containerEl: HTMLElement, t: SettingsTranslator): void {
 	const description = createFragment();
 	description.createEl("p", {
-		text:
+		text: t(
 			"Config changes aren't synced immediately — they're picked up the next time a sync runs " +
-			"(triggered by another vault change, returning to the app, or Sync now).",
+			"(triggered by another vault change, returning to the app, or Sync now)."),
 	});
 	description.createEl("p", {
-		text:
+		text: t(
 			"After a sync finishes, reload the affected plugins, themes, and snippets (or restart Obsidian) " +
-			"for the synced settings to take effect.",
+			"for the synced settings to take effect."),
 	});
-	new Setting(containerEl).setName("Sync timing").setDesc(description);
+	new Setting(containerEl).setName(t("Sync timing")).setDesc(description);
 }
 
 function renderInjectedPatterns(
@@ -115,8 +113,9 @@ function renderInjectedPatterns(
 	plugin: AirSyncPlugin,
 	configDir: string,
 ): void {
+	const t = settingsTranslator(plugin.settings.uiLanguage);
 	const description = createFragment();
-	description.appendText("Added automatically to the top of your Ignore patterns above:");
+	description.appendText(t("Added automatically to the top of your Ignore patterns above:"));
 	description.createEl("pre", {
 		text: getConfigSyncIgnorePatterns(
 			plugin.settings,
@@ -124,5 +123,5 @@ function renderInjectedPatterns(
 			plugin.manifest.id,
 		).join("\n"),
 	});
-	new Setting(containerEl).setName("Injected ignore patterns").setDesc(description);
+	new Setting(containerEl).setName(t("Injected ignore patterns")).setDesc(description);
 }

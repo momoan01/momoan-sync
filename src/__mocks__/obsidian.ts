@@ -93,6 +93,7 @@ export class Modal {
 	constructor(app: unknown) {
 		this.app = app;
 	}
+	setTitle(_title: string): this { return this; }
 	open() {
 		// Each open starts from a clean button list, so __ui.buttons always
 		// reflects only the currently-open modal (no accumulation across opens).

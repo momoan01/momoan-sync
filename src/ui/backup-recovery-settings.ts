@@ -1,3 +1,4 @@
+import { settingsTranslator } from "./settings-i18n";
 import { normalizeBackupIntervalMinutes } from "../backup/lifecycle";
 import { errorMessage } from "../backend-api";
 import type { BackupRestoreSelection, BackupSnapshotSummary } from "../backup/types";
@@ -30,27 +31,28 @@ export function renderBackupRecoverySettings(
 	state: BackupRecoveryUiState,
 	rerender: () => void,
 ): void {
-	new Setting(containerEl).setName("Backup").setHeading();
+	const t = settingsTranslator(plugin.settings.uiLanguage);
+	new Setting(containerEl).setName(t("Backup")).setHeading();
 	if (Platform.isMobile) {
 		new Setting(containerEl)
-			.setName("Local snapshots")
-			.setDesc("Local vault snapshots are desktop-only. File recovery, safety journal, and drive trash remain available on mobile.");
+			.setName(t("Local snapshots"))
+			.setDesc(t("Local vault snapshots are desktop-only. File recovery, safety journal, and drive trash remain available on mobile."));
 		return;
 	}
 
 	new Setting(containerEl)
-		.setName("Backup folder")
-		.setDesc("Existing absolute folder outside this vault. Momoan sync will create blobs, manifests, and metadata inside it.")
+		.setName(t("Backup folder"))
+		.setDesc(t("Existing absolute folder outside this vault. Momoan sync will create blobs, manifests, and metadata inside it."))
 		.addText((text) => text
-			.setPlaceholder("Absolute folder path")
+			.setPlaceholder(t("Absolute folder path"))
 			.setValue(plugin.settings.backupDirectory)
 			.onChange(async (value) => {
 				plugin.settings.backupDirectory = value;
 				await plugin.saveSettings();
 			}));
 	new Setting(containerEl)
-		.setName("Snapshot interval")
-		.setDesc("Minutes between background snapshots. 0 = off. Requires an external backup folder.")
+		.setName(t("Snapshot interval"))
+		.setDesc(t("Minutes between background snapshots. 0 = off. Requires an external backup folder."))
 		.addText((text) => {
 			text.inputEl.type = "number";
 			text.inputEl.min = "0";
@@ -61,24 +63,22 @@ export function renderBackupRecoverySettings(
 			});
 		});
 	new Setting(containerEl)
-		.setName("Local snapshot")
-		.setDesc(plugin.settings.backupDirectory
-			? "Create a content-addressed snapshot of the whole vault now."
-			: "Choose an external backup folder first.")
+		.setName(t("Local snapshot"))
+		.setDesc(t(plugin.settings.backupDirectory ? "Create a content-addressed snapshot of the whole vault now." : "Choose an external backup folder first."))
 		.addButton((button) => button
-			.setButtonText("Backup now")
+			.setButtonText(t("Backup now"))
 			.setDisabled(!plugin.settings.backupDirectory.trim())
 			.onClick(async () => {
 				button.setDisabled(true);
 				try { await plugin.backupNow(); } finally { rerender(); }
 			}));
 
-	new Setting(containerEl).setName("Recovery").setHeading();
+	new Setting(containerEl).setName(t("Recovery")).setHeading();
 	new Setting(containerEl)
-		.setName("Snapshots")
-		.setDesc(snapshotListDescription(state.snapshots))
+		.setName(t("Snapshots"))
+		.setDesc(snapshotListDescription(state.snapshots, t))
 		.addButton((button) => button
-			.setButtonText("Refresh snapshots")
+			.setButtonText(t("Refresh snapshots"))
 			.setDisabled(!plugin.settings.backupDirectory.trim())
 			.onClick(async () => {
 				button.setDisabled(true);
@@ -88,11 +88,11 @@ export function renderBackupRecoverySettings(
 
 	const hasSnapshots = state.snapshots.length > 0;
 	new Setting(containerEl)
-		.setName("Snapshot")
-		.setDesc(hasSnapshots ? "Choose a completed snapshot from the current vault." : "Refresh snapshots to load recovery points.")
+		.setName(t("Snapshot"))
+		.setDesc(t(hasSnapshots ? "Choose a completed snapshot from the current vault." : "Refresh snapshots to load recovery points."))
 		.addDropdown((dropdown) => {
 			for (const snapshot of state.snapshots) {
-				dropdown.addOption(snapshot.snapshotId, snapshotLabel(snapshot));
+				dropdown.addOption(snapshot.snapshotId, snapshotLabel(snapshot, t));
 			}
 			if (state.selectedSnapshotId) dropdown.setValue(state.selectedSnapshotId);
 			dropdown.setDisabled(!hasSnapshots).onChange((value) => {
@@ -102,10 +102,10 @@ export function renderBackupRecoverySettings(
 		});
 
 	new Setting(containerEl)
-		.setName("Snapshot integrity")
-		.setDesc(state.selectedSnapshotId ? "Verify the manifest and every referenced blob." : "Choose a snapshot first.")
+		.setName(t("Snapshot integrity"))
+		.setDesc(t(state.selectedSnapshotId ? "Verify the manifest and every referenced blob." : "Choose a snapshot first."))
 		.addButton((button) => button
-			.setButtonText("Verify snapshot")
+			.setButtonText(t("Verify snapshot"))
 			.setDisabled(!state.selectedSnapshotId)
 			.onClick(async () => {
 				button.setDisabled(true);
@@ -114,20 +114,20 @@ export function renderBackupRecoverySettings(
 			}));
 
 	new Setting(containerEl)
-		.setName("Restore folder")
-		.setDesc("Existing absolute folder outside both the vault and backup store. The original vault is never overwritten.")
+		.setName(t("Restore folder"))
+		.setDesc(t("Existing absolute folder outside both the vault and backup store. The original vault is never overwritten."))
 		.addText((text) => text
-			.setPlaceholder("Absolute restore folder path")
+			.setPlaceholder(t("Absolute restore folder path"))
 			.setValue(state.restoreDirectory)
 			.onChange((value) => { state.restoreDirectory = value; }));
 
 	new Setting(containerEl)
-		.setName("Restore scope")
-		.setDesc("Restore the entire snapshot, one file, or one folder tree.")
+		.setName(t("Restore scope"))
+		.setDesc(t("Restore the entire snapshot, one file, or one folder tree."))
 		.addDropdown((dropdown) => dropdown
-			.addOption("all", "Entire snapshot")
-			.addOption("file", "Single file")
-			.addOption("folder", "Folder")
+			.addOption("all", t("Entire snapshot"))
+			.addOption("file", t("Single file"))
+			.addOption("folder", t("Folder"))
 			.setValue(state.selectionKind)
 			.setDisabled(!hasSnapshots)
 			.onChange((value) => {
@@ -138,8 +138,8 @@ export function renderBackupRecoverySettings(
 
 	if (state.selectionKind !== "all") {
 		new Setting(containerEl)
-			.setName("Snapshot path")
-			.setDesc(state.selectionKind === "file" ? "Exact file path inside the snapshot." : "Exact folder path inside the snapshot.")
+			.setName(t("Snapshot path"))
+			.setDesc(t(state.selectionKind === "file" ? "Exact file path inside the snapshot." : "Exact folder path inside the snapshot."))
 			.addText((text) => text
 				.setPlaceholder(state.selectionKind === "file" ? "folder/note.md" : "folder/subfolder")
 				.setValue(state.selectionPath)
@@ -147,10 +147,10 @@ export function renderBackupRecoverySettings(
 	}
 
 	new Setting(containerEl)
-		.setName("Restore snapshot")
-		.setDesc("Materialize the selected data into a new restore tree for inspection.")
+		.setName(t("Restore snapshot"))
+		.setDesc(t("Materialize the selected data into a new restore tree for inspection."))
 		.addButton((button) => button
-			.setButtonText("Restore snapshot")
+			.setButtonText(t("Restore snapshot"))
 			.setDisabled(!canRestore(state))
 			.onClick(async () => {
 				button.setDisabled(true);
@@ -159,46 +159,49 @@ export function renderBackupRecoverySettings(
 			}));
 
 	if (state.status) {
-		new Setting(containerEl).setName("Recovery status").setDesc(state.status);
+		new Setting(containerEl).setName(t("Recovery status")).setDesc(state.status);
 	}
 }
 
 async function refreshSnapshots(plugin: AirSyncPlugin, state: BackupRecoveryUiState): Promise<void> {
+	const t = settingsTranslator(plugin.settings.uiLanguage);
 	try {
 		state.snapshots = await plugin.backupService.listSnapshots();
 		if (!state.snapshots.some((snapshot) => snapshot.snapshotId === state.selectedSnapshotId)) {
 			state.selectedSnapshotId = state.snapshots[0]?.snapshotId ?? "";
 		}
 		state.status = state.snapshots.length === 0
-			? "No completed snapshots found."
-			: `Loaded ${state.snapshots.length} completed snapshot${state.snapshots.length === 1 ? "" : "s"}.`;
+			? t("No completed snapshots found.")
+			: t("Loaded {n} completed snapshots.", { n: state.snapshots.length });
 	} catch (error) {
 		state.snapshots = [];
 		state.selectedSnapshotId = "";
-		reportFailure(state, "Could not load snapshots", error);
+		reportFailure(state, t("Could not load snapshots"), error);
 	}
 }
 
 async function verifySelectedSnapshot(plugin: AirSyncPlugin, state: BackupRecoveryUiState): Promise<void> {
+	const t = settingsTranslator(plugin.settings.uiLanguage);
 	try {
 		const integrity = await plugin.backupService.verifySnapshot(state.selectedSnapshotId);
 		state.status = integrity.ok
-			? "Snapshot integrity verified."
-			: `Snapshot integrity failed · missing ${integrity.missingBlobs.length} · corrupt ${integrity.corruptBlobs.length}.`;
+			? t("Snapshot integrity verified.")
+			: t("Snapshot integrity failed · missing {missing} · corrupt {corrupt}.", { missing: integrity.missingBlobs.length, corrupt: integrity.corruptBlobs.length });
 		new Notice(state.status);
 	} catch (error) {
-		reportFailure(state, "Could not verify snapshot", error);
+		reportFailure(state, t("Could not verify snapshot"), error);
 	}
 }
 
 async function restoreSelectedSnapshot(plugin: AirSyncPlugin, state: BackupRecoveryUiState): Promise<void> {
+	const t = settingsTranslator(plugin.settings.uiLanguage);
 	try {
 		const result = await plugin.backupService.restoreSnapshot(
 			state.selectedSnapshotId, state.restoreDirectory, restoreSelection(state));
-		state.status = `Restored ${result.restoredFiles} files to ${result.targetDirectory}.`;
-		new Notice(`Restore complete · ${result.restoredFiles} files`);
+		state.status = t("Restored {n} files to {path}.", { n: result.restoredFiles, path: result.targetDirectory });
+		new Notice(t("Restore complete · {n} files", { n: result.restoredFiles }));
 	} catch (error) {
-		reportFailure(state, "Could not restore snapshot", error);
+		reportFailure(state, t("Could not restore snapshot"), error);
 	}
 }
 
@@ -214,14 +217,14 @@ function canRestore(state: BackupRecoveryUiState): boolean {
 		(state.selectionKind === "all" || !!state.selectionPath.trim());
 }
 
-function snapshotListDescription(snapshots: readonly BackupSnapshotSummary[]): string {
+function snapshotListDescription(snapshots: readonly BackupSnapshotSummary[], t: import("./settings-i18n").SettingsTranslator): string {
 	const latest = snapshots[0];
-	if (!latest) return "Load completed recovery points from the configured backup store.";
-	return `${snapshots.length} snapshots · latest ${snapshotLabel(latest)}.`;
+	if (!latest) return t("Load completed recovery points from the configured backup store.");
+	return t("{n} snapshots · latest {latest}.", { n: snapshots.length, latest: snapshotLabel(latest, t) });
 }
 
-function snapshotLabel(snapshot: BackupSnapshotSummary): string {
-	return `${new Date(snapshot.createdAt).toLocaleString()} · ${snapshot.fileCount} files · ${snapshot.trigger}`;
+function snapshotLabel(snapshot: BackupSnapshotSummary, t: import("./settings-i18n").SettingsTranslator): string {
+	return `${new Date(snapshot.createdAt).toLocaleString()} · ${t("{n} files", { n: snapshot.fileCount })} · ${snapshot.trigger}`;
 }
 
 function reportFailure(state: BackupRecoveryUiState, prefix: string, error: unknown): void {

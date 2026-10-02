@@ -1,3 +1,5 @@
+import { settingsTranslator } from "./settings-i18n";
+import { renderSyncModeSettings } from "./sync-mode-settings";
 import { syncExecutionMode } from "../settings";
 import { shadowPreviewSummary } from "../sync/shadow-preview";
 import {
@@ -47,43 +49,20 @@ export class AirSyncSettingTab extends PluginSettingTab {
 	// so in-place refreshes can re-render without calling the deprecated display().
 	renderContent(): void {
 		const { containerEl } = this;
+		const t = settingsTranslator(this.plugin.settings.uiLanguage);
 		containerEl.empty();
-
-		new Setting(containerEl).setName("Sync").setHeading();
-		const shadow = syncExecutionMode(this.plugin.settings) === "shadow";
-		if (shadow) {
-			new Setting(containerEl).setName("Shadow mode · Google Drive")
-				.setDesc("No files will be changed.")
-				.addButton(button => button.setButtonText("Run preview").onClick(async () => {
-					button.setDisabled(true);
-					try { await this.plugin.runSync(); } finally { this.renderContent(); }
-				}));
-			const preview = this.plugin.getLatestShadowPreview();
-			if (preview) {
-				new Setting(containerEl).setName("Latest preview").setDesc(shadowPreviewSummary(preview));
-				new Setting(containerEl).setName("Preview diagnostics")
-					.setDesc("Blocked " + preview.blockedCount + " · Admission failures " + preview.admissionFailureCount + ". " + preview.diagnostics.join(" "));
-			}
-		}
-
-		new Setting(containerEl)
-			.setName("Conflict strategy")
-			.setDesc(
-				"Prefer local applies only to conflicts: it uses the local version for proven two-sided edits, " +
-				"and automatically preserves both versions when that cannot be proven."
-			)
-			.addDropdown((dropdown) =>
-				dropdown
-					.addOption("auto_merge", "Auto merge (recommended)")
-					.addOption("prefer_local", "Prefer local")
-					.addOption("duplicate", "Always create duplicate")
-					.setValue(this.plugin.settings.conflictStrategy)
-					.onChange(async (value) => {
-						this.plugin.settings.conflictStrategy =
-							value as ConflictStrategy;
-						await this.plugin.saveSettings();
-					})
-			);
+		containerEl.addClass("momoan-sync-settings");
+		new Setting(containerEl).setName(t("Momoan Sync")).setHeading();
+		new Setting(containerEl).setName(t("Language")).addDropdown(dropdown => dropdown
+			.addOption("auto", t("System language")).addOption("ko", "한국어").addOption("en", "English")
+			.addOption("ja", "日本語").addOption("zh", "中文").setValue(this.plugin.settings.uiLanguage ?? "auto")
+			.onChange(async value => {
+				if (value !== "auto" && value !== "ko" && value !== "en" && value !== "ja" && value !== "zh") return;
+				this.plugin.settings.uiLanguage = value;
+				await this.plugin.saveSettings();
+				this.renderContent();
+			}));
+		new Setting(containerEl).setName(t("Connection")).setHeading();
 
 		// --- Backend-specific settings (config + connection flow) ---
 		const provider = getBackendProvider(
@@ -94,7 +73,7 @@ export class AirSyncSettingTab extends PluginSettingTab {
 		);
 		if (renderer) {
 			new Setting(containerEl)
-				.setName(`${provider?.displayName ?? "Backend"} connection`)
+				.setName(provider?.displayName ?? "Backend")
 				.setHeading();
 
 			renderer.render(
@@ -118,31 +97,70 @@ export class AirSyncSettingTab extends PluginSettingTab {
 			);
 		}
 
+		new Setting(containerEl).setName(t("Sync")).setHeading();
+		renderSyncModeSettings(containerEl, this.plugin, () => this.renderContent());
+		const shadow = syncExecutionMode(this.plugin.settings) === "shadow";
+		if (shadow) {
+			new Setting(containerEl).setName(t("Shadow mode · Google Drive"))
+				.setDesc(t("No files will be changed."))
+				.addButton(button => button.setButtonText(t("Run preview")).onClick(async () => {
+					button.setDisabled(true);
+					try { await this.plugin.runSync(); } finally { this.renderContent(); }
+				}));
+			const preview = this.plugin.getLatestShadowPreview();
+			if (preview) {
+				new Setting(containerEl).setName(t("Latest preview")).setDesc(shadowPreviewSummary(preview).replace(/Create|Update|Rename|Delete|Conflicts/g, label => t(label)));
+				new Setting(containerEl).setName(t("Preview diagnostics"))
+					.setDesc(t("Blocked") + " " + preview.blockedCount + " · " + t("Admission failures") + " " + preview.admissionFailureCount + ". " + preview.diagnostics.join(" "));
+			}
+		}
+
+		new Setting(containerEl)
+			.setName(t("Conflict strategy"))
+			.setDesc(t(
+				"Prefer local applies only to conflicts: it uses the local version for proven two-sided edits, " +
+				"and automatically preserves both versions when that cannot be proven."
+			))
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("auto_merge", t("Auto merge (recommended)"))
+					.addOption("prefer_local", t("Prefer local"))
+					.addOption("duplicate", t("Always create duplicate"))
+					.setValue(this.plugin.settings.conflictStrategy)
+					.onChange(async (value) => {
+						this.plugin.settings.conflictStrategy =
+							value as ConflictStrategy;
+						await this.plugin.saveSettings();
+					})
+			);
+
+
+		new Setting(containerEl).setName(t("Backup and recovery")).setHeading();
 		renderBackupRecoverySettings(
 			containerEl, this.plugin, this.backupRecovery, () => this.renderContent());
 		renderRecoveryJournalSettings(
 			containerEl, this.plugin, this.recoveryJournal, () => this.renderContent());
 
 		// --- Advanced settings ---
-		new Setting(containerEl).setName("Advanced").setHeading();
+		new Setting(containerEl).setName(t("Advanced")).setHeading();
 
 		new Setting(containerEl)
-			.setName(shadow ? "Cold preview" : "Rescan vault")
-			.setDesc(
+			.setName(t(shadow ? "Cold preview" : "Rescan vault"))
+			.setDesc(t(
 				shadow ? "Run a full observation preview without changing files or the saved checkpoint." : "Discard the remote sync checkpoint and fully reconcile against the remote on the next sync. Use this if sync seems stuck or incomplete after an interrupted sync. It compares files rather than re-downloading them, and keeps your sync history."
-			)
+			))
 			.addButton((button) =>
-				button.setButtonText(shadow ? "Run cold preview" : "Rescan").onClick(() => {
-					new Notice(shadow ? "Starting a full preview" : "Starting a full rescan");
+				button.setButtonText(t(shadow ? "Run cold preview" : "Rescan")).onClick(() => {
+					new Notice(t(shadow ? "Starting a full preview" : "Starting a full rescan"));
 					void this.plugin.rescan();
 				})
 			);
 
 		new Setting(containerEl)
-			.setName("Dot-prefixed paths to sync")
-			.setDesc(
+			.setName(t("Dot-prefixed paths to sync"))
+			.setDesc(t(
 				"Dot-prefixed folders to include in sync, one per line."
-			)
+			))
 			.addTextArea((text) =>
 				text
 					.setPlaceholder(".templates\nfoo/.bar")
@@ -159,8 +177,8 @@ export class AirSyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Ignore patterns")
-			.setDesc("Patterns to exclude from sync (gitignore syntax), one per line.")
+			.setName(t("Ignore patterns"))
+			.setDesc(t("Patterns to exclude from sync (gitignore syntax), one per line."))
 			.addTextArea((text) =>
 				text
 					.setValue(
@@ -175,10 +193,10 @@ export class AirSyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Mobile max file size (mb)")
-			.setDesc(
+			.setName(t("Mobile max file size (mb)"))
+			.setDesc(t(
 				"Files larger than this will be skipped on mobile."
-			)
+			))
 			.addText((text) =>
 				text
 					.setPlaceholder("10")
@@ -196,10 +214,10 @@ export class AirSyncSettingTab extends PluginSettingTab {
 
 		if (Platform.isMobile) {
 			new Setting(containerEl)
-				.setName("Keep screen awake during sync")
-				.setDesc(
+				.setName(t("Keep screen awake during sync"))
+				.setDesc(t(
 					"On mobile, prevent the screen from sleeping while a sync is running, so long syncs are not interrupted by the device locking."
-				)
+				))
 				.addToggle((toggle) =>
 					toggle
 						.setValue(this.plugin.settings.screenWakeLockOnSync)
@@ -211,10 +229,10 @@ export class AirSyncSettingTab extends PluginSettingTab {
 		}
 
 		new Setting(containerEl)
-			.setName("Show sync notifications")
-			.setDesc(
+			.setName(t("Show sync notifications"))
+			.setDesc(t(
 				"Show a brief notice summarizing each completed sync (files uploaded, downloaded, etc.)."
-			)
+			))
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.showSyncNotifications)
@@ -225,10 +243,10 @@ export class AirSyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Enable logging")
-			.setDesc(
+			.setName(t("Enable logging"))
+			.setDesc(t(
 				"Write sync logs inside the private data directory for debugging."
-			)
+			))
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.enableLogging)
@@ -239,16 +257,16 @@ export class AirSyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Log level")
-			.setDesc(
+			.setName(t("Log level"))
+			.setDesc(t(
 				"Minimum level of messages to log."
-			)
+			))
 			.addDropdown((dropdown) =>
 				dropdown
-					.addOption("debug", "Debug")
-					.addOption("info", "Info")
-					.addOption("warn", "Warn")
-					.addOption("error", "Error")
+					.addOption("debug", t("Debug"))
+					.addOption("info", t("Info"))
+					.addOption("warn", t("Warn"))
+					.addOption("error", t("Error"))
 					.setValue(this.plugin.settings.logLevel)
 					.onChange(async (value) => {
 						this.plugin.settings.logLevel =
@@ -258,7 +276,7 @@ export class AirSyncSettingTab extends PluginSettingTab {
 			);
 
 		// --- Experimental settings ---
-		new Setting(containerEl).setName("Experimental").setHeading();
+		new Setting(containerEl).setName(t("Danger zone")).setHeading();
 
 		renderConfigSyncSettings(containerEl, this.plugin, () => this.renderContent());
 	}

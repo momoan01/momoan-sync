@@ -10,7 +10,7 @@ import { AirSyncSettingTab } from "./settings";
 
 beforeEach(() => {
  __ui.buttons = []; __ui.dropdowns = [];
- vi.stubGlobal("document", { createElement: () => ({ empty: () => {} }) });
+ vi.stubGlobal("document", { createElement: () => ({ empty: () => {}, addClass: () => {} }) });
 });
 
 function pluginFixture() {
@@ -21,6 +21,7 @@ function pluginFixture() {
 		saveSettings: vi.fn().mockResolvedValue(undefined),
 		rescan: vi.fn(),
 		getLatestShadowPreview: () => null,
+		isSyncing: vi.fn().mockReturnValue(false),
 		runSync: vi.fn().mockResolvedValue(undefined),
 		backendManager: {},
 	};
@@ -31,7 +32,7 @@ describe("AirSyncSettingTab conflict strategy", () => {
 		__ui.dropdowns = [];
 		__ui.buttons = [];
 		vi.stubGlobal("document", {
-			createElement: () => ({ empty: () => {} }),
+			createElement: () => ({ empty: () => {}, addClass: () => {} }),
 		});
 	});
 
@@ -61,7 +62,7 @@ describe("AirSyncSettingTab conflict strategy", () => {
 
 
 describe("M3 Shadow settings", () => {
- it("exposes preview and cold preview without a Write mode control", () => {
+ it("exposes preview and cold preview with no ordinary mode toggle", () => {
   const plugin = pluginFixture(); const tab = new AirSyncSettingTab(new App() as unknown as ObsidianApp, plugin as unknown as AirSyncPlugin);
   tab.display();
   const button = __ui.buttons.find(item => item.name === "Shadow mode · Google Drive");
@@ -81,4 +82,19 @@ it("shows the latest preview summary and explicit no-change disclosure", () => {
  expect(names).toHaveBeenCalledWith("Latest preview"); expect(descriptions).toHaveBeenCalledWith("No files will be changed.");
  expect(descriptions).toHaveBeenCalledWith("Create 0 · Update 0 · Rename 0 · Delete 0 · Conflicts 0");
  names.mockRestore(); descriptions.mockRestore();
+});
+
+it.each(["ko", "ja", "zh"])("renders all five product sections in %s and persists the language", async language => {
+ const plugin = pluginFixture();
+ const names = vi.spyOn(Setting.prototype, "setName");
+ const tab = new AirSyncSettingTab(new App() as unknown as ObsidianApp, plugin as unknown as AirSyncPlugin);
+ tab.display();
+ const languageControl = __ui.dropdowns.find(item => item.name === "Language");
+ await languageControl?.change(language);
+ expect(plugin.settings).toHaveProperty("uiLanguage", language);
+ expect(plugin.saveSettings).toHaveBeenCalledOnce();
+ const translated = language === "ko" ? ["연결", "동기화", "백업·복구", "고급", "위험 영역"] :
+  language === "ja" ? ["接続", "同期", "バックアップ・復元", "詳細", "危険な操作"] : ["连接", "同步", "备份与恢复", "高级", "危险操作"];
+ for (const section of translated) expect(names).toHaveBeenCalledWith(section);
+ names.mockRestore();
 });

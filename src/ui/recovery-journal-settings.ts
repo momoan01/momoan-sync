@@ -1,3 +1,4 @@
+import { settingsTranslator } from "./settings-i18n";
 import { errorMessage } from "../backend-api";
 import type AirSyncPlugin from "../main";
 import { Notice, Platform, Setting } from "../platform/obsidian";
@@ -36,12 +37,13 @@ export function renderRecoveryJournalSettings(
 	state: RecoveryJournalUiState,
 	rerender: () => void,
 ): void {
-	new Setting(containerEl).setName("Recent sync recovery").setHeading();
+	const t = settingsTranslator(plugin.settings.uiLanguage);
+	new Setting(containerEl).setName(t("Recent sync recovery")).setHeading();
 	new Setting(containerEl)
-		.setName("Safety journal")
-		.setDesc("Captured file states from before destructive sync actions. Restoring exports a copy and never replays the sync action.")
+		.setName(t("Safety journal"))
+		.setDesc(t("Captured file states from before destructive sync actions. Restoring exports a copy and never replays the sync action."))
 		.addButton((button) => button
-			.setButtonText("Refresh journal")
+			.setButtonText(t("Refresh journal"))
 			.onClick(async () => {
 				button.setDisabled(true);
 				await refreshJournal(plugin, state);
@@ -50,10 +52,8 @@ export function renderRecoveryJournalSettings(
 
 	const choices = recoveryChoices(state.entries);
 	new Setting(containerEl)
-		.setName("Captured file")
-		.setDesc(choices.length > 0
-			? "Choose a captured file state to export for inspection."
-			: "Refresh the safety journal to load recoverable file states.")
+		.setName(t("Captured file"))
+		.setDesc(t(choices.length > 0 ? "Choose a captured file state to export for inspection." : "Refresh the safety journal to load recoverable file states."))
 		.addDropdown((dropdown) => {
 			for (const choice of choices) dropdown.addOption(choice.key, choice.label);
 			if (state.selectedEndpointKey) dropdown.setValue(state.selectedEndpointKey);
@@ -65,25 +65,25 @@ export function renderRecoveryJournalSettings(
 
 	if (Platform.isMobile) {
 		new Setting(containerEl)
-			.setName("Recovery export")
-			.setDesc("Safety journal data remains available on mobile, but exporting captured files requires desktop.");
-		if (state.status) new Setting(containerEl).setName("Recovery status").setDesc(state.status);
+			.setName(t("Recovery export"))
+			.setDesc(t("Safety journal data remains available on mobile, but exporting captured files requires desktop."));
+		if (state.status) new Setting(containerEl).setName(t("Recovery status")).setDesc(state.status);
 		return;
 	}
 
 	new Setting(containerEl)
-		.setName("Restore folder")
-		.setDesc("Existing absolute folder outside the vault. The captured file is exported into a new recovery tree.")
+		.setName(t("Restore folder"))
+		.setDesc(t("Existing absolute folder outside the vault. The captured file is exported into a new recovery tree."))
 		.addText((text) => text
-			.setPlaceholder("Absolute restore folder path")
+			.setPlaceholder(t("Absolute restore folder path"))
 			.setValue(state.restoreDirectory)
 			.onChange((value) => { state.restoreDirectory = value; }));
 
 	new Setting(containerEl)
-		.setName("Restore captured file")
-		.setDesc("Export the selected pre-sync file state without modifying the current vault.")
+		.setName(t("Restore captured file"))
+		.setDesc(t("Export the selected pre-sync file state without modifying the current vault."))
 		.addButton((button) => button
-			.setButtonText("Restore captured file")
+			.setButtonText(t("Restore captured file"))
 			.setDisabled(!selectedChoice(state, choices) || !state.restoreDirectory.trim())
 			.onClick(async () => {
 				button.setDisabled(true);
@@ -91,10 +91,11 @@ export function renderRecoveryJournalSettings(
 				rerender();
 			}));
 
-	if (state.status) new Setting(containerEl).setName("Recovery status").setDesc(state.status);
+	if (state.status) new Setting(containerEl).setName(t("Recovery status")).setDesc(state.status);
 }
 
 async function refreshJournal(plugin: AirSyncPlugin, state: RecoveryJournalUiState): Promise<void> {
+	const t = settingsTranslator(plugin.settings.uiLanguage);
 	try {
 		state.entries = await listRecoveryJournalEntries(plugin.settings.vaultId);
 		const choices = recoveryChoices(state.entries);
@@ -102,12 +103,12 @@ async function refreshJournal(plugin: AirSyncPlugin, state: RecoveryJournalUiSta
 			state.selectedEndpointKey = choices[0]?.key ?? "";
 		}
 		state.status = choices.length === 0
-			? "No recoverable file content is currently stored in the safety journal."
-			: `Loaded ${choices.length} recoverable file state${choices.length === 1 ? "" : "s"}.`;
+			? t("No recoverable file content is currently stored in the safety journal.")
+			: t("Loaded {n} recoverable file states.", { n: choices.length });
 	} catch (error) {
 		state.entries = [];
 		state.selectedEndpointKey = "";
-		reportFailure(state, "Could not load the safety journal", error);
+		reportFailure(state, t("Could not load the safety journal"), error);
 	}
 }
 
@@ -116,6 +117,7 @@ async function restoreSelectedEntry(
 	state: RecoveryJournalUiState,
 	choices: readonly RecoveryJournalChoice[],
 ): Promise<void> {
+	const t = settingsTranslator(plugin.settings.uiLanguage);
 	try {
 		const choice = selectedChoice(state, choices);
 		if (!choice) throw new Error("Choose a captured file first");
@@ -129,10 +131,10 @@ async function restoreSelectedEntry(
 			backupDirectory: plugin.settings.backupDirectory,
 			restoreDirectory: state.restoreDirectory,
 		});
-		state.status = `Restored captured file to ${result.restoredPath}.`;
-		new Notice("Safety journal recovery exported");
+		state.status = t("Restored captured file to {path}.", { path: result.restoredPath });
+		new Notice(t("Safety journal recovery exported"));
 	} catch (error) {
-		reportFailure(state, "Could not restore captured file", error);
+		reportFailure(state, t("Could not restore captured file"), error);
 	}
 }
 

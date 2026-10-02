@@ -44,3 +44,18 @@
 .air-sync-status-disconnected .setting-item-description {
 	color: var(--text-muted);
 }
+
+/* Momoan product family: compact spacing, quiet surfaces, clear section hierarchy. */
+.momoan-sync-settings { --momoan-radius: 12px; max-width: 860px; margin-inline: auto; }
+.momoan-sync-settings .setting-item { padding-block: 12px; gap: 16px; }
+.momoan-sync-settings .setting-item-heading { margin-top: 24px; padding-bottom: 10px; }
+.momoan-sync-settings .setting-item-name { font-weight: 550; }
+.momoan-sync-settings .setting-item-description { line-height: 1.55; font-size: var(--font-ui-small); }
+.momoan-sync-settings input:not([type=checkbox]), .momoan-sync-settings select,
+.momoan-sync-settings button { border-radius: 8px; }
+.momoan-sync-write-confirmation .setting-item-description { line-height: 1.6; }
+.momoan-sync-write-confirmation .setting-item { padding-block: 12px; }
+@media (max-width: 600px) {
+  .momoan-sync-settings .setting-item { flex-wrap: wrap; }
+  .momoan-sync-settings .setting-item-control { max-width: 100%; }
+}

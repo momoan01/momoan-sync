@@ -1,3 +1,4 @@
+import type { SettingsTranslator } from "./settings-i18n";
 import { Setting } from "../platform/obsidian";
 import type { App, TextComponent } from "../platform/obsidian";
 import type { AirSyncSettings } from "../settings";
@@ -17,6 +18,7 @@ import { AppFolderPickerModal, type AppFolderPickerProvider } from "./app-folder
 export function renderConnectionStatus(
 	containerEl: HTMLElement,
 	opts: {
+		translate?: SettingsTranslator;
 		connected: boolean;
 		connectLabel: string;
 		actions: BackendConnectionActions;
@@ -24,13 +26,14 @@ export function renderConnectionStatus(
 	},
 ): void {
 	const { connected, connectLabel, actions } = opts;
+	const t = opts.translate ?? ((text: string) => text);
 	const setting = new Setting(containerEl)
-		.setName("Connection status")
-		.setDesc(connected ? "● Connected" : "● Not connected");
+		.setName(t("Connection status"))
+		.setDesc(t(connected ? "● Connected" : "● Not connected"));
 	setting.settingEl.addClass(connected ? "air-sync-status-connected" : "air-sync-status-disconnected");
 	setting.addButton((button) =>
 		button
-			.setButtonText(connected ? "Disconnect" : connectLabel)
+			.setButtonText(connected ? t("Disconnect") : connectLabel)
 			.onClick(async () => {
 				if (connected) {
 					await actions.disconnect();

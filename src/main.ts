@@ -321,6 +321,11 @@ export default class AirSyncPlugin extends Plugin {
 		this.backupLifecycle?.configure();
 	}
 
+	/** Settings mode switches must wait until the current attempt has settled. */
+	isSyncing(): boolean {
+		return this.orchestrator.isSyncing();
+	}
+
 	getLatestShadowPreview() {
 		return this.orchestrator.getLatestShadowPreview();
 	}

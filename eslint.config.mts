@@ -324,8 +324,9 @@ export default defineConfig(
 	{
 		// Plugin composition root retains lifecycle registration, startup-before-sync,
 		// and settings-driven interval reconfiguration together; snapshot work is in backup/lifecycle.ts.
+		// The read-only isSyncing settings boundary prevents mode switches during an active attempt.
 		files: ["src/main.ts"],
-		rules: { "max-lines": ["error", { max: 326, skipBlankLines: true, skipComments: true }] },
+		rules: { "max-lines": ["error", { max: 329, skipBlankLines: true, skipComments: true }] },
 	},
 	{
 		// Startup WARM acquisition: the durable record read now starts before the

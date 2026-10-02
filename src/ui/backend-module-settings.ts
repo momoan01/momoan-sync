@@ -1,3 +1,4 @@
+import type { SettingsTranslator } from "./settings-i18n";
 import { Setting } from "../platform/obsidian";
 import type {
 	BackendSettingField,
@@ -21,6 +22,7 @@ import {
  * `secret_reference` field holds a non-secret reference name only.
  */
 export interface BackendSettingsHost {
+	translate?: SettingsTranslator;
 	/** The latest active config bag (read fresh on every render). */
 	config(): Readonly<JsonObject>;
 	/** Persist one top-level field of the active config bag. */
@@ -71,6 +73,7 @@ export function renderBackendSettings(
 	host: BackendSettingsHost,
 ): void {
 	const root = parent.createDiv();
+	const t = host.translate ?? ((text: string) => text);
 	const draw = (): void => {
 		const config = host.config();
 		const issues = new Map(
@@ -78,9 +81,9 @@ export function renderBackendSettings(
 		);
 		root.empty();
 		for (const field of visibleFields(definition, config)) {
-			const setting = new Setting(root).setName(field.label);
+			const setting = new Setting(root).setName(t(field.label));
 			const issue = issues.get(field.key);
-			const help = field.description ?? "";
+			const help = t(field.description ?? "");
 			setting.setDesc(issue ? (help ? `${help} — ${issue}` : issue) : help);
 			const commit = (next: JsonValue): void => {
 				void Promise.resolve(host.setValue(field.key, next)).then(draw);

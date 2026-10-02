@@ -9,6 +9,8 @@ export function syncExecutionMode(settings: Pick<AirSyncSettings, "syncMode">): 
 
 export interface AirSyncSettings {
 	syncMode?: SyncExecutionMode;
+	/** UI language only; missing uses the device language. */
+	uiLanguage?: "auto" | "en" | "ko" | "ja" | "zh";
 	/** Unique identifier for this vault (used as IndexedDB key) */
 	vaultId: string;
 	/** Selected backend type (e.g. "googledrive") */
