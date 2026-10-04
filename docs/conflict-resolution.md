@@ -3,6 +3,21 @@
 This document owns the conflict-policy judgements. The resolver's implementation lives in
 the code.
 
+## Concurrent rename conflicts
+
+A one-sided rename propagates normally. When local and remote rename the same
+committed file to different paths concurrently, the remote/provider-current path
+wins as the deterministic canonical address only when each new path is vacant on
+the opposite side. Occupants and replacements retain the existing preservation
+behavior. Rename resolution does not compare
+mtimes. Renaming both sides to the same path retains normal convergence behavior.
+
+Content conflicts are resolved separately by the existing `auto_merge`,
+`prefer_local`, or `duplicate` policy; choosing the remote name does not choose
+which content to keep. When sync notifications are enabled, successful divergent
+rename resolution also reports `N rename conflict(s) (remote name kept)` alongside
+the existing renamed count.
+
 ## Conflict strategies
 
 The settings surface exposes three user-facing strategies. Observation uses the captured

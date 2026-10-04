@@ -733,6 +733,40 @@ describe("admitBatchObservation", () => {
 		expect(next.dispositions[0]?.kind).toBe("resolved_no_action");
 	});
 
+	it.each([
+		{ localPath: "pc1.md", remotePath: "drive.md", action: "rename_local", oldPath: "pc1.md", path: "drive.md" },
+		{ localPath: "pc1.md", remotePath: "test.md", action: "rename_remote", oldPath: "test.md", path: "pc1.md" },
+		{ localPath: "test.md", remotePath: "drive.md", action: "rename_local", oldPath: "test.md", path: "drive.md" },
+		{ localPath: "drive.md", remotePath: "drive.md", action: "match", path: "drive.md" },
+	])("binds equal-content renames $localPath / $remotePath to $path", ({ localPath, remotePath, action, oldPath, path }) => {
+		const baseline = recordFor(entity("test.md", "X"));
+		// Local is newer, but mtimes must not select the canonical rename address.
+		const local = { ...entity(localPath), mtime: 100 };
+		const remote = entity(remotePath, "X");
+		const paths = [...new Set(["test.md", localPath, remotePath])];
+		const evidence: IdentityEvidence[] = [];
+		if (localPath !== baseline.path) evidence.push(remoteRename({
+			side: "local", oldPath: baseline.path, newPath: localPath, identityKey: undefined,
+		}));
+		if (remotePath !== baseline.path) evidence.push(remoteRename({
+			oldPath: baseline.path, newPath: remotePath,
+		}));
+		const observations: PathObservation[] = paths.flatMap((requestedPath) =>
+			(["local", "remote"] as const).map((side): PathObservation => {
+				const current = side === "local" ? local : remote;
+				return requestedPath === current.path
+					? { kind: "exact", side, requestedPath, entity: current }
+					: { kind: "absent", side, requestedPath, authority: "stat" };
+			}));
+		const result = admitBatchObservation(captureBatchObservation([
+			{ path: baseline.path, prevSync: baseline },
+			{ path: local.path, local }, { path: remote.path, remote },
+		], evidence, observations, projection(Object.fromEntries(paths.map((p) => [p, "included"]))), "backend\0root"));
+
+		expect(result.failures).toEqual([]);
+		expect(result.executable.actions).toEqual([expect.objectContaining({ action, path, ...(oldPath ? { oldPath } : {}) })]);
+	});
+
 	it("binds a remote rename before selecting its changed content transfer", () => {
 		const local = entity("A.md");
 		const baseline = recordFor({ ...local, identityKey: "X" });
@@ -3247,6 +3281,7 @@ describe("admitBatchObservation", () => {
 		], evidence, [
 			{ kind: "absent", side: "local", requestedPath: "A.md", authority: "stat" },
 			{ kind: "exact", side: "local", requestedPath: "B.md", entity: local },
+			{ kind: "absent", side: "local", requestedPath: "C.md", authority: "stat" },
 			{ kind: "absent", side: "remote", requestedPath: "A.md", authority: "stat" },
 			{ kind: "absent", side: "remote", requestedPath: "B.md", authority: "stat" },
 			{ kind: "exact", side: "remote", requestedPath: "C.md", entity: movedRemote },
@@ -3254,7 +3289,7 @@ describe("admitBatchObservation", () => {
 
 		expect(result.executable.actions).toHaveLength(1);
 		expect(result.executable.actions[0]).toMatchObject({
-			action: "conflict", path: "B.md",
+			action: "conflict", path: "C.md", local,
 			remote: movedRemote, remoteIdentitySource: movedRemote,
 			publication: { source: baseline, destination: undefined },
 		});
@@ -3302,6 +3337,7 @@ describe("admitBatchObservation", () => {
 		], [
 			{ kind: "absent", side: "local", requestedPath: "A.md", authority: "stat" },
 			{ kind: "exact", side: "local", requestedPath: "B.md", entity: local },
+			{ kind: "absent", side: "local", requestedPath: "C.md", authority: "stat" },
 			{ kind: "absent", side: "remote", requestedPath: "A.md", authority: "stat" },
 			{ kind: "exact", side: "remote", requestedPath: "B.md", entity: occupant },
 			{ kind: "exact", side: "remote", requestedPath: "C.md", entity: movedRemote },
@@ -3309,14 +3345,11 @@ describe("admitBatchObservation", () => {
 
 		expect(result.executable.actions).toHaveLength(1);
 		expect(result.executable.actions[0]).toMatchObject({
-			action: "conflict", path: "B.md",
-			remote: movedRemote, remoteIdentitySource: movedRemote,
-			additionalRemote: occupant,
+			action: "conflict", path: "B.md", remote: movedRemote,
+			remoteIdentitySource: movedRemote, additionalRemote: occupant,
 			publication: { source: baseline, destination: undefined },
 		});
-		expect(result.dispositions[0]).toMatchObject({
-			kind: "authorized",
-		});
+		expect(result.dispositions[0]).toMatchObject({ kind: "authorized" });
 		expect(result.failures).toEqual([]);
 	});
 

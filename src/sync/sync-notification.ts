@@ -33,12 +33,17 @@ export function buildNotificationMessage(outcome: SyncCycleOutcome): string {
 	};
 	for (const { action } of execution.succeeded) count(action);
 	for (const { action } of execution.superseded) count(action);
+	const renameConflicts = execution.succeeded.filter(({ action }) =>
+		(action.action === "rename_local" || action.action === "conflict") && action.baseline && action.local && action.remote &&
+		action.local.path !== action.baseline.path && action.remote.path !== action.baseline.path &&
+		action.local.path !== action.remote.path && action.path === action.remote.path).length;
 	const parts: string[] = [];
 	if (counts.pushed > 0) parts.push(`${counts.pushed} pushed`);
 	if (counts.pulled > 0) parts.push(`${counts.pulled} pulled`);
 	if (counts.matched > 0) parts.push(`${counts.matched} matched`);
 	if (counts.deleted > 0) parts.push(`${counts.deleted} deleted`);
 	if (counts.renamed > 0) parts.push(`${counts.renamed} renamed`);
+	if (renameConflicts > 0) parts.push(`${renameConflicts} rename ${renameConflicts === 1 ? "conflict" : "conflicts"} (remote name kept)`);
 	if (execution.conflicts.length > 0) parts.push(`${execution.conflicts.length} conflicts`);
 	const errors = execution.failed.length + outcome.admissionFailures.length;
 	if (errors > 0) parts.push(`${errors} ${errors === 1 ? "error" : "errors"}`);

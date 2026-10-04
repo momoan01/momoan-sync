@@ -1,6 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { buildNotificationMessage, CycleSummary } from "./sync-notification";
 import type { SyncCycleOutcome } from "./sync-notification";
+import type { SyncAction } from "./types";
+
+function concurrentRename() {
+	return {
+		action: "rename_local" as const, oldPath: "pc1.md", path: "drive.md",
+		local: { path: "pc1.md", isDirectory: false, size: 1, mtime: 100, hash: "h" },
+		remote: { path: "drive.md", isDirectory: false, size: 1, mtime: 1, hash: "h" },
+		baseline: { path: "test.md", hash: "h", localMtime: 1, remoteMtime: 1,
+			localSize: 1, remoteSize: 1, remoteIdentityKey: "X", syncedAt: 1 },
+	};
+}
 
 function outcome(admissionFailures = 0): SyncCycleOutcome {
 	return {
@@ -55,5 +66,41 @@ describe("sync notification Admission failure visibility", () => {
 		summary.add(outcome(2));
 
 		expect(summary.message).toBe("Sync: 3 errors — Admission failed (unclassified)");
+	});
+
+	it("reports a successful concurrent rename with the remote name kept", () => {
+		const cycle = outcome();
+		cycle.execution.succeeded.push({ action: concurrentRename() });
+		expect(buildNotificationMessage(cycle)).toBe("Sync: 1 renamed, 1 rename conflict (remote name kept)");
+		cycle.execution.succeeded.push({ action: concurrentRename() });
+		expect(buildNotificationMessage(cycle)).toBe("Sync: 2 renamed, 2 rename conflicts (remote name kept)");
+	});
+
+	it("reports the remote name kept alongside a content conflict", () => {
+		const cycle = outcome();
+		const action: SyncAction = { ...concurrentRename(), action: "conflict",
+			protocol: { kind: "same_path" }, conflictPolicy: { mode: "preserve", strategy: "duplicate" } };
+		cycle.execution.succeeded.push({ action });
+		expect(buildNotificationMessage(cycle)).toBe("Sync: 1 rename conflict (remote name kept)");
+	});
+
+	it.each([
+		{ baseline: undefined },
+		{ local: undefined },
+		{ remote: undefined },
+		{ local: { path: "test.md", isDirectory: false, size: 1, mtime: 1, hash: "h" } },
+		{ remote: { path: "test.md", isDirectory: false, size: 1, mtime: 1, hash: "h" } },
+		{ local: { path: "drive.md", isDirectory: false, size: 1, mtime: 1, hash: "h" } },
+		{ path: "other.md" },
+	])("does not label an ordinary rename as a concurrent rename conflict (%j)", (override) => {
+		const cycle = outcome();
+		cycle.execution.succeeded.push({ action: { ...concurrentRename(), ...override } });
+		expect(buildNotificationMessage(cycle)).toBe("Sync: 1 renamed");
+	});
+
+	it("does not count a superseded concurrent rename as successfully resolved", () => {
+		const cycle = outcome();
+		cycle.execution.superseded.push({ action: concurrentRename(), terminalRecord: concurrentRename().baseline });
+		expect(buildNotificationMessage(cycle)).toBe("Sync: 1 renamed");
 	});
 });
