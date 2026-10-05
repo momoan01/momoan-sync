@@ -1,4 +1,4 @@
-/* eslint max-lines: ["error", 941] -- relation abandonment, exact-path binding, preservation-cover authorization, and Prefer-local eligibility must stay under the sole identity-policy owner. Re-pinned from 785 for the two corrected publication expectations: a replacement continues no row, so the incumbent it names is the occupant of the claimed address and nothing else. Re-pinned from 789 for the rename guard's cross-source note, which precedes the loop it explains; this directive counts comments. Re-pinned from 800 for the contended-address precondition: which provider object an address denotes is current topology, bound here with the endpoint and record facts below rather than filtered out of the result afterwards, so every rule reads one `CurrentFacts` and no caller can re-decide an address this owner already refused. Re-pinned from 815 for `awaiting_repair`, the reason that tells a withheld address whose repair its own plan carries apart from one nothing will settle — the closeout owes the first a follow-up cycle and the second nothing — and it belongs in the closed vocabulary this owner defines. Re-pinned from 822 for the abandoned-relation fallback's identity join: a committed row belongs to the current address its provider identity is observed at, and abandoning a relation must re-seat it there (through the relocated-match fallback) rather than decide the endpoint unbaselined. Re-pinned from 848 to also mark a stored row whose identity is observed elsewhere as relocated away, so a continuation and a replacement cannot both name the same incumbent row. Re-pinned from 858 for ordering a carrying action before the address it vacates, so a stored path that sorts first cannot outrun the row it must lose. Re-pinned from 869 for carrying a remote rename's local counterpart to the rename destination, so a folder rename onto an occupied address moves the local file instead of pushing the stale old address. Re-pinned from 901 for the empty-parent prune candidate helper: it binds the scope-filtered ancestor chain to the exact delete/file-rename action this owner materializes, so no other layer re-derives candidate addresses. Re-pinned from 931 for mutually vacant provider-current concurrent rename binding and accounting for its admitted local source; content resolution remains separate. */
+/* eslint max-lines: ["error", 963] -- relation abandonment, exact-path binding, preservation-cover authorization, and Prefer-local eligibility must stay under the sole identity-policy owner. Re-pinned from 785 for the two corrected publication expectations: a replacement continues no row, so the incumbent it names is the occupant of the claimed address and nothing else. Re-pinned from 789 for the rename guard's cross-source note, which precedes the loop it explains; this directive counts comments. Re-pinned from 800 for the contended-address precondition: which provider object an address denotes is current topology, bound here with the endpoint and record facts below rather than filtered out of the result afterwards, so every rule reads one `CurrentFacts` and no caller can re-decide an address this owner already refused. Re-pinned from 815 for `awaiting_repair`, the reason that tells a withheld address whose repair its own plan carries apart from one nothing will settle — the closeout owes the first a follow-up cycle and the second nothing — and it belongs in the closed vocabulary this owner defines. Re-pinned from 822 for the abandoned-relation fallback's identity join: a committed row belongs to the current address its provider identity is observed at, and abandoning a relation must re-seat it there (through the relocated-match fallback) rather than decide the endpoint unbaselined. Re-pinned from 848 to also mark a stored row whose identity is observed elsewhere as relocated away, so a continuation and a replacement cannot both name the same incumbent row. Re-pinned from 858 for ordering a carrying action before the address it vacates, so a stored path that sorts first cannot outrun the row it must lose. Re-pinned from 869 for carrying a remote rename's local counterpart to the rename destination, so a folder rename onto an occupied address moves the local file instead of pushing the stale old address. Re-pinned from 901 for the empty-parent prune candidate helper: it binds the scope-filtered ancestor chain to the exact delete/file-rename action this owner materializes, so no other layer re-derives candidate addresses. Re-pinned from 931 for mutually vacant provider-current concurrent rename binding and accounting for its admitted local source; content resolution remains separate. Re-pinned from 941 to keep explicit-report and vacant-destination COLD identity proofs under the same identity-policy owner. */
 import type { FileEntity } from "../fs/types";
 import type { IdentityComponent } from "./plan-admission-graph";
 import { selectReportFamily } from "./identity-component-report-family";
@@ -483,13 +483,35 @@ function bindFiles(facts: CurrentFacts, reports: readonly RenameEvidence[]): Fil
 			continue;
 		}
 		// Concurrent divergent renames use the provider-current path as the
-		// deterministic canonical address. Content resolution remains separate.
-		const remoteWinsDivergentRename =
+		// deterministic canonical address. A delta rename report is one proof of
+		// that move, but a COLD scan can prove the same fact from the committed
+		// provider identity observed at a different current path. Content resolution
+		// remains separate.
+		const remoteMovedByIdentity =
+			!!trackedRemote &&
+			trackedRemote.path !== baseline.path &&
+			trackedRemote.identityKey === baseline.remoteIdentityKey;
+		const remoteWinsReportedDivergentRename =
 			!!localReport && !!remoteReport && !!local && !!remote &&
-			localReport.newPath === local.path && remoteReport.newPath === remote.path &&
-			local.path !== remote.path && remote.identityKey === baseline.remoteIdentityKey &&
+			localReport.newPath === local.path &&
+			remoteReport.newPath === remote.path &&
+			local.path !== remote.path &&
+			remote.identityKey === baseline.remoteIdentityKey &&
 			vacant(facts, "remote", local.path, remote.path) &&
 			vacant(facts, "local", remote.path, local.path);
+		const remoteWinsColdIdentityDivergentRename =
+			!!localReport && !remoteReport && remoteMovedByIdentity &&
+			!!local && !!remote &&
+			localReport.newPath === local.path &&
+			local.path !== remote.path &&
+			remote.identityKey === baseline.remoteIdentityKey &&
+			!facts.remote.has(local.path) &&
+			!facts.local.has(remote.path) &&
+			vacant(facts, "remote", local.path, remote.path) &&
+			vacant(facts, "local", remote.path, local.path);
+		const remoteWinsDivergentRename =
+			remoteWinsReportedDivergentRename ||
+			remoteWinsColdIdentityDivergentRename;
 		const path = remoteWinsDivergentRename ? remote.path
 			: localReport && local ? local.path
 			: carriedLocal && remote ? remote.path

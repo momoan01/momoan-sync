@@ -17,6 +17,7 @@ import { applyScope } from "./scope-projection";
 import { captureBatchObservation, prepareSyncCycleSnapshot } from "./sync-cycle-planning";
 import { admitBatchObservation } from "./plan-admission";
 import { insertConflictSuffix } from "./conflict";
+import { createShadowPreview } from "./shadow-preview";
 
 const checksumRegistry = createChecksumRegistry();
 
@@ -682,6 +683,65 @@ describe("collectChanges — temperature selection", () => {
 
 			expect(result.temperature).toBe("cold");
 			expect(result.identityEvidence).toEqual([]);
+		});
+
+		it("cold preview keeps the provider-current name for a clean divergent rename", async () => {
+			const content = "same";
+			const bytes = new TextEncoder().encode(content).buffer;
+			const hash = await sha256(bytes);
+			const local = addFile(localFs, "local.md", content, 1000);
+			local.hash = hash;
+			const remote = addFile(remoteFs, "remote.md", content, 1000);
+			remote.hash = hash;
+			remote.identityKey = "R";
+			await stateStore.put(makeRecord("old.md", {
+				hash,
+				localMtime: 1000,
+				remoteMtime: 1000,
+				localSize: bytes.byteLength,
+				remoteSize: bytes.byteLength,
+				remoteIdentityKey: "R",
+			}));
+			localTracker.markRenamed("local.md", "old.md");
+
+			const changes = await collectChanges(makeDeps(), { forceFullScan: true });
+
+			expect(changes.temperature).toBe("cold");
+			expect(changes.identityEvidence).toContainEqual({
+				kind: "rename", side: "local",
+				oldPath: "old.md", newPath: "local.md",
+				isFolder: false, authority: "reported",
+			});
+			expect(changes.identityEvidence).toContainEqual({
+				kind: "stable_identity", side: "remote", identityKey: "R",
+				occurrences: [
+					{ side: "remote", phase: "baseline", path: "old.md", identityKey: "R" },
+					{ side: "remote", phase: "current", path: "remote.md", identityKey: "R" },
+				],
+			});
+			expect(changes.identityEvidence).not.toContainEqual(expect.objectContaining({
+				kind: "rename", side: "remote",
+			}));
+
+			const { snapshot } = prepareSyncCycleSnapshot(
+				changes, "backend\0root", { ignorePatterns: [] },
+			);
+			const admission = admitBatchObservation(snapshot);
+
+			expect(admission.failures).toEqual([]);
+			expect(admission.executable.actions).toContainEqual(expect.objectContaining({
+				action: "rename_local",
+				oldPath: "local.md",
+				path: "remote.md",
+			}));
+
+			const preview = createShadowPreview(admission, true, false);
+			expect(preview.expectedChanges).toEqual({
+				create: { local: 0, remote: 0 },
+				update: { local: 0, remote: 0 },
+				rename: { local: 1, remote: 0 },
+				delete: { local: 0, remote: 0 },
+			});
 		});
 
 		it("collects a case-only alias without inventing rename evidence", async () => {
