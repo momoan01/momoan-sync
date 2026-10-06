@@ -117,7 +117,7 @@ describe("GoogleAuthDirect.getAuthorizationUrl", () => {
 
 		const url = new URL(await auth.getFolderPickerAuthorizationUrl());
 
-		expect(url.searchParams.get("scope")).toBe("https://www.googleapis.com/auth/drive.file");
+		expect(url.searchParams.get("scope")).toBe("https://www.googleapis.com/auth/drive");
 		expect(url.searchParams.get("prompt")).toBe("consent");
 		expect(url.searchParams.get("trigger_onepick")).toBe("true");
 		expect(url.searchParams.get("allow_folder_selection")).toBe("true");

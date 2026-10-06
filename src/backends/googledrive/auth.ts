@@ -11,7 +11,7 @@ import { DEFAULT_CUSTOM_REDIRECT_URI } from "../shared/auth-config";
 
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
-const SCOPES = "https://www.googleapis.com/auth/drive.file";
+const SCOPES = "https://www.googleapis.com/auth/drive";
 export const DEFAULT_CUSTOM_SCOPE = SCOPES;
 
 /** Google BYO OAuth contract. */

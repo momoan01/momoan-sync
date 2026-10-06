@@ -66,7 +66,7 @@ describe("Momoan BYO Google OAuth and Picker contract", () => {
 		const verifier = f.value("pendingCodeVerifier");
 		expect(verifier.length).toBeGreaterThanOrEqual(43);
 		expect(url.searchParams.get("client_id")).toBe(CID);
-		expect(url.searchParams.get("scope")).toBe("https://www.googleapis.com/auth/drive.file");
+		expect(url.searchParams.get("scope")).toBe("https://www.googleapis.com/auth/drive");
 		expect(url.searchParams.get("code_challenge_method")).toBe("S256");
 		expect(url.searchParams.get("code_challenge")).toBe(await computeS256Challenge(verifier));
 		expect(f.config().pendingCodeVerifier).toBeUndefined();
@@ -131,14 +131,14 @@ describe("Momoan BYO Google OAuth and Picker contract", () => {
 		expect(f.value("refresh")).toBe(""); expectPendingCleared(f);
 	});
 
-	it("starts the BYO top-level folder Picker with drive.file and S256", async () => {
+	it("starts the BYO top-level folder Picker with full Drive scope and S256", async () => {
 		const f = fixture(); await f.connection.beginPick();
 		const url = new URL(f.opened[0]!);
 		expect(url.searchParams.get("trigger_onepick")).toBe("true");
 		expect(url.searchParams.get("allow_folder_selection")).toBe("true");
 		expect(url.searchParams.get("mimetypes")).toBe(FOLDER.mimeType);
 		expect(url.searchParams.get("client_id")).toBe(CID);
-		expect(url.searchParams.get("scope")).toBe("https://www.googleapis.com/auth/drive.file");
+		expect(url.searchParams.get("scope")).toBe("https://www.googleapis.com/auth/drive");
 		expect(url.searchParams.get("code_challenge_method")).toBe("S256");
 		expect(f.config().pendingFolderPickState).toBe(f.config().pendingAuthState);
 	});

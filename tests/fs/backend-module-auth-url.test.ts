@@ -116,7 +116,7 @@ describe("Google Drive production BYO auth", () => {
 			const url = await startedUrl(googleDriveModule, config, { clientSecret: "user-secret" });
 			expect(clientId(url)).toBe(GOOGLE_CUSTOM_CLIENT_ID);
 			expect(url.searchParams.get("redirect_uri")).toBe(DEFAULT_CUSTOM_REDIRECT_URI);
-			expect(url.searchParams.get("scope")).toBe("https://www.googleapis.com/auth/drive.file");
+			expect(url.searchParams.get("scope")).toBe("https://www.googleapis.com/auth/drive");
 			expect(url.searchParams.get("code_challenge_method")).toBe("S256");
 		});
 	}
