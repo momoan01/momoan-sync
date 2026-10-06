@@ -238,6 +238,7 @@ export class SyncOrchestrator {
 
 				if (executionMode === "shadow") {
 					this.deps.onStatusChange("shadow_ready");
+					await this.deps.logger?.flush();
 					continue; // No production history, tracker closeout, or Synced notification.
 				}
 				const { succeeded, failed, blocked, conflicts } = result;

@@ -359,8 +359,9 @@ export default defineConfig(
 		// Shadow closeout and M4 mass-guard safety capture stay beside Write closeout so
 		// the shared lifecycle and its no-mutation follow-up boundary remain reviewable.
 		// C3-C passes attempt-local snapshot trigger provenance and the schema safety dependency.
+		// Re-pin 504 → 505 for the Shadow success lifecycle closeout that durably flushes preview logs.
 		files: ["src/sync/orchestrator.ts"],
-		rules: { "max-lines": ["error", { max: 504, skipBlankLines: true, skipComments: true }] },
+		rules: { "max-lines": ["error", { max: 505, skipBlankLines: true, skipComments: true }] },
 	},
 	{
 		// Exact action effects, commitAction, terminal result publication, and their

@@ -231,6 +231,24 @@ export function logSyncCyclePlan(
 		freshLocalRenameCandidates: renameCandidates.length,
 		...actionBreakdown,
 	});
+	if (logger?.enabled("debug")) {
+		const actions: { action: string; path: string; oldPath?: string; reason?: string }[] = [];
+		let truncated = 0;
+		for (const item of admission.executable.actions) {
+			if (item.action === "match" || item.action === "cleanup") continue;
+			if (actions.length >= 100) {
+				truncated++;
+				continue;
+			}
+			actions.push({
+				action: item.action,
+				path: item.path,
+				...(item.action === "rename_local" || item.action === "rename_remote" ? { oldPath: item.oldPath } : {}),
+				...(item.action === "conflict" ? { reason: item.protocol.kind } : {}),
+			});
+		}
+		logger.debug("Sync plan action details", { actions, truncated });
+	}
 	for (const component of admission.failures) {
 		logger?.warn("Sync plan component failed Admission", {
 			reasons: component.reasons,

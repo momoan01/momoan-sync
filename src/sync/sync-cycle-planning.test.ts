@@ -1,6 +1,9 @@
+import { Logger } from "../logging/logger";
+import { DEFAULT_SETTINGS } from "../settings";
 import { describe, expect, it, vi } from "vitest";
 import {
 	captureBatchObservation,
+	logSyncCyclePlan,
 	prepareSyncCycleSnapshot,
 	prepareSyncCycleSnapshotForExecution as prepareSyncCycleSnapshotForExecutionRaw,
 	type BatchObservation,
@@ -695,5 +698,50 @@ describe("logChangeDetection — unresolved observations", () => {
 
 		expect(filter).not.toHaveBeenCalled();
 		expect(logger.debug).not.toHaveBeenCalled();
+	});
+});
+
+
+describe("sync plan action detail diagnostics", () => {
+	function setup(actions: import("./types").SyncAction[], debugEnabled = true) {
+		const logger = new Logger({ exists: () => Promise.resolve(true), read: () => Promise.resolve(""), write: () => Promise.resolve(), mkdir: () => Promise.resolve() }, () => ({ ...DEFAULT_SETTINGS, enableLogging: true, logLevel: "debug" }), "test");
+		vi.spyOn(logger, "enabled").mockImplementation(level => level !== "debug" || debugEnabled);
+		const debug = vi.spyOn(logger, "debug").mockImplementation(() => {});
+		const info = vi.spyOn(logger, "info").mockImplementation(() => {});
+		const admission = admitBatchObservation(captureBatchObservation([], [], [], { byEndpoint: new Map(), isConfiguredScopeCompatible: () => true }, "test"));
+		return { logger, debug, info, admission: { ...admission, executable: { ...admission.executable, actions } } };
+	}
+
+	it("logs only non-match paths, rename sources and conflict reasons", () => {
+		const f = setup([
+			{ action: "match", path: "match.md" }, { action: "cleanup", path: "cleanup.md" },
+			{ action: "push", path: "push.md" },
+			{ action: "rename_local", oldPath: "local-old.md", path: "local-new.md" },
+			{ action: "rename_remote", oldPath: "remote-old.md", path: "remote-new.md" },
+			{ action: "conflict", path: "conflict.md", protocol: { kind: "same_path" }, conflictPolicy: { mode: "local_win", strategy: "prefer_local" } },
+		]);
+		logSyncCyclePlan(f.logger, f.admission);
+		expect(f.debug).toHaveBeenCalledWith("Sync plan action details", { actions: [
+			{ action: "push", path: "push.md" },
+			{ action: "rename_local", oldPath: "local-old.md", path: "local-new.md" },
+			{ action: "rename_remote", oldPath: "remote-old.md", path: "remote-new.md" },
+			{ action: "conflict", path: "conflict.md", reason: "same_path" },
+		], truncated: 0 });
+		expect(f.info).toHaveBeenCalledWith("Sync plan created", expect.objectContaining({ total: 6, match: 1, cleanup: 1, push: 1, conflict: 1 }));
+	});
+
+	it("does not read detail paths or call debug when disabled", () => {
+		const path = vi.fn(() => "push.md");
+		const f = setup([{ action: "push", get path() { return path(); } }], false);
+		logSyncCyclePlan(f.logger, f.admission);
+		expect(path).not.toHaveBeenCalled(); expect(f.debug).not.toHaveBeenCalled();
+	});
+
+	it("caps details at 100 and counts only omitted non-match actions", () => {
+		const actions: import("./types").SyncAction[] = Array.from({ length: 103 }, (_, i) => ({ action: "push", path: `${i}.md` }));
+		actions.push({ action: "match", path: "match.md" }, { action: "cleanup", path: "cleanup.md" });
+		const f = setup(actions);
+		logSyncCyclePlan(f.logger, f.admission);
+		expect(f.debug).toHaveBeenCalledWith("Sync plan action details", { actions: actions.slice(0, 100), truncated: 3 });
 	});
 });

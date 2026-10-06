@@ -5,6 +5,7 @@ import { SyncOrchestrator, type SyncOrchestratorDeps } from "./orchestrator";
 import { LocalChangeTracker } from "./local-tracker";
 import { createChecksumRegistry } from "../fs/modules/checksum-registry";
 import { addFile, deferred, confirmMockPath, createMockLocalFs, createMockRemoteFs, mockSettings } from "../__mocks__/sync-test-helpers";
+import { Logger } from "../logging/logger";
 import * as executor from "./plan-executor";
 import * as admissionModule from "./plan-admission";
 import * as detector from "./change-detector";
@@ -23,7 +24,7 @@ vi.mock("./error", async (importOriginal) => {
 });
 const engines: SyncOrchestrator[] = [];
 afterEach(async () => { for (const engine of engines.splice(0)) await engine.close(); vi.restoreAllMocks(); });
-function fixture(mode: "shadow" | "write" = "shadow", hasCheckpoint = true) {
+function fixture(mode: "shadow" | "write" = "shadow", hasCheckpoint = true, logger?: Logger) {
  const settings = mockSettings({ syncMode: mode, vaultId: crypto.randomUUID(), backendType: "googledrive" });
  const local = createMockLocalFs(); const remote = createMockRemoteFs();
  const write = remote.write.bind(remote);
@@ -42,7 +43,7 @@ function fixture(mode: "shadow" | "write" = "shadow", hasCheckpoint = true) {
  const tracker = new LocalChangeTracker(); tracker.markDirty("local.md");
  const acknowledge = vi.spyOn(tracker, "acknowledge"); const consume = vi.spyOn(tracker, "acknowledgeRelations");
  const save = vi.fn().mockResolvedValue(undefined); const history = vi.fn().mockResolvedValue(undefined); const status = vi.fn();
- const deps: SyncOrchestratorDeps = { getSettings: () => settings, saveSettings: save, configDir: () => ".cfg", pluginId: () => "momoan-sync", localFs: () => local, remoteFs: () => remote, backendProvider: () => null, checksumRegistry: createChecksumRegistry(), onStatusChange: status, onProgress: vi.fn(), notify: vi.fn(), isMobile: () => false, localTracker: tracker, recordConflicts: history };
+ const deps: SyncOrchestratorDeps = { logger, getSettings: () => settings, saveSettings: save, configDir: () => ".cfg", pluginId: () => "momoan-sync", localFs: () => local, remoteFs: () => remote, backendProvider: () => null, checksumRegistry: createChecksumRegistry(), onStatusChange: status, onProgress: vi.fn(), notify: vi.fn(), isMobile: () => false, localTracker: tracker, recordConflicts: history };
  const engine = new SyncOrchestrator(deps); engines.push(engine);
  const mutations = [local, remote].flatMap(fs => [vi.spyOn(fs, "write"), vi.spyOn(fs, "rename"), vi.spyOn(fs, "delete"), vi.spyOn(fs, "mkdir")]);
  const stateWrites = [vi.spyOn(engine.state, "put"), vi.spyOn(engine.state, "compareAndPut"), vi.spyOn(engine.state, "compareAndDelete"), vi.spyOn(engine.state, "delete"), vi.spyOn(engine.state, "clear"), vi.spyOn(engine.state, "compareAndRewritePaths"), vi.spyOn(engine.state, "putContent"), vi.spyOn(engine.state, "compareAndPutContent")];
@@ -53,6 +54,16 @@ function readOnly(f: ReturnType<typeof fixture>) {
  expect(f.checkpoint.abortWorkingView).toHaveBeenCalled(); expect(f.authority()).toEqual({ working: false, durable: "original" });
 }
 describe("M3 shadow zero-mutation contract", () => {
+ it("flushes successful preview logs once while preserving all read-only authorities", async () => {
+  const writeLog = vi.fn().mockResolvedValue(undefined);
+  const logger = new Logger({ exists: () => Promise.resolve(true), read: () => Promise.resolve(""), write: writeLog, mkdir: () => Promise.resolve() }, () => ({ ...DEFAULT_SETTINGS, enableLogging: true, logLevel: "debug" }), "test");
+  const flushLog = vi.spyOn(logger, "flush");
+  const f = fixture("shadow", true, logger); const before = f.tracker.snapshot();
+  await f.engine.runSync();
+  expect(f.status).toHaveBeenCalledWith("shadow_ready");
+  expect(flushLog).toHaveBeenCalledOnce(); expect(writeLog).toHaveBeenCalled();
+  readOnly(f); expect(f.tracker.snapshot()).toEqual(before); expect(await f.engine.state.getAll()).toEqual([]);
+ });
  it("defaults new and mode-less settings to shadow", () => {
   expect(DEFAULT_SETTINGS.syncMode).toBe("shadow"); expect(syncExecutionMode({})).toBe("shadow"); expect(syncExecutionMode({ syncMode: "write" })).toBe("write");
  });
