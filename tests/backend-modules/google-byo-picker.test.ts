@@ -78,10 +78,24 @@ describe("Momoan BYO Google OAuth and Picker contract", () => {
 		expect(body.get("redirect_uri")).toBe(url.searchParams.get("redirect_uri"));
 		expect(f.request.mock.calls[0]![0].url).toBe("https://oauth2.googleapis.com/token");
 		expect(body.get("client_secret")).toBe(CS);
-		expect(f.value("refresh")).toBe(TOKEN.refresh_token);
+		expect(f.value("refreshFullDriveV1")).toBe(TOKEN.refresh_token);
 		expectPendingCleared(f);
 		expect(JSON.stringify(f.sink.mock.calls)).not.toContain(verifier);
 		expect(JSON.stringify(f.config())).not.toContain(TOKEN.refresh_token);
+	});
+
+	it("removes legacy credentials before authorization and stores only the full-drive generation", async () => {
+		const f = fixture();
+		f.secrets.set(physical("googledrive", "refresh"), "LEGACY-REFRESH");
+		f.secrets.set(physical("googledrive", "access"), "LEGACY-ACCESS");
+		await f.connection.startAuth();
+		expect(f.value("refresh")).toBe("");
+		expect(f.value("access")).toBe("");
+		await f.connection.completeAuth(f.callback(requireString(f.config().pendingAuthState)));
+		expect(f.value("refreshFullDriveV1")).toBe(TOKEN.refresh_token);
+		expect(f.value("accessFullDriveV1")).toBe(TOKEN.access_token);
+		expect(f.value("refresh")).toBe("");
+		expect(f.value("access")).toBe("");
 	});
 
 	it.each(["", "   "])("uses the default HTTPS callback for blank redirect %j in auth and exchange", async (redirectUri) => {
@@ -128,7 +142,7 @@ describe("Momoan BYO Google OAuth and Picker contract", () => {
 		expectPendingCleared(f);
 		await f.connection.startAuth();
 		await expect(f.connection.completeAuth("obsidian://momoan-sync-auth?access_token=OLD&state=" + encodeURIComponent(requireString(f.config().pendingAuthState)))).rejects.toThrow("Authorization code is missing");
-		expect(f.value("refresh")).toBe(""); expectPendingCleared(f);
+		expect(f.value("refreshFullDriveV1")).toBe(""); expectPendingCleared(f);
 	});
 
 	it("starts the BYO top-level folder Picker with full Drive scope and S256", async () => {
@@ -182,8 +196,11 @@ describe("Momoan BYO Google OAuth and Picker contract", () => {
 
 	it("disconnect clears device credentials, client secret, temporary proof and binding", async () => {
 		const f = fixture(); await f.connection.startAuth(); await f.connection.completeAuth(f.callback(requireString(f.config().pendingAuthState)));
-		await f.connection.beginPick(); await f.connection.disconnect();
-		for (const key of ["refresh", "access", "clientSecret", "pendingCodeVerifier"]) expect(f.value(key)).toBe("");
+		await f.connection.beginPick();
+		f.secrets.set(physical("googledrive", "refresh"), "LEGACY-REFRESH");
+		f.secrets.set(physical("googledrive", "access"), "LEGACY-ACCESS");
+		await f.connection.disconnect();
+		for (const key of ["refreshFullDriveV1", "accessFullDriveV1", "refresh", "access", "clientSecret", "pendingCodeVerifier"]) expect(f.value(key)).toBe("");
 		expectPendingCleared(f); expect(f.config().remoteVaultFolderId).toBeUndefined();
 	});
 
@@ -192,6 +209,6 @@ describe("Momoan BYO Google OAuth and Picker contract", () => {
 		const cancelAuth = vi.fn();
 		handleOAuthProtocolCallback({ error: "access_denied", state }, state, { notify: vi.fn(), cancelAuth, completeConnect: vi.fn(), completeFolderPick: vi.fn() });
 		expect(cancelAuth).toHaveBeenCalledOnce();
-		const second = fixture(); expect(second.value("refresh")).toBe(""); expect(second.value("access")).toBe("");
+		const second = fixture(); expect(second.value("refreshFullDriveV1")).toBe(""); expect(second.value("accessFullDriveV1")).toBe("");
 	});
 });

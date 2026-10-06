@@ -504,6 +504,21 @@ describe("BackendModuleProvider — a disposed connection is rebuilt for auth", 
 
 
 describe("Momoan Google SecretStorage physical IDs", () => {
+	it("requires fresh authorization when only legacy Google credentials exist", () => {
+		const settings = settingsWith({ clientId: "PUBLIC-CID" });
+		const legacyIds = new Set(["momoan-sync-googledrive-refresh", "momoan-sync-googledrive-access"]);
+		const { provider } = makeProvider("googledrive", settings, (id) => legacyIds.has(id) ? "LEGACY" : null);
+		expect(provider.hasCredentials()).toBe(false);
+	});
+
+	it.each(["refresh", "access"])("recognizes the current full-drive %s credential", (kind) => {
+		const settings = settingsWith({ clientId: "PUBLIC-CID" });
+		const { provider } = makeProvider("googledrive", settings, (id) =>
+			id === `momoan-sync-googledrive-${kind}-full-drive-v1` ? "CURRENT" : null,
+		);
+		expect(provider.hasCredentials()).toBe(true);
+	});
+
 	it("writes valid module-owned IDs without persisting secret values in config", async () => {
 		const settings = settingsWith({ clientId: "PUBLIC-CID", redirectUri: "https://example.test/callback" });
 		const before = JSON.stringify(settings.backendData);
@@ -512,8 +527,8 @@ describe("Momoan Google SecretStorage physical IDs", () => {
 		const expected = {
 			clientSecret: "momoan-sync-googledrive-client-secret",
 			pendingCodeVerifier: "momoan-sync-googledrive-pending-code-verifier",
-			refresh: "momoan-sync-googledrive-refresh",
-			access: "momoan-sync-googledrive-access",
+			refreshFullDriveV1: "momoan-sync-googledrive-refresh-full-drive-v1",
+			accessFullDriveV1: "momoan-sync-googledrive-access-full-drive-v1",
 		};
 		setSecret.mockImplementation((id, value) => {
 			if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) throw new Error("Invalid Obsidian SecretStorage ID");

@@ -39,6 +39,10 @@ async function buildAuth(context: BackendRuntimeContext, config: Readonly<JsonOb
 	});
 }
 
+// Full-drive credentials must never fall back to the legacy drive.file generation.
+const REFRESH_CREDENTIAL_KEY = "refreshFullDriveV1";
+const ACCESS_CREDENTIAL_KEY = "accessFullDriveV1";
+
 const PENDING_KEYS = ["pendingAuthState", "pendingFolderPickState", "pendingCodeVerifier", "pendingAuthExpiresAt"];
 const AUTH_LIFETIME_MS = 10 * 60 * 1000;
 
@@ -52,6 +56,8 @@ async function beginAuthorization(context: BackendRuntimeContext, config: Readon
 	if (!asString(config.clientId) || !(await context.secrets.get("clientSecret"))) {
 		throw new Error("Client ID and client secret are required.");
 	}
+	await context.secrets.delete("refresh");
+	await context.secrets.delete("access");
 	const google = await buildAuth(context, config);
 	const url = folderPick ? await google.getFolderPickerAuthorizationUrl() : await google.getAuthorizationUrl();
 	const verifier = google.getCodeVerifier();
@@ -71,7 +77,7 @@ async function beginAuthorization(context: BackendRuntimeContext, config: Readon
 }
 
 const auth: BackendAuth = {
-	credentialKeys: ["refresh", "access"],
+	credentialKeys: [REFRESH_CREDENTIAL_KEY, ACCESS_CREDENTIAL_KEY],
 	start: (context, config) => beginAuthorization(context, config, false),
 	cancelPending: async (context) => {
 		await context.secrets.delete("pendingCodeVerifier");
@@ -94,19 +100,21 @@ const auth: BackendAuth = {
 		if (!tokens.refreshToken) {
 			throw new Error("The provider did not return a refresh token. Reconnect and consent again.");
 		}
-		await context.secrets.set("refresh", tokens.refreshToken);
-		await context.secrets.set("access", tokens.accessToken);
+		await context.secrets.set(REFRESH_CREDENTIAL_KEY, tokens.refreshToken);
+		await context.secrets.set(ACCESS_CREDENTIAL_KEY, tokens.accessToken);
 		return { set: { accessTokenExpiry: tokens.accessTokenExpiry, pendingAuthState: "" }, unset: config.pendingFolderPickState ? ["pendingCodeVerifier"] : ["pendingCodeVerifier", "pendingAuthExpiresAt"] };
 	},
 	revoke: async (context, config) => {
 		try {
-			const refresh = await context.secrets.get("refresh");
+			const refresh = await context.secrets.get(REFRESH_CREDENTIAL_KEY);
 			if (refresh) {
 				const google = await buildAuth(context, config);
-				google.setTokens(refresh, (await context.secrets.get("access")) ?? "", 0);
+				google.setTokens(refresh, (await context.secrets.get(ACCESS_CREDENTIAL_KEY)) ?? "", 0);
 				await google.revokeToken();
 			}
 		} finally {
+			await context.secrets.delete("refresh");
+			await context.secrets.delete("access");
 			await context.secrets.delete("clientSecret");
 			await context.secrets.delete("pendingCodeVerifier");
 		}
@@ -120,10 +128,10 @@ async function buildClient(
 ): Promise<GoogleDriveClient> {
 	const google = await buildAuth(context, config);
 	const expiry = typeof config.accessTokenExpiry === "number" ? config.accessTokenExpiry : 0;
-	google.setRefreshTokenRotatedHook((rotated) => context.secrets.set("refresh", rotated));
+	google.setRefreshTokenRotatedHook((rotated) => context.secrets.set(REFRESH_CREDENTIAL_KEY, rotated));
 	google.setTokens(
-		(await context.secrets.get("refresh")) ?? "",
-		(await context.secrets.get("access")) ?? "",
+		(await context.secrets.get(REFRESH_CREDENTIAL_KEY)) ?? "",
+		(await context.secrets.get(ACCESS_CREDENTIAL_KEY)) ?? "",
 		expiry,
 	);
 	return new GoogleDriveClient((force) => google.getAccessToken(force), createContextTransport(context.http), context.logger);
@@ -135,10 +143,10 @@ async function buildClientState(
 ): Promise<{ client: GoogleDriveClient; readExpiry: () => number }> {
 	const google = await buildAuth(context, config);
 	const expiry = typeof config.accessTokenExpiry === "number" ? config.accessTokenExpiry : 0;
-	google.setRefreshTokenRotatedHook((rotated) => context.secrets.set("refresh", rotated));
+	google.setRefreshTokenRotatedHook((rotated) => context.secrets.set(REFRESH_CREDENTIAL_KEY, rotated));
 	google.setTokens(
-		(await context.secrets.get("refresh")) ?? "",
-		(await context.secrets.get("access")) ?? "",
+		(await context.secrets.get(REFRESH_CREDENTIAL_KEY)) ?? "",
+		(await context.secrets.get(ACCESS_CREDENTIAL_KEY)) ?? "",
 		expiry,
 	);
 	return {
