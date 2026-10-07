@@ -5,8 +5,8 @@ import type { FileEntity } from "../fs/types";
 import type { Logger } from "../logging/logger";
 import { getFileExtension } from "../utils/path";
 import {
-	generateConflictPath,
-	type ConflictResolutionResult, type VerifiedConflictOutput,
+	generateConflictPath, insertConflictSuffix, remoteReplacementInputs,
+	type ConflictResolutionResult, type ConflictInputSnapshots, type VerifiedConflictOutput,
 } from "./conflict";
 import { bytesMatch, captureContentSnapshot, ContentProofError, type ExactSnapshot, type StableVersionWitness } from "./content-snapshot";
 import { isMergeEligible, threeWayMerge } from "./merge";
@@ -28,6 +28,10 @@ export interface ConflictResolverContext {
 	stateStore?: SyncStateStore;
 	checksumRegistry: ChecksumRegistry;
 	logger?: Logger;
+	/** Detached executor captures, never resolver-owned source authority. */
+	inputSnapshots?: ConflictInputSnapshots;
+	/** Run exact copy mutations under the executor-owned path barrier. */
+	mutatePreservation?: (path: string, operation: () => Promise<void>) => Promise<void>;
 }
 
 
@@ -61,14 +65,14 @@ export type { ConflictResolutionResult };
 /** Bounded read-only capture; no path allocation, resolver call, or mutation. */
 export async function prepareConflict(ctx: ConflictResolverContext): Promise<PreparedConflict> {
 	if (!ctx.remote) throw new ContentProofError("proof_mismatch", "Conflict primary is absent");
-	const primary = await captureContentSnapshot(
+	const primary = ctx.inputSnapshots?.remote ?? await captureContentSnapshot(
 		ctx.remoteFs, ctx.remotePath ?? ctx.remote.path, ctx.remote, ctx.checksumRegistry);
 	const additional = ctx.additionalRemote
-		? [await captureContentSnapshot(
+		? [ctx.inputSnapshots?.additionalRemote ?? await captureContentSnapshot(
 			ctx.remoteFs, ctx.additionalRemote.path, ctx.additionalRemote, ctx.checksumRegistry)] as const
 		: [] as const;
 	const local = ctx.additionalLocal
-		? await captureContentSnapshot(
+		? ctx.inputSnapshots?.additionalLocal ?? await captureContentSnapshot(
 			ctx.localFs, ctx.additionalLocal.path, ctx.additionalLocal, ctx.checksumRegistry) : undefined;
 	const obligations = Object.freeze([
 		obligation("primary", primary),
@@ -94,13 +98,20 @@ export async function resolveConflict(
 	policy: ConflictExecutionPolicy,
 ): Promise<ConflictResolutionResult> {
 	const local = ctx.local
-		? await captureContentSnapshot(ctx.localFs, ctx.localPath ?? ctx.local.path, ctx.local, ctx.checksumRegistry)
+		? ctx.inputSnapshots?.local ?? await captureContentSnapshot(ctx.localFs, ctx.localPath ?? ctx.local.path, ctx.local, ctx.checksumRegistry)
 		: undefined;
 	if (!ctx.remote) {
 		return { action: local ? "duplicated" : "kept_local", targetContent: local?.content, targetMtime: ctx.local?.mtime ?? 0,
 			verifiedOutputs: [], capturedInputs: { local } };
 	}
 	const prepared = await prepareConflict(ctx);
+	if (policy.mode === "remote_preserve") {
+		if (!local || !prepared.local) throw new ContentProofError("proof_mismatch", "Replacement local inputs are absent");
+		const outputs = await preserveSnapshots(ctx, remoteReplacementInputs(local, prepared.primary, prepared.local), true);
+		return { action: "kept_remote", targetContent: prepared.primary.content.slice(0),
+			targetMtime: prepared.primary.entity.mtime, verifiedOutputs: outputs,
+			capturedInputs: { local, remote: prepared.primary, additionalLocal: prepared.local } };
+	}
 	const resolution = await resolvePreparedWithPolicy(
 		ctx, policy, prepared.primary, local,
 	);
@@ -110,6 +121,45 @@ export async function resolveConflict(
 		? await preserveAll(ctx, prepared) : [];
 	return { ...resolution, duplicatePath: resolution.action === "duplicated" ? outputs[0]?.path : undefined,
 		verifiedOutputs: outputs, capturedInputs: { local, remote: prepared.primary } };
+}
+
+/** Reuse only a fully observed pair with the exact captured source bytes. */
+async function reusableReplacementPath(
+	ctx: ConflictResolverContext, snapshot: ExactSnapshot, used: ReadonlySet<string>,
+): Promise<{ path: string; reuse: boolean; local?: FileEntity; remote?: FileEntity }> {
+	for (let index = 1; index <= 100; index++) {
+		const path = insertConflictSuffix(ctx.path, index);
+		if (used.has(path)) continue;
+		const local = await ctx.localFs.stat(path);
+		const remote = await ctx.remoteFs.stat(path);
+		if (!local && !remote) return { path, reuse: false };
+		if (!local || !remote) throw new ContentProofError("proof_mismatch", `Partial preservation candidate: ${path}`);
+		if (local.path !== path || remote.path !== path ||
+			local.pathAuthority !== "actual_resolved" || remote.pathAuthority !== "actual_resolved" ||
+			local.isDirectory || remote.isDirectory) {
+			throw new ContentProofError("proof_mismatch", `Unresolved preservation candidate: ${path}`);
+		}
+		const left = await captureContentSnapshot(ctx.localFs, path, local, ctx.checksumRegistry);
+		const right = await captureContentSnapshot(ctx.remoteFs, path, remote, ctx.checksumRegistry);
+		if (buffersEqual(left.content, snapshot.content) && buffersEqual(right.content, snapshot.content)) {
+			return { path, reuse: true, local: Object.freeze({ ...local }), remote: Object.freeze({ ...remote }) };
+		}
+	}
+	throw new ContentProofError("proof_mismatch", "No proved replacement preservation address available");
+}
+
+async function proveReusableCopy(
+	fs: IFileSystem, path: string, entity: FileEntity | null, expected: FileEntity | undefined,
+	snapshot: ExactSnapshot, registry: ChecksumRegistry,
+): Promise<void> {
+	if (!entity || !expected || entity.path !== path || entity.pathAuthority !== "actual_resolved" || entity.isDirectory ||
+		entity.identityKey !== expected.identityKey) {
+		throw new ContentProofError("proof_mismatch", `Preservation candidate changed: ${path}`);
+	}
+	const current = await captureContentSnapshot(fs, path, expected, registry);
+	if (!buffersEqual(current.content, snapshot.content)) {
+		throw new ContentProofError("proof_mismatch", `Preservation candidate bytes changed: ${path}`);
+	}
 }
 
 /** Consume Admission's closed policy without reinterpreting the configured setting. */
@@ -188,22 +238,51 @@ async function preserveAll(
 		...prepared.additional.map((snapshot) => ({ role: "additional" as const, snapshot })),
 		...(prepared.local ? [{ role: "local" as const, snapshot: prepared.local }] : []),
 	];
+	return preserveSnapshots(ctx, snapshots);
+}
+
+async function preserveSnapshots(
+	ctx: ConflictResolverContext,
+	snapshots: readonly { role: VerifiedConflictOutput["role"]; snapshot: ExactSnapshot }[],
+	proveVacancy = false,
+): Promise<readonly VerifiedConflictOutput[]> {
 	const outputs: VerifiedConflictOutput[] = [];
 	for (const { role, snapshot } of snapshots) {
-		const path = await generateConflictPath(ctx.path, ctx.localFs, ctx.remoteFs);
-		await ctx.localFs.write(path, snapshot.content.slice(0), snapshot.entity.mtime);
-		await ctx.remoteFs.write(path, snapshot.content.slice(0), snapshot.entity.mtime);
-		for (const fs of [ctx.localFs, ctx.remoteFs]) {
-			const entity = await fs.stat(path);
-			if (!entity || (!await bytesMatch(snapshot.content, entity, ctx.checksumRegistry) &&
-				!buffersEqual(snapshot.content, await fs.read(path)))) {
-				throw new ContentProofError("proof_mismatch", `Conflict output readback mismatch: ${path}`);
+		const candidate = proveVacancy
+			? await reusableReplacementPath(ctx, snapshot, new Set(outputs.map(({ path }) => path)))
+			: { path: await generateConflictPath(ctx.path, ctx.localFs, ctx.remoteFs), reuse: false,
+				local: undefined, remote: undefined };
+		const { path, reuse } = candidate;
+		const endpoints: FileEntity[] = [];
+		const preserve = async () => {
+			for (const fs of [ctx.localFs, ctx.remoteFs]) {
+				const before = await fs.stat(path);
+				if (reuse) {
+					await proveReusableCopy(fs, path, before, fs === ctx.localFs ? candidate.local : candidate.remote,
+						snapshot, ctx.checksumRegistry);
+				} else {
+					if (proveVacancy && before) {
+						throw new ContentProofError("proof_mismatch", `Preservation destination appeared: ${path}`);
+					}
+					await fs.write(path, snapshot.content.slice(0), snapshot.entity.mtime);
+				}
 			}
-		}
+			for (const fs of [ctx.localFs, ctx.remoteFs]) {
+				const entity = await fs.stat(path);
+				if (!entity || (!await bytesMatch(snapshot.content, entity, ctx.checksumRegistry) &&
+					!buffersEqual(snapshot.content, await fs.read(path)))) {
+					throw new ContentProofError("proof_mismatch", `Conflict output readback mismatch: ${path}`);
+				}
+				endpoints.push(Object.freeze({ ...entity }));
+			}
+		};
+		if (ctx.mutatePreservation) await ctx.mutatePreservation(path, preserve);
+		else await preserve();
 		outputs.push(Object.freeze({
 			role, path, sourcePath: snapshot.path,
 			sourceEntity: snapshot.entity,
 			sourceContent: snapshot.content.slice(0),
+			localEntity: endpoints[0], remoteEntity: endpoints[1],
 		}));
 	}
 	return Object.freeze(outputs);

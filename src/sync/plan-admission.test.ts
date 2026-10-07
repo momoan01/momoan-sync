@@ -4346,3 +4346,80 @@ describe("empty-parent prune candidate chain", () => {
 		});
 	});
 });
+
+
+describe("remote replacement rename onto occupied local destination", () => {
+	function fixture(reported: boolean, occupantHash = "X-bytes") {
+		const local = freshEntity("temp.md", "X-bytes");
+		const occupant = freshEntity("final.md", occupantHash);
+		const remote = freshEntity("final.md", "X-bytes", "X");
+		const source = recordFor(local, "X");
+		const destination = recordFor(occupant, "Y");
+		const entries = [
+			{ path: "temp.md", local, prevSync: source },
+			{ path: "final.md", local: occupant, remote, prevSync: destination },
+		];
+		const observations: PathObservation[] = [
+			{ kind: "exact", side: "local", requestedPath: "temp.md", entity: local },
+			{ kind: "absent", side: "remote", requestedPath: "temp.md", authority: "stat" },
+			{ kind: "exact", side: "local", requestedPath: "final.md", entity: occupant },
+			{ kind: "exact", side: "remote", requestedPath: "final.md", entity: remote },
+		];
+		const evidence: IdentityEvidence[] = [{
+			kind: "stable_identity", side: "remote", identityKey: "X", occurrences: [
+				{ side: "remote", phase: "baseline", path: "temp.md", identityKey: "X" },
+				{ side: "remote", phase: "current", path: "final.md", identityKey: "X" },
+			],
+		}];
+		if (reported) evidence.push(remoteRename({ oldPath: "temp.md", newPath: "final.md" }));
+		return { local, occupant, remote, source, destination, entries, observations, evidence };
+	}
+
+	it.each([true, false])("admits the occupied destination with rename report=%s", (reported) => {
+		const f = fixture(reported);
+		const result = admit([], f.evidence, f.observations, undefined, f.entries);
+		expect(result.failures).toEqual([]);
+		expect(result.executable.actions).toHaveLength(1);
+		expect(result.executable.actions[0]).toMatchObject({
+			path: "final.md", local: f.local, remote: f.remote,
+			additionalLocal: f.occupant,
+			publication: { source: f.source, destination: f.destination },
+		});
+	});
+	it.each(["auto_merge", "duplicate", "prefer_local"] as const)(
+		"preserves a different occupant with %s without a simple local-win proof", (strategy) => {
+			const f = fixture(false, "Y-bytes");
+			const result = admit([], f.evidence, f.observations, undefined, f.entries, [], strategy);
+			expect(result.failures).toEqual([]);
+			expect(result.executable.actions[0]).toMatchObject({
+				action: "conflict", additionalLocal: f.occupant,
+				conflictPolicy: { mode: "remote_preserve", strategy },
+			});
+		},
+	);
+
+	it.each(["identity", "multiple", "unknown", "unresolved", "scope", "content"] as const)(
+		"fails closed for %s proof", (problem) => {
+			const f = fixture(false);
+			const scope = projection({ "temp.md": "included", "final.md": "included" });
+			if (problem === "identity") f.remote.identityKey = "foreign";
+			if (problem === "multiple") {
+				const duplicate = freshEntity("temp.md", "X-bytes", "X");
+				f.observations[1] = { kind: "exact", side: "remote", requestedPath: "temp.md", entity: duplicate };
+			}
+			if (problem === "unknown") f.observations[2] = {
+				kind: "unknown", side: "local", requestedPath: "final.md", reason: "not_observed",
+			};
+			if (problem === "unresolved") f.observations[2] = {
+				kind: "present_unresolved", side: "local", requestedPath: "final.md",
+				returnedPath: "final.md", entity: f.occupant, source: "stat",
+			};
+			if (problem === "scope") scope.isConfiguredScopeCompatible = () => false;
+			if (problem === "content") f.occupant.hash = "";
+			const result = admit([], f.evidence, f.observations, scope, f.entries);
+			expect(result.failures).toHaveLength(1);
+			expect(result.executable.actions).toEqual([]);
+		},
+	);
+
+});

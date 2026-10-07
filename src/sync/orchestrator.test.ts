@@ -3872,3 +3872,113 @@ describe("SyncOrchestrator", () => {
 		});
 	});
 });
+
+
+describe("remote replacement rename onto occupied local destination", () => {
+	it.each([
+		[true, "same", "auto_merge", false], [false, "same", "auto_merge", false],
+		[true, "occupant", "auto_merge", false], [false, "occupant", "auto_merge", false],
+		[true, "occupant", "duplicate", false], [false, "occupant", "duplicate", false],
+		[true, "occupant", "prefer_local", false], [false, "occupant", "prefer_local", false],
+		[false, "occupant", "auto_merge", true],
+	] as const)("converges reported=%s occupant=%s strategy=%s", async (reported, occupant, strategy, publicationCut) => {
+		const localFs = createMockLocalFs();
+		const remoteFs = createMockRemoteFs();
+		confirmRemoteWrites(remoteFs);
+		addFile(localFs, "temp.md", "same", 1000);
+		addFile(localFs, "final.md", occupant, 1000);
+		const remote = addFile(remoteFs, "final.md", "same", 1000);
+		remote.identityKey = "X";
+		remote.remoteChecksum = { algo: "md5", value: await checksumRegistry.compute(new TextEncoder().encode("same").buffer, "md5") };
+		const write = remoteFs.write.bind(remoteFs);
+		remoteFs.write = async (path, content, mtime) => {
+			const entity = await write(path, content, mtime);
+			remoteFs.files.get(path)!.entity.remoteChecksum = { algo: "md5", value: await checksumRegistry.compute(content, "md5") };
+			return entity;
+		};
+		const settings = baseMockSettings({
+			backendType: "test", vaultId: `test-${Math.random()}`, lastSyncedIdentity: "test:root",
+			conflictStrategy: strategy,
+		});
+		remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(reported);
+		remoteFs.checkpoint!.getChangedPaths = vi.fn().mockResolvedValue({
+			modified: ["final.md"], deleted: ["temp.md"],
+			renamed: [{ oldPath: "temp.md", newPath: "final.md", identityKey: "X", isFolder: false }],
+		});
+		const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+		remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+		const deps = createDeps({ getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs });
+		const orchestrator = new SyncOrchestrator(deps);
+		for (const [path, identity, content] of [["temp.md", "X", "same"], ["final.md", "Y", occupant]]) {
+			await orchestrator.state.put({
+				path: path!, remoteIdentityKey: identity!, hash: await sha256(new TextEncoder().encode(content).buffer),
+				localSize: content!.length, remoteSize: content!.length, localMtime: 1000, remoteMtime: 1000, syncedAt: 900,
+			});
+		}
+		let cut = false;
+		if (publicationCut) {
+			const stat = remoteFs.stat.bind(remoteFs);
+			remoteFs.stat = async (path) => {
+				const entity = await stat(path);
+				if (!cut && path === "final.conflict.md" && entity && localFs.files.has(path)) {
+					cut = true;
+					const record = (await orchestrator.state.get("final.md"))!;
+					await orchestrator.state.put({ ...record, syncedAt: 1234 });
+				}
+				return entity;
+			};
+		}
+		const statusChange = vi.spyOn(deps, "onStatusChange");
+		const localWrite = vi.spyOn(localFs, "write");
+		const remoteWrite = vi.spyOn(remoteFs, "write");
+		const execute = vi.spyOn(executor, "executePlan");
+		try {
+			if (publicationCut) {
+				await orchestrator.runSync();
+				expect(deps.onStatusChange).toHaveBeenCalledWith("partial_error");
+				expect(commitCheckpoint).not.toHaveBeenCalled();
+				expect(readText(localFs, "final.md")).toBe("occupant");
+				expect(await orchestrator.state.get("temp.md")).toMatchObject({ remoteIdentityKey: "X" });
+				expect(readText(localFs, "final.conflict.md")).toBe("occupant");
+				statusChange.mockClear();
+				execute.mockClear();
+			}
+			await orchestrator.runSync();
+			expect(deps.onStatusChange).not.toHaveBeenCalledWith("partial_error");
+			const evidence = execute.mock.calls[0]![0].components.flatMap((component) => component.evidence);
+			expect(evidence.some((item) => item.kind === "rename" && item.side === "remote")).toBe(reported);
+			expect(evidence.some((item) => item.kind === "stable_identity" && item.identityKey === "X")).toBe(true);
+			expect(readText(localFs, "final.md")).toBe("same");
+			expect(readText(remoteFs, "final.md")).toBe("same");
+			expect(localFs.files.has("temp.md")).toBe(false);
+			expect(await orchestrator.state.get("temp.md")).toBeUndefined();
+			expect(await orchestrator.state.get("final.md")).toMatchObject({ remoteIdentityKey: "X" });
+			expect((await orchestrator.state.getAll()).filter((row) => row.remoteIdentityKey === "X")).toHaveLength(1);
+			expect(commitCheckpoint).toHaveBeenCalledOnce();
+			expect(remoteWrite.mock.calls.filter(([path]) => path === "final.md")).toEqual([]);
+			if (occupant === "same") {
+				expect(localWrite.mock.calls.filter(([path]) => path === "final.md")).toEqual([]);
+				expect([...localFs.files.keys()].filter((path) => path.includes("conflict"))).toEqual([]);
+			} else {
+				expect(readText(localFs, "final.conflict.md")).toBe(occupant);
+				expect(readText(remoteFs, "final.conflict.md")).toBe(occupant);
+				expect(localFs.files.has("final.conflict-2.md")).toBe(false);
+				expect(remoteFs.files.has("final.conflict-2.md")).toBe(false);
+			}
+			execute.mockClear();
+			remoteFs.checkpoint!.hasCheckpoint = vi.fn().mockResolvedValue(false);
+			await orchestrator.runSync();
+			expect(execute.mock.calls.flatMap(([plan]) => plan.actions).filter((action) => action.action === "conflict")).toEqual([]);
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			if (occupant !== "same") {
+				expect(await orchestrator.state.get("final.conflict.md")).toMatchObject({
+					remoteIdentityKey: (await remoteFs.stat("final.conflict.md"))!.identityKey,
+				});
+			}
+		} finally {
+			localWrite.mockRestore(); remoteWrite.mockRestore(); statusChange.mockRestore();
+			execute.mockRestore();
+			await orchestrator.close();
+		}
+	});
+});

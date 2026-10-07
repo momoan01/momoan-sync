@@ -29,10 +29,24 @@ export function conflictContractViolation(action: ConflictAction): string | unde
 		candidate.conflictPolicy.strategy === "auto_merge") {
 		return `Conflict policy is incompatible with same-path Auto merge: ${action.path}`;
 	}
+	if (candidate.conflictPolicy.mode === "remote_preserve" && !hasRemoteReplacementProof(action)) {
+		return `Remote replacement proof is missing or invalid: ${action.path}`;
+	}
 	if (candidate.conflictPolicy.mode === "local_win" && !hasLocalWinProof(action)) {
 		return `Prefer-local local-win proof is missing or invalid: ${action.path}`;
 	}
 	return undefined;
+}
+
+function hasRemoteReplacementProof(action: ConflictAction): boolean {
+	const { local, remote, baseline, additionalLocal, publication, path } = action;
+	return action.protocol.kind === "same_path" && !!local && !!remote && !!baseline && !!additionalLocal &&
+		local.path === baseline.path && local.path !== path && remote.path === path &&
+		additionalLocal.path === path && !local.isDirectory && !remote.isDirectory && !additionalLocal.isDirectory &&
+		remote.identityKey === baseline.remoteIdentityKey && action.remoteIdentitySource?.path === remote.path &&
+		action.remoteIdentitySource.identityKey === remote.identityKey &&
+		publication?.source?.remoteIdentityKey === baseline.remoteIdentityKey &&
+		publication.source.path === baseline.path && !action.additionalRemote && !action.localPath && !action.remotePath;
 }
 
 function hasLocalWinProof(action: ConflictAction): boolean {
@@ -181,5 +195,5 @@ function isConflictExecutionPolicy(value: unknown): value is ConflictExecutionPo
 	if (strategy !== "auto_merge" && strategy !== "prefer_local" && strategy !== "duplicate") return false;
 	if (policy.mode === "auto_merge") return strategy === "auto_merge";
 	if (policy.mode === "local_win") return strategy === "prefer_local";
-	return policy.mode === "preserve";
+	return policy.mode === "preserve" || policy.mode === "remote_preserve";
 }

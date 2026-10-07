@@ -111,7 +111,9 @@ export type ConflictStrategy = "auto_merge" | "prefer_local" | "duplicate";
 export type ConflictExecutionPolicy =
 	| { readonly mode: "auto_merge"; readonly strategy: "auto_merge" }
 	| { readonly mode: "local_win"; readonly strategy: "prefer_local" }
-	| { readonly mode: "preserve"; readonly strategy: ConflictStrategy };
+	| { readonly mode: "preserve"; readonly strategy: ConflictStrategy }
+	/** A compound tracked relocation keeps the remote endpoint after preserving local inputs. */
+	| { readonly mode: "remote_preserve"; readonly strategy: ConflictStrategy };
 
 /** A record of a conflict resolution for audit/history purposes */
 export interface ConflictRecord {

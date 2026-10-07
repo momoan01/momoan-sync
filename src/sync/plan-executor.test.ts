@@ -16,6 +16,8 @@ import { captureBatchObservation } from "./sync-cycle-planning";
 import { resolveConflict } from "./conflict-resolver";
 import { ContentProofError } from "./content-snapshot";
 import { PriorityCoordinator } from "./priority-coordinator";
+import { LocalMutationBarrier } from "./local-mutation-barrier";
+import { finalizeSyncCycle } from "./sync-cycle-finalization";
 import { buildSyncRecord } from "./state-committer";
 import { insertConflictSuffix } from "./conflict";
 import { sha256 } from "../utils/hash";
@@ -3049,4 +3051,376 @@ describe("toConflictRecords", () => {
 	it("returns an empty list for no conflicts (so the writer is never touched)", () => {
 		expect(toConflictRecords([], "s", "t")).toEqual([]);
 	});
+});
+
+
+describe("remote replacement rename onto occupied local destination", () => {
+	async function arrange(sourceContent = "remote", occupantContent = "occupant") {
+		const ctx = makeCtx();
+		const localFs = ctx.localFs as MockFileSystem;
+		const remoteFs = ctx.remoteFs as MockFileSystem;
+		addFile(localFs, "temp.md", sourceContent, 1000);
+		addFile(localFs, "final.md", occupantContent, 1000);
+		addFile(remoteFs, "final.md", "remote", 1000).identityKey = "X";
+		const local = (await localFs.stat("temp.md"))!;
+		const occupant = (await localFs.stat("final.md"))!;
+		const remote = (await remoteFs.stat("final.md"))!;
+		const source = buildSyncRecord(local, { ...remote, path: "temp.md" }, "temp.md");
+		const destination = buildSyncRecord(occupant, { ...remote, identityKey: "Y" }, "final.md");
+		await ctx.committer.stateStore.put(source);
+		await ctx.committer.stateStore.put(destination);
+		const admission = admitBatchObservation(captureBatchObservation([
+			{ path: "temp.md", local, prevSync: source },
+			{ path: "final.md", local: occupant, remote, prevSync: destination },
+		], [{ kind: "stable_identity", side: "remote", identityKey: "X", occurrences: [
+			{ phase: "baseline", side: "remote", path: "temp.md", identityKey: "X" },
+			{ phase: "current", side: "remote", path: "final.md", identityKey: "X" },
+		] }], [
+			{ kind: "exact", side: "local", requestedPath: "temp.md", entity: local },
+			{ kind: "exact", side: "local", requestedPath: "final.md", entity: occupant },
+			{ kind: "exact", side: "remote", requestedPath: "final.md", entity: remote },
+			{ kind: "absent", side: "remote", requestedPath: "temp.md", authority: "stat" },
+		], { byEndpoint: new Map([["temp.md", "included"], ["final.md", "included"]]),
+			isConfiguredScopeCompatible: () => true }, "test"));
+		expect(admission.failures).toEqual([]);
+		return { ctx, localFs, remoteFs, source, destination, admission, plan: admission.executable };
+	}
+
+
+	it("rejects a self-consistent wrong-bytes resolver receipt before publication", async () => {
+		const f = await arrange();
+		const remove = vi.spyOn(f.localFs, "delete");
+		f.ctx.conflictResolver = async (ctx, policy) => {
+			const result = await resolveConflict(ctx, policy);
+			const wrong = new TextEncoder().encode("tampered").buffer;
+			const verifiedOutputs = [];
+			for (const output of result.verifiedOutputs ?? []) {
+				await f.localFs.write(output.path, wrong, 1000);
+				await f.remoteFs.write(output.path, wrong, 1000);
+				verifiedOutputs.push({ ...output, sourceContent: wrong,
+					localEntity: (await f.localFs.stat(output.path))!, remoteEntity: (await f.remoteFs.stat(output.path))! });
+			}
+			return { ...result, verifiedOutputs };
+		};
+		const result = await executePlan(f.plan, f.ctx);
+		expect(result.blocked).toHaveLength(1);
+		expect(result.blocked[0]?.classification).toBe("precondition_changed");
+		expect(result.succeeded).toEqual([]);
+		expect(remove).not.toHaveBeenCalled();
+		expect(await f.ctx.committer.stateStore.get("temp.md")).toEqual(f.source);
+		const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+		const abortWorkingView = vi.fn().mockResolvedValue(undefined);
+		const completion = await finalizeSyncCycle({ admission: f.admission, result, scopeFingerprint: "test",
+			checkpoint: { commitCheckpoint, abortWorkingView, resetCheckpoint: vi.fn(),
+				getChangedPaths: vi.fn(), hasCheckpoint: vi.fn() } });
+		expect(completion.kind).toBe("incomplete");
+		expect(commitCheckpoint).not.toHaveBeenCalled();
+		remove.mockRestore();
+	});
+
+	it("protects every actual replacement mutation address with the barrier", async () => {
+		const f = await arrange();
+		const protectedPaths = new Set<string>();
+		const declarations: string[][] = [];
+		class RecordingBarrier extends LocalMutationBarrier {
+			override async run<T>(paths: readonly string[], operation: () => Promise<T>): Promise<T> {
+				declarations.push([...paths]);
+				for (const path of paths) protectedPaths.add(path);
+				try { return await operation(); }
+				finally { for (const path of paths) protectedPaths.delete(path); }
+			}
+		}
+		f.ctx.mutationBarrier = new RecordingBarrier();
+		const uncovered: string[] = [];
+		for (const fs of [f.localFs, f.remoteFs]) {
+			const write = fs.write.bind(fs);
+			fs.write = async (path, content, mtime) => {
+				if (!protectedPaths.has(path)) uncovered.push(path);
+				return write(path, content, mtime);
+			};
+		}
+		const rename = f.localFs.rename.bind(f.localFs);
+		f.localFs.rename = async (from, to) => {
+			if (!protectedPaths.has(from)) uncovered.push(from);
+			if (!protectedPaths.has(to)) uncovered.push(to);
+			return rename(from, to);
+		};
+		const remove = f.localFs.delete.bind(f.localFs);
+		f.localFs.delete = async (path) => {
+			if (!protectedPaths.has(path)) uncovered.push(path);
+			return remove(path);
+		};
+		const result = await executePlan(f.plan, f.ctx);
+		expect(result.blocked).toEqual([]);
+		expect(result.failed).toEqual([]);
+		expect(uncovered).toEqual([]);
+		expect(new Set(declarations.flat())).toEqual(new Set(["temp.md", "final.md", "final.conflict.md"]));
+	});
+
+	it("reconciles equal canonical bytes without rewriting or recreating final", async () => {
+		const f = await arrange("remote", "remote");
+		const localWrite = vi.spyOn(f.localFs, "write");
+		const remoteWrite = vi.spyOn(f.remoteFs, "write");
+		const remove = vi.spyOn(f.localFs, "delete");
+		const rename = vi.spyOn(f.localFs, "rename");
+		const result = await executePlan(f.plan, f.ctx);
+		expect(result.failed).toEqual([]);
+		expect(result.blocked).toEqual([]);
+		expect(localWrite).not.toHaveBeenCalled();
+		expect(remoteWrite).not.toHaveBeenCalled();
+		expect(rename).not.toHaveBeenCalled();
+		expect(remove.mock.calls).toEqual([["temp.md"]]);
+		expect(await f.ctx.committer.stateStore.get("temp.md")).toBeUndefined();
+		expect(await f.ctx.committer.stateStore.get("final.md")).toMatchObject({ remoteIdentityKey: "X" });
+		localWrite.mockRestore(); remoteWrite.mockRestore(); remove.mockRestore(); rename.mockRestore();
+	});
+
+	it("blocks an occupant mutation during the final publication revalidation", async () => {
+		const f = await arrange();
+		const get = f.ctx.committer.stateStore.get.bind(f.ctx.committer.stateStore);
+		let changed = false;
+		vi.spyOn(f.ctx.committer.stateStore, "get").mockImplementation(async (path) => {
+			if (!changed && path === "final.md" && f.localFs.files.has("final.conflict.md")) {
+				changed = true;
+				await f.localFs.write("final.md", new TextEncoder().encode("new occupant").buffer, 2000);
+			}
+			return get(path);
+		});
+		const remove = vi.spyOn(f.localFs, "delete");
+		const result = await executePlan(f.plan, f.ctx);
+		expect(result.blocked).toHaveLength(1);
+		expect(result.succeeded).toEqual([]);
+		expect(remove).not.toHaveBeenCalled();
+		expect(readText(f.localFs, "final.md")).toBe("new occupant");
+		expect(f.localFs.files.has("temp.md")).toBe(true);
+		expect(await f.ctx.committer.stateStore.get("temp.md")).toEqual(f.source);
+		expect(await f.ctx.committer.stateStore.get("final.md")).toEqual(f.destination);
+	});
+
+	it("reuses verified preservation bytes after a publication precondition failure", async () => {
+		const f = await arrange();
+		f.ctx.conflictResolver = async (ctx, policy) => {
+			const result = await resolveConflict(ctx, policy);
+			await f.ctx.committer.stateStore.put({ ...f.destination, syncedAt: 1234 });
+			return result;
+		};
+		const first = await executePlan(f.plan, f.ctx);
+		expect(first.blocked).toHaveLength(1);
+		expect(first.succeeded).toEqual([]);
+		expect(readText(f.localFs, "final.md")).toBe("occupant");
+		expect(readText(f.localFs, "final.conflict.md")).toBe("occupant");
+		// Fresh Admission observes the current row, not a stored retry instruction.
+		const entries = [
+			{ path: "temp.md", local: (await f.localFs.stat("temp.md"))!, prevSync: await f.ctx.committer.stateStore.get("temp.md") },
+			{ path: "final.md", local: (await f.localFs.stat("final.md"))!, remote: (await f.remoteFs.stat("final.md"))!,
+				prevSync: await f.ctx.committer.stateStore.get("final.md") },
+		];
+		const observations: PathObservation[] = [
+			{ kind: "exact", side: "local", requestedPath: "temp.md", entity: entries[0]!.local },
+			{ kind: "absent", side: "remote", requestedPath: "temp.md", authority: "stat" },
+			{ kind: "exact", side: "local", requestedPath: "final.md", entity: entries[1]!.local },
+			{ kind: "exact", side: "remote", requestedPath: "final.md", entity: entries[1]!.remote! },
+		];
+		const admission = admitBatchObservation(captureBatchObservation(entries, [], observations, {
+			byEndpoint: new Map([["temp.md", "included"], ["final.md", "included"]]), isConfiguredScopeCompatible: () => true,
+		}, "test"));
+		expect(admission.failures).toEqual([]);
+		f.ctx.conflictResolver = resolveConflict;
+		const localWrite = vi.spyOn(f.localFs, "write");
+		const second = await executePlan(admission.executable, f.ctx);
+		expect(second.blocked).toEqual([]);
+		expect(second.failed).toEqual([]);
+		expect(f.localFs.files.has("final.conflict-2.md")).toBe(false);
+		expect(f.remoteFs.files.has("final.conflict-2.md")).toBe(false);
+		expect(localWrite.mock.calls.some(([path]) => path === "final.conflict.md")).toBe(false);
+		expect(readText(f.localFs, "final.conflict.md")).toBe("occupant");
+		localWrite.mockRestore();
+	});
+
+
+	it("does not trust forged resolver captured inputs or their matching receipts", async () => {
+		const f = await arrange();
+		f.ctx.conflictResolver = async (ctx, policy) => {
+			const result = await resolveConflict(ctx, policy);
+			const wrong = new TextEncoder().encode("tampered").buffer;
+			const verifiedOutputs = [];
+			for (const output of result.verifiedOutputs ?? []) {
+				await f.localFs.write(output.path, wrong, 1000);
+				await f.remoteFs.write(output.path, wrong, 1000);
+				verifiedOutputs.push({ ...output, sourceContent: wrong,
+					localEntity: (await f.localFs.stat(output.path))!, remoteEntity: (await f.remoteFs.stat(output.path))! });
+			}
+			return { ...result, verifiedOutputs, capturedInputs: { ...result.capturedInputs,
+				additionalLocal: { ...result.capturedInputs!.additionalLocal!, content: wrong } } };
+		};
+		const result = await executePlan(f.plan, f.ctx);
+		expect(result.blocked).toHaveLength(1);
+		expect(result.succeeded).toEqual([]);
+		expect(readText(f.localFs, "final.md")).toBe("occupant");
+		expect(await f.ctx.committer.stateStore.get("temp.md")).toEqual(f.source);
+	});
+
+	it("does not reuse an existing preservation pair with one different byte", async () => {
+		const f = await arrange();
+		addFile(f.localFs, "final.conflict.md", "occupanX", 1000);
+		addFile(f.remoteFs, "final.conflict.md", "occupanX", 1000);
+		const result = await executePlan(f.plan, f.ctx);
+		expect(result.failed).toEqual([]);
+		expect(result.blocked).toEqual([]);
+		expect(readText(f.localFs, "final.conflict.md")).toBe("occupanX");
+		expect(readText(f.remoteFs, "final.conflict.md")).toBe("occupanX");
+		expect(readText(f.localFs, "final.conflict-2.md")).toBe("occupant");
+	});
+
+	it.each(["local-only", "remote-only", "unresolved", "unknown"] as const)(
+		"fails closed instead of adopting a %s preservation candidate", async (problem) => {
+			const f = await arrange();
+			if (problem !== "remote-only") addFile(f.localFs, "final.conflict.md", "occupant", 1000);
+			if (problem !== "local-only") addFile(f.remoteFs, "final.conflict.md", "occupant", 1000);
+			if (problem === "unresolved") f.remoteFs.files.get("final.conflict.md")!.entity.pathAuthority = "requested_echo";
+			if (problem === "unknown") {
+				const stat = f.remoteFs.stat.bind(f.remoteFs);
+				f.remoteFs.stat = (path) => path === "final.conflict.md"
+					? Promise.reject(new Error("observation unavailable")) : stat(path);
+			}
+			const result = await executePlan(f.plan, f.ctx);
+			expect(result.succeeded).toEqual([]);
+			expect(result.blocked.length + result.failed.length).toBe(1);
+			expect(readText(f.localFs, "final.md")).toBe("occupant");
+			expect(f.localFs.files.has("temp.md")).toBe(true);
+			expect(await f.ctx.committer.stateStore.get("temp.md")).toEqual(f.source);
+		},
+	);
+
+	it.each(["bytes", "identity"] as const)("blocks a reusable copy %s change before its exact barrier", async (change) => {
+		const f = await arrange();
+		addFile(f.localFs, "final.conflict.md", "occupant", 1000);
+		addFile(f.remoteFs, "final.conflict.md", "occupant", 1000);
+		class ChangingBarrier extends LocalMutationBarrier {
+			override async run<T>(paths: readonly string[], operation: () => Promise<T>): Promise<T> {
+				if (paths.includes("final.conflict.md")) {
+					if (change === "bytes") await f.remoteFs.write("final.conflict.md", new TextEncoder().encode("occupanX").buffer, 1000);
+					else f.remoteFs.files.get("final.conflict.md")!.entity.identityKey = "foreign";
+				}
+				return super.run(paths, operation);
+			}
+		}
+		f.ctx.mutationBarrier = new ChangingBarrier();
+		const result = await executePlan(f.plan, f.ctx);
+		expect(result.blocked).toHaveLength(1);
+		expect(result.succeeded).toEqual([]);
+		expect(readText(f.localFs, "final.md")).toBe("occupant");
+	});
+
+	it("rechecks preserved source bytes after the equal-canonical namespace cleanup", async () => {
+		const f = await arrange("edited", "remote");
+		const remove = f.localFs.delete.bind(f.localFs);
+		f.localFs.delete = async (path) => {
+			await remove(path);
+			if (path === "temp.md") await f.remoteFs.write("final.conflict.md", new TextEncoder().encode("broken").buffer, 2000);
+		};
+		const result = await executePlan(f.plan, f.ctx);
+		expect(result.blocked).toHaveLength(1);
+		expect(result.succeeded).toEqual([]);
+		expect(await f.ctx.committer.stateStore.get("temp.md")).toEqual(f.source);
+		expect(readText(f.localFs, "final.md")).toBe("remote");
+	});
+
+	it("preserves both distinct local inputs before replacing the canonical address", async () => {
+		const f = await arrange("local edited", "occupant");
+		const events: string[] = [];
+		const write = f.remoteFs.write.bind(f.remoteFs);
+		f.remoteFs.write = async (path, content, mtime) => {
+			events.push(`preserve:${path}`);
+			return write(path, content, mtime);
+		};
+		const remove = f.localFs.delete.bind(f.localFs);
+		f.localFs.delete = async (path) => { events.push(`delete:${path}`); await remove(path); };
+		const result = await executePlan(f.plan, f.ctx);
+		expect(result.failed).toEqual([]);
+		expect(result.blocked).toEqual([]);
+		expect(readText(f.localFs, "final.md")).toBe("remote");
+		expect(readText(f.remoteFs, "final.md")).toBe("remote");
+		expect(readText(f.localFs, "final.conflict.md")).toBe("local edited");
+		expect(readText(f.remoteFs, "final.conflict.md")).toBe("local edited");
+		expect(readText(f.localFs, "final.conflict-2.md")).toBe("occupant");
+		expect(readText(f.remoteFs, "final.conflict-2.md")).toBe("occupant");
+		expect(events.indexOf("preserve:final.conflict-2.md")).toBeLessThan(events.indexOf("delete:final.md"));
+		expect(f.localFs.files.has("temp.md")).toBe(false);
+		expect(await f.ctx.committer.stateStore.get("temp.md")).toBeUndefined();
+		expect(await f.ctx.committer.stateStore.get("final.md")).toMatchObject({ remoteIdentityKey: "X" });
+	});
+
+	it.each(["source", "occupant", "remote", "remote-identity", "copy", "copy-identity", "publication"] as const)(
+		"blocks a %s change after captures, before any original-path effects", async (change) => {
+			const f = await arrange();
+			const originalDelete = vi.spyOn(f.localFs, "delete");
+			f.ctx.conflictResolver = async (ctx, policy) => {
+				const result = await resolveConflict(ctx, policy);
+				if (change === "source") await f.localFs.write("temp.md", new TextEncoder().encode("new source").buffer, 2000);
+				if (change === "occupant") await f.localFs.write("final.md", new TextEncoder().encode("new occupant").buffer, 2000);
+				if (change === "remote") await f.remoteFs.write("final.md", new TextEncoder().encode("new remote").buffer, 2000);
+				if (change === "remote-identity") f.remoteFs.files.get("final.md")!.entity.identityKey = "foreign";
+				if (change === "copy") await f.localFs.write("final.conflict.md", new TextEncoder().encode("corrupt copy").buffer, 2000);
+				if (change === "copy-identity") f.remoteFs.files.get("final.conflict.md")!.entity.identityKey = "foreign";
+				if (change === "publication") await f.ctx.committer.stateStore.put({ ...f.destination, syncedAt: 1234 });
+				return result;
+			};
+			const result = await executePlan(f.plan, f.ctx);
+			expect(result.blocked).toHaveLength(1);
+			expect(result.failed).toEqual([]);
+			expect(result.succeeded).toEqual([]);
+			expect(originalDelete).not.toHaveBeenCalled();
+			expect(f.localFs.files.has("temp.md")).toBe(true);
+			expect(await f.ctx.committer.stateStore.get("temp.md")).toEqual(f.source);
+			originalDelete.mockRestore();
+		},
+	);
+
+	it("blocks a source mutation before content capture", async () => {
+		const f = await arrange();
+		await f.localFs.write("temp.md", new TextEncoder().encode("changed").buffer, 2000);
+		const result = await executePlan(f.plan, f.ctx);
+		expect(result.blocked).toHaveLength(1);
+		expect(readText(f.localFs, "final.md")).toBe("occupant");
+		expect(await f.ctx.committer.stateStore.get("temp.md")).toEqual(f.source);
+	});
+	it.each(["capture", "target", "coverage"] as const)("rejects missing or changed %s proof before deletion", async (change) => {
+		const f = await arrange();
+		const remove = vi.spyOn(f.localFs, "delete");
+		f.ctx.conflictResolver = async (ctx, policy) => {
+			const result = await resolveConflict(ctx, policy);
+			if (change === "capture") return { ...result, capturedInputs: undefined };
+			if (change === "target") return { ...result, targetContent: new TextEncoder().encode("wrong target").buffer };
+			return { ...result, verifiedOutputs: [] };
+		};
+		const result = await executePlan(f.plan, f.ctx);
+		expect(result.blocked).toHaveLength(1);
+		expect(remove).not.toHaveBeenCalled();
+		expect(readText(f.localFs, "final.md")).toBe("occupant");
+		expect(await f.ctx.committer.stateStore.get("temp.md")).toEqual(f.source);
+		remove.mockRestore();
+	});
+
+	it.each(["local", "remote"] as const)("does not overwrite an arriving %s preservation occupant", async (side) => {
+		const f = await arrange();
+		const fs = side === "local" ? f.localFs : f.remoteFs;
+		const stat = fs.stat.bind(fs);
+		let arrived = false;
+		fs.stat = async (path) => {
+			const value = await stat(path);
+			if (path === "final.conflict.md" && !arrived) {
+				arrived = true;
+				addFile(fs, path, "foreign arrival", 2000);
+			}
+			return value;
+		};
+		const result = await executePlan(f.plan, f.ctx);
+		expect(result.blocked).toHaveLength(1);
+		expect(readText(fs, "final.conflict.md")).toBe("foreign arrival");
+		expect(readText(f.localFs, "final.md")).toBe("occupant");
+		expect(f.localFs.files.has("temp.md")).toBe(true);
+		expect(await f.ctx.committer.stateStore.get("temp.md")).toEqual(f.source);
+	});
+
 });

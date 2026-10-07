@@ -338,8 +338,9 @@ export default defineConfig(
 		// which loads the committed row of an observed identity whose stored path the
 		// delta did not visit: a per-cycle acquisition concern that belongs beside the
 		// other entry-shaping steps, not in a separate module.
+		// Re-pinned 328 → 329 to acquire COLD stable-identity relocation content facts.
 		files: ["src/sync/change-detector.ts"],
-		rules: { "max-lines": ["error", { max: 328, skipBlankLines: true, skipComments: true }] },
+		rules: { "max-lines": ["error", { max: 329, skipBlankLines: true, skipComments: true }] },
 	},
 	{
 		// Per-file overrides above the 300 cap (known debt), each pinned at its

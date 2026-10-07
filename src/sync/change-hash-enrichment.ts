@@ -263,6 +263,11 @@ export async function enrichHashesForRenames(
 	const paths = new Set<string>();
 	const prefixes = new Set<string>();
 	for (const item of evidence) {
+		if (item.kind === "stable_identity" &&
+			new Set(item.occurrences.map(({ path }) => path)).size > 1) {
+			// COLD relocation needs the same content facts as a reported move; no report is invented.
+			for (const occurrence of item.occurrences) paths.add(occurrence.path);
+		}
 		if (item.kind !== "rename") continue;
 		for (const path of [item.oldPath, item.newPath]) {
 			paths.add(path);

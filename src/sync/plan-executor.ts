@@ -1,4 +1,4 @@
-/* eslint max-lines: ["error", 1087] -- the executor owns all fixed protocols, direction-specific transfer proof, immediate pre-effect observation, and proof-gated commit routing. Re-pinned from 970 for the identity-addressed namespace repair: which addressing a rename uses, and the fact that the repair route runs none of the publication machinery, must be readable against the path-addressed protocol it deliberately bypasses. Re-pinned from 1020 for the structural auth-failure normalization (a separately bundled module's AuthError class identity is not authoritative and its plain shape may arrive wrapped by ContentProofError), which adds the unwrap/normalize at each cycle-abort site. Re-pinned from 1070 to 1087 for local input proof provenance and exact non-local precondition revalidation before benign supersession certification. */
+/* eslint max-lines: ["error", 1187] -- the executor owns all fixed protocols, direction-specific transfer proof, immediate pre-effect observation, and proof-gated commit routing. Re-pinned from 970 for the identity-addressed namespace repair: which addressing a rename uses, and the fact that the repair route runs none of the publication machinery, must be readable against the path-addressed protocol it deliberately bypasses. Re-pinned from 1020 for the structural auth-failure normalization (a separately bundled module's AuthError class identity is not authoritative and its plain shape may arrive wrapped by ContentProofError), which adds the unwrap/normalize at each cycle-abort site. Re-pinned from 1070 to 1087 for local input proof provenance and exact non-local precondition revalidation before benign supersession certification. Re-pinned from 1087 for preservation-first occupied-local relocation effects and exact pre-destructive proof checks. Re-pinned from 1120 to 1187 for executor-owned source binding, exact preservation barriers, copy reuse, and same-byte namespace reconciliation. */
 import type { IFileSystem } from "../fs/interface";
 import type { ChecksumRegistry } from "../fs/modules/checksum-registry";
 import type { FileEntity } from "../fs/types";
@@ -9,12 +9,12 @@ import type {
 import { conflictContractViolation } from "./conflict-action-contract";
 import type { AuthorizedSyncPlan } from "./plan-admission";
 import type { StateCommitterContext } from "./state-committer";
-import { bytesMatch, captureContentSnapshot, ContentProofError } from "./content-snapshot";
+import { bytesMatch, captureContentSnapshot, ContentProofError, type ExactSnapshot } from "./content-snapshot";
 import type {
 	ConflictResolverContext,
 	ConflictResolutionResult,
 } from "./conflict-resolver";
-import type { VerifiedConflictOutput } from "./conflict";
+import { remoteReplacementInputs, type ConflictInputSnapshots, type VerifiedConflictOutput } from "./conflict";
 import type { Logger } from "../logging/logger";
 import { commitAction, commitExactCleanup } from "./state-committer";
 import { resolveConflict } from "./conflict-resolver";
@@ -714,11 +714,30 @@ function buffersEqual(left: ArrayBuffer, right: ArrayBuffer): boolean {
 function verifiedConflictOutputs(
 	action: SyncAction,
 	resolution: ConflictResolutionResult,
+	inputs: ConflictInputSnapshots,
 ): readonly VerifiedConflictOutput[] {
 	const requiresCopies = resolution.action === "duplicated" && !!action.local ||
 		!!action.remoteIdentitySource && action.remoteIdentitySource.path !== action.path || !!action.additionalRemote || !!action.additionalLocal ||
 		!!action.local && action.local.path !== action.path || !!action.remote && action.remote.path !== action.path;
-	const expected = action.remote && requiresCopies ? [
+	const replacementInputs = action.action === "conflict" && action.conflictPolicy.mode === "remote_preserve"
+		? inputs : undefined;
+	if (action.action === "conflict" && action.conflictPolicy.mode === "remote_preserve" &&
+		(!replacementInputs?.local || !replacementInputs.remote || !replacementInputs.additionalLocal)) {
+		throw new ContentProofError("proof_mismatch", "Replacement captured inputs are incomplete");
+	}
+	if (replacementInputs) {
+		for (const key of ["local", "remote", "additionalLocal"] as const) {
+			const claim = resolution.capturedInputs?.[key];
+			const source = replacementInputs[key];
+			if (!claim || !source || claim.path !== source.path || !buffersEqual(claim.content, source.content)) {
+				throw new ContentProofError("proof_mismatch", "Resolver input claim contradicts executor capture");
+			}
+		}
+	}
+	const expected = replacementInputs
+		? remoteReplacementInputs(replacementInputs.local!, replacementInputs.remote!, replacementInputs.additionalLocal!)
+			.map(({ role, snapshot }) => ({ role, sourcePath: snapshot.path }))
+		: action.remote && requiresCopies ? [
 		{ role: "primary" as const, sourcePath: action.remotePath ?? action.remote.path },
 		...(action.additionalRemote
 			? [{ role: "additional" as const, sourcePath: action.additionalRemote.path }]
@@ -735,7 +754,37 @@ function verifiedConflictOutputs(
 			"proof_mismatch", `Conflict preservation coverage mismatch: ${action.path}`,
 		);
 	}
+	for (const output of actual) {
+		const source = output.role === "primary" ? inputs.remote :
+			output.role === "additional" ? inputs.additionalRemote :
+			output.role === "source" ? inputs.local : inputs.additionalLocal;
+		if (!source || output.sourcePath !== source.path || output.sourceEntity.path !== source.entity.path ||
+			output.sourceEntity.identityKey !== source.entity.identityKey ||
+			!buffersEqual(output.sourceContent, source.content)) {
+			throw new ContentProofError("proof_mismatch", "Preservation receipt contradicts executor-captured source");
+		}
+	}
 	return actual;
+}
+
+/** Capture before the resolver can write copies or return self-asserted witnesses. */
+async function captureConflictInputs(action: ConflictAction, ctx: ExecutionContext): Promise<ConflictInputSnapshots> {
+	const capture = (fs: IFileSystem, entity: FileEntity | undefined) => entity
+		? captureContentSnapshot(fs, entity.path, entity, ctx.checksumRegistry) : undefined;
+	return Object.freeze({
+		local: await capture(ctx.localFs, action.local), remote: await capture(ctx.remoteFs, action.remote),
+		additionalLocal: await capture(ctx.localFs, action.additionalLocal),
+		additionalRemote: await capture(ctx.remoteFs, action.additionalRemote),
+	});
+}
+
+
+/** The resolver receives detached buffers; executor-owned A cannot be forged through C. */
+function detachedConflictInputs(inputs: ConflictInputSnapshots): ConflictInputSnapshots {
+	const copy = (value: ExactSnapshot | undefined) => value
+		? Object.freeze({ ...value, content: value.content.slice(0) }) : undefined;
+	return Object.freeze({ local: copy(inputs.local), remote: copy(inputs.remote),
+		additionalLocal: copy(inputs.additionalLocal), additionalRemote: copy(inputs.additionalRemote) });
 }
 
 function makeTerminalProof(
@@ -759,15 +808,17 @@ async function executePreparedConflictEffects(
 	action: SyncAction,
 	ctx: ExecutionContext,
 	resolution: ConflictResolutionResult,
+	inputs: ConflictInputSnapshots,
+	completed: readonly CompletedAction[] = [],
 ): Promise<{
 	localEntity: FileEntity;
 	remoteEntity: FileEntity;
 	terminalProof: TerminalActionProof;
 }> {
-	const outputs = verifiedConflictOutputs(action, resolution);
 	if (!resolution.targetContent) {
 		throw new TerminalInvariantError(`Fresh resolver omitted target content: ${action.path}`);
 	}
+	const outputs = verifiedConflictOutputs(action, resolution, inputs);
 	const intended = resolution.targetContent.slice(0);
 	const source = action.remoteIdentitySource;
 	const rotationRequired = !!source && source.path !== action.path;
@@ -777,8 +828,8 @@ async function executePreparedConflictEffects(
 	if (action.local) await unchangedEndpoint(ctx.localFs, action.local);
 	if (action.remote) await unchangedEndpoint(ctx.remoteFs, action.remote);
 	for (const [fs, entity, snapshot] of [
-		[ctx.localFs, action.local, resolution.capturedInputs?.local],
-		[ctx.remoteFs, action.remote, resolution.capturedInputs?.remote],
+		[ctx.localFs, action.local, inputs.local],
+		[ctx.remoteFs, action.remote, inputs.remote],
 	] as const) {
 		if (!entity) continue;
 		if (!snapshot) throw new TerminalInvariantError(`Resolver omitted captured input: ${entity.path}`);
@@ -787,10 +838,11 @@ async function executePreparedConflictEffects(
 	}
 	const localTarget = action.localPath ?? action.path;
 	const remoteTarget = action.remotePath ?? action.path;
+	const replacingLocal = action.action === "conflict" && action.conflictPolicy.mode === "remote_preserve";
 	const localMove = action.local && action.local.path !== localTarget;
 	if (localMove) {
 		const occupant = await ctx.localFs.stat(localTarget);
-		if (occupant && occupant.path !== action.local!.path) {
+		if (occupant && occupant.path !== action.local!.path && !replacingLocal) {
 			throw new ContentProofError("proof_mismatch", `Conflict local destination changed: ${localTarget}`);
 		}
 	}
@@ -798,8 +850,12 @@ async function executePreparedConflictEffects(
 	const additionalOutput = outputs.find((output) => output.role === "additional");
 	const localOutput = outputs.find((output) => output.role === "local");
 	if (action.additionalLocal) {
-		if (!localOutput) throw new TerminalInvariantError(`Local preservation proof missing: ${action.path}`);
-		await assertPreservedSourceUnchanged(ctx.localFs, action.additionalLocal.path, action.additionalLocal.identityKey, localOutput, ctx.checksumRegistry);
+		const witness = replacingLocal ? inputs.additionalLocal : localOutput;
+		if (!witness) throw new TerminalInvariantError(`Local preservation proof missing: ${action.path}`);
+		await unchangedEndpoint(ctx.localFs, action.additionalLocal);
+		await assertPreservedSourceUnchanged(ctx.localFs, action.additionalLocal.path, action.additionalLocal.identityKey,
+			"content" in witness ? { sourcePath: witness.path, sourceEntity: witness.entity, sourceContent: witness.content } : witness,
+			ctx.checksumRegistry);
 	}
 	if (action.additionalRemote) {
 		if (!additionalOutput) throw new TerminalInvariantError(`Conflict omitted target snapshot: ${action.path}`);
@@ -815,11 +871,34 @@ async function executePreparedConflictEffects(
 		if (action.additionalRemote) await ctx.remoteFs.delete(action.path);
 		await ctx.remoteFs.rename(source.path, action.path);
 	}
+	if (replacingLocal) {
+		if (!inputs.remote || !buffersEqual(intended, inputs.remote.content) ||
+			outputs.some(({ path }) => path === action.path || path === action.local?.path)) {
+			throw new ContentProofError("proof_mismatch", "Remote replacement terminal/preservation contract changed");
+		}
+		// Re-prove copies and publication before replacing either admitted local input.
+		await proveReplacementCopies(ctx, outputs);
+		await checkPublicationInputs(action, ctx, completed);
+		const occupant = inputs.additionalLocal!;
+		await unchangedEndpoint(ctx.localFs, action.additionalLocal!);
+		await assertPreservedSourceUnchanged(ctx.localFs, occupant.path, occupant.entity.identityKey,
+			{ sourcePath: occupant.path, sourceEntity: occupant.entity, sourceContent: occupant.content }, ctx.checksumRegistry);
+		if (buffersEqual(occupant.content, intended)) {
+			await ctx.localFs.delete(action.local!.path);
+			const localEntity = await unchangedEndpoint(ctx.localFs, action.additionalLocal!);
+			const remoteEntity = await unchangedEndpoint(ctx.remoteFs, action.remote!);
+			await proveAdmittedTerminal(action, ctx, { localEntity, remoteEntity, intendedContent: intended });
+			await proveReplacementCopies(ctx, outputs);
+			return { localEntity, remoteEntity,
+				terminalProof: makeTerminalProof(action, localEntity, remoteEntity, intended, outputs) };
+		}
+		await ctx.localFs.delete(action.additionalLocal!.path);
+	}
 	if (localMove) await ctx.localFs.rename(action.local!.path, localTarget);
 
 	const mtime = resolution.targetMtime ?? action.local?.mtime ?? 0;
 	await ctx.localFs.write(localTarget, intended.slice(0), mtime);
-	await ctx.remoteFs.write(remoteTarget, intended.slice(0), mtime);
+	if (!replacingLocal) await ctx.remoteFs.write(remoteTarget, intended.slice(0), mtime);
 	const [localEntity, remoteEntity, sourceAfter] = await Promise.all([
 		ctx.localFs.stat(localTarget), ctx.remoteFs.stat(remoteTarget),
 		rotationRequired ? ctx.remoteFs.stat(source.path) : Promise.resolve(null),
@@ -831,6 +910,7 @@ async function executePreparedConflictEffects(
 		throw new ContentProofError("proof_mismatch", `Fresh conflict terminal identity mismatch: ${action.path}`);
 	}
 	await proveAdmittedTerminal(action, ctx, { localEntity, remoteEntity, intendedContent: intended });
+	if (replacingLocal) await proveReplacementCopies(ctx, outputs);
 	for (const output of outputs) {
 		for (const fs of [ctx.localFs, ctx.remoteFs]) {
 			const entity = await fs.stat(output.path);
@@ -846,6 +926,20 @@ async function executePreparedConflictEffects(
 		action, localEntity, remoteEntity, intended, outputs,
 	);
 	return { localEntity, remoteEntity, terminalProof };
+}
+
+
+/** A receipt supplies no source authority; verifiedConflictOutputs already bound its bytes. */
+async function proveReplacementCopies(ctx: ExecutionContext, outputs: readonly VerifiedConflictOutput[]): Promise<void> {
+	for (const output of outputs) {
+		for (const fs of [ctx.localFs, ctx.remoteFs]) {
+			const endpoint = fs === ctx.localFs ? output.localEntity : output.remoteEntity;
+			if (!endpoint) throw new ContentProofError("proof_mismatch", "Preservation endpoint proof is absent");
+			await unchangedEndpoint(fs, endpoint);
+			await assertPreservedSourceUnchanged(fs, output.path, endpoint.identityKey,
+				{ ...output, sourcePath: output.path, sourceEntity: endpoint }, ctx.checksumRegistry);
+		}
+	}
 }
 
 async function assertPreservedSourceUnchanged(
@@ -915,6 +1009,12 @@ async function executeConflictAction(
 			remoteIdentitySource: action.remoteIdentitySource,
 			additionalRemote: action.additionalRemote,
 			additionalLocal: action.additionalLocal,
+			mutatePreservation: ctx.mutationBarrier ? async (path, operation) => {
+				if ([action.path, action.local?.path, action.remote?.path].includes(path)) {
+					throw new ContentProofError("proof_mismatch", "Preservation address overlaps an admitted original");
+				}
+				await ctx.mutationBarrier!.run([path], operation);
+			} : undefined,
 		};
 
 		// No in-cycle retry: conflict resolution (the `duplicate` strategy) is NOT
@@ -925,18 +1025,18 @@ async function executeConflictAction(
 		const execute = async () => {
 			await checkPublicationInputs(action, ctx, result.succeeded);
 			const recoveryId = await captureRecovery(action, ctx);
+			const inputs = await captureConflictInputs(action, ctx);
 			const resolution = await (ctx.conflictResolver ?? resolveConflict)(
-				conflictCtx, action.conflictPolicy,
+				{ ...conflictCtx, inputSnapshots: detachedConflictInputs(inputs) }, action.conflictPolicy,
 			);
-			const { localEntity, remoteEntity, terminalProof } = await executePreparedConflictEffects(action, ctx, resolution);
+			const { localEntity, remoteEntity, terminalProof } = await executePreparedConflictEffects(action, ctx, resolution, inputs, result.succeeded);
 			const terminalRecord = await commitAction(action, localEntity, remoteEntity, ctx.committer,
 				terminalProof, result.succeeded);
 			await completeRecovery(recoveryId, ctx);
 			return { resolution, localEntity, remoteEntity, terminalProof, terminalRecord };
 		};
-		const mutationPaths = action.remoteIdentitySource
-			? [action.path, action.remoteIdentitySource.path]
-			: [action.path];
+		const mutationPaths = [...new Set([action.path, action.local?.path, action.remoteIdentitySource?.path,
+			action.additionalLocal?.path].filter((path): path is string => path !== undefined))];
 		const { resolution, localEntity, remoteEntity, terminalProof, terminalRecord } = ctx.mutationBarrier
 			? await ctx.mutationBarrier.run(mutationPaths, execute)
 			: await execute();

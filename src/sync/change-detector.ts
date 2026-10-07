@@ -180,7 +180,8 @@ export async function collectChanges(
 	);
 	// Hash enrichment operates only on exact entries and cannot upgrade observations.
 	changeSet.hashEnrichment = await enrichHashesForInitialMatch(changeSet.entries, deps.localFs, deps.checksumRegistry);
-	await enrichHashesForRenames(changeSet.entries, changeSet.observations, deps.localFs, deps.remoteFs, changeSet.identityEvidence, deps.checksumRegistry);
+	await enrichHashesForRenames(changeSet.entries, changeSet.observations, deps.localFs, deps.remoteFs,
+		completeIdentityEvidence(changeSet.identityEvidence, changeSet.observations, changeSet.entries), deps.checksumRegistry);
 	const candidateEvidence = completeIdentityEvidence(
 		changeSet.identityEvidence,
 		changeSet.observations,

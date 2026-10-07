@@ -20,16 +20,27 @@ export interface ConflictResolutionResult {
 	targetContent?: ArrayBuffer;
 	targetMtime?: number;
 	/** Attempt-local read witnesses; execution revalidates these before original-path effects. */
-	capturedInputs?: { readonly local?: ExactSnapshot; readonly remote?: ExactSnapshot };
+	capturedInputs?: ConflictInputSnapshots;
+}
+
+/** Executor captures these independently of the resolver's receipts. */
+export interface ConflictInputSnapshots {
+	readonly local?: ExactSnapshot;
+	readonly remote?: ExactSnapshot;
+	readonly additionalLocal?: ExactSnapshot;
+	readonly additionalRemote?: ExactSnapshot;
 }
 
 export interface VerifiedConflictOutput {
-	readonly role: "primary" | "additional" | "local";
+	readonly role: "primary" | "additional" | "local" | "source";
 	readonly path: string;
 	readonly sourcePath: string;
 	/** Immutable resolver snapshot used by the executor's destructive precondition check. */
 	readonly sourceEntity: FileEntity;
 	readonly sourceContent: ArrayBuffer;
+	/** Exact post-copy endpoints for pre-destructive revalidation. */
+	readonly localEntity?: FileEntity;
+	readonly remoteEntity?: FileEntity;
 }
 
 /** Generate a conflict file path with sequential numbering to avoid overwrites.
@@ -75,4 +86,16 @@ export function directConflictCandidateHint(
 	const sha256 = match[2]!;
 	if ((!match[1] && !match[3]) || insertConflictSuffix(basePath, sha256) !== path) return undefined;
 	return { basePath, sha256 };
+}
+
+/** Only distinct local versions need copies: the canonical remote bytes already survive. */
+export function remoteReplacementInputs(local: ExactSnapshot, remote: ExactSnapshot, occupant: ExactSnapshot) {
+	return [
+		{ role: "source" as const, snapshot: local },
+		{ role: "local" as const, snapshot: occupant },
+	].filter(({ snapshot }) => {
+		const left = new Uint8Array(snapshot.content);
+		const right = new Uint8Array(remote.content);
+		return left.length !== right.length || !left.every((value, index) => value === right[index]);
+	});
 }

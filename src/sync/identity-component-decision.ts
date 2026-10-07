@@ -1,9 +1,9 @@
-/* eslint max-lines: ["error", 963] -- relation abandonment, exact-path binding, preservation-cover authorization, and Prefer-local eligibility must stay under the sole identity-policy owner. Re-pinned from 785 for the two corrected publication expectations: a replacement continues no row, so the incumbent it names is the occupant of the claimed address and nothing else. Re-pinned from 789 for the rename guard's cross-source note, which precedes the loop it explains; this directive counts comments. Re-pinned from 800 for the contended-address precondition: which provider object an address denotes is current topology, bound here with the endpoint and record facts below rather than filtered out of the result afterwards, so every rule reads one `CurrentFacts` and no caller can re-decide an address this owner already refused. Re-pinned from 815 for `awaiting_repair`, the reason that tells a withheld address whose repair its own plan carries apart from one nothing will settle — the closeout owes the first a follow-up cycle and the second nothing — and it belongs in the closed vocabulary this owner defines. Re-pinned from 822 for the abandoned-relation fallback's identity join: a committed row belongs to the current address its provider identity is observed at, and abandoning a relation must re-seat it there (through the relocated-match fallback) rather than decide the endpoint unbaselined. Re-pinned from 848 to also mark a stored row whose identity is observed elsewhere as relocated away, so a continuation and a replacement cannot both name the same incumbent row. Re-pinned from 858 for ordering a carrying action before the address it vacates, so a stored path that sorts first cannot outrun the row it must lose. Re-pinned from 869 for carrying a remote rename's local counterpart to the rename destination, so a folder rename onto an occupied address moves the local file instead of pushing the stale old address. Re-pinned from 901 for the empty-parent prune candidate helper: it binds the scope-filtered ancestor chain to the exact delete/file-rename action this owner materializes, so no other layer re-derives candidate addresses. Re-pinned from 931 for mutually vacant provider-current concurrent rename binding and accounting for its admitted local source; content resolution remains separate. Re-pinned from 941 to keep explicit-report and vacant-destination COLD identity proofs under the same identity-policy owner. */
+/* eslint max-lines: ["error", 980] -- relation abandonment, exact-path binding, preservation-cover authorization, and Prefer-local eligibility must stay under the sole identity-policy owner. Re-pinned from 785 for the two corrected publication expectations: a replacement continues no row, so the incumbent it names is the occupant of the claimed address and nothing else. Re-pinned from 789 for the rename guard's cross-source note, which precedes the loop it explains; this directive counts comments. Re-pinned from 800 for the contended-address precondition: which provider object an address denotes is current topology, bound here with the endpoint and record facts below rather than filtered out of the result afterwards, so every rule reads one `CurrentFacts` and no caller can re-decide an address this owner already refused. Re-pinned from 815 for `awaiting_repair`, the reason that tells a withheld address whose repair its own plan carries apart from one nothing will settle — the closeout owes the first a follow-up cycle and the second nothing — and it belongs in the closed vocabulary this owner defines. Re-pinned from 822 for the abandoned-relation fallback's identity join: a committed row belongs to the current address its provider identity is observed at, and abandoning a relation must re-seat it there (through the relocated-match fallback) rather than decide the endpoint unbaselined. Re-pinned from 848 to also mark a stored row whose identity is observed elsewhere as relocated away, so a continuation and a replacement cannot both name the same incumbent row. Re-pinned from 858 for ordering a carrying action before the address it vacates, so a stored path that sorts first cannot outrun the row it must lose. Re-pinned from 869 for carrying a remote rename's local counterpart to the rename destination, so a folder rename onto an occupied address moves the local file instead of pushing the stale old address. Re-pinned from 901 for the empty-parent prune candidate helper: it binds the scope-filtered ancestor chain to the exact delete/file-rename action this owner materializes, so no other layer re-derives candidate addresses. Re-pinned from 931 for mutually vacant provider-current concurrent rename binding and accounting for its admitted local source; content resolution remains separate. Re-pinned from 941 to keep explicit-report and vacant-destination COLD identity proofs under the same identity-policy owner. Re-pinned from 963 for exact occupied-local relocation binding and its remote-preserving conflict contract. */
 import type { FileEntity } from "../fs/types";
 import type { IdentityComponent } from "./plan-admission-graph";
 import { selectReportFamily } from "./identity-component-report-family";
 import { compareContent } from "./decision-engine";
-import { sameContent, sameSynchronizedContent } from "./content-identity";
+import { sameContent, sameSynchronizedContent, contentKey } from "./content-identity";
 import { isDotPrefixed } from "../utils/path";
 import { insertConflictSuffix } from "./conflict";
 import { compileSamePathConflictContract } from "./conflict-policy-admission";
@@ -51,6 +51,8 @@ interface BoundFile {
 	readonly move?: { readonly side: SyncSide; readonly from: string };
 	/** Different current identities share this address: equality or preservation. */
 	readonly replacement?: boolean;
+	/** Tracked remote relocation replaces an exactly observed local occupant. */
+	readonly occupiedLocalRelocation?: boolean;
 	readonly localPath?: string;
 	readonly remotePath?: string;
 	readonly remoteIdentitySource?: FileEntity;
@@ -526,17 +528,30 @@ function bindFiles(facts: CurrentFacts, reports: readonly RenameEvidence[]): Fil
 			? { side: path === local.path ? "remote" : "local",
 				from: path === local.path ? remote.path : local.path } : undefined;
 		const additionalRemote = move?.side === "remote" && remote?.path !== path ? facts.remote.get(path) : undefined;
-		if (move && !additionalRemote && !vacant(facts, move.side, path, move.from)) return "conflicting_identity";
+		const occupant = move?.side === "local" ? facts.local.get(path) : undefined;
+		const occupiedLocalRelocation = !!occupant && !!local && !!remote &&
+			!localReport && !recreated && local.path === baseline.path && !claimedLocal.has(occupant.path) &&
+			!currentByIdentity.has(facts.records.get(path)?.remoteIdentityKey ?? "") &&
+			path === remote.path && trackedRemote === remote && remoteMovedByIdentity &&
+			absent(facts, "remote", baseline.path) &&
+			[local, occupant, remote].every((entity) => observationsAt(facts,
+				entity === remote ? "remote" : "local", entity.path).some((item) => item.kind === "exact"));
+		if (occupiedLocalRelocation && [local, occupant, remote].some((entity) => !contentKey(entity))) {
+			return "identity_postcondition_unproven";
+		}
+		if (move && !additionalRemote && !occupiedLocalRelocation && !vacant(facts, move.side, path, move.from)) return "conflicting_identity";
 		bound.push({ kind: "structural", binding: { path, local: destinationLocal, remote,
 			// The local source belongs to the later source-address decision. Its
 			// existence cannot turn an unmaterialized destination into a deletion.
-			baseline: recreated ? undefined : baseline, move,
+			baseline: recreated ? undefined : baseline, move, occupiedLocalRelocation,
 			remoteIdentitySource: trackedRemote, additionalRemote,
-			additionalLocal: recreated && destinationLocal && remote && !equal(destinationLocal, remote) ? destinationLocal : undefined,
+			additionalLocal: occupiedLocalRelocation ? occupant :
+				recreated && destinationLocal && remote && !equal(destinationLocal, remote) ? destinationLocal : undefined,
 			replacement: (recreated && !!destinationLocal) || !!additionalRemote ||
 				(!!remote && remote.identityKey !== baseline.remoteIdentityKey),
 			publication: { source: baseline, destination: facts.records.get(path) } } });
 		if (destinationLocal) claimedLocal.add(destinationLocal.path);
+		if (occupiedLocalRelocation) claimedLocal.add(occupant.path);
 		if (remote) claimedRemote.add(remote.path);
 		if (additionalRemote) claimedRemote.add(additionalRemote.path);
 		if (baseline.path !== path) relocated.add(baseline.path);
@@ -711,7 +726,7 @@ function materializeFile(
 	if (!local && !absent(facts, "local", file.localPath ?? path)) return "unknown_observation";
 	if (!remote && !file.releasedRemote && !absent(facts, "remote", file.remotePath ?? path)) return "unknown_observation";
 	const compared = compareContent({ path, local, remote, prevSync: baseline });
-	const kind = file.replacement && local && remote
+	const kind = file.occupiedLocalRelocation ? "conflict" : file.replacement && local && remote
 		? !file.additionalRemote && equal(local, remote) ? "match" : "conflict" : compared;
 	if (!move && kind === "delete_local" && !observationsAt(facts, "remote", file.remotePath ?? path).some((item) =>
 		item.kind === "absent" && item.authority === "checkpoint_deleted")) return "unknown_observation";
@@ -729,7 +744,9 @@ function materializeFile(
 		if (!local || !remote || (!remote.identityKey && !equal(local, remote))) return "remote_identity_missing";
 		if (kind === "conflict") return {
 			action: "conflict", path, local, remote, baseline, publication,
-			...compileSamePathConflictContract(conflictFacts(file), conflictStrategy, allowPreferLocalWin),
+			...(file.occupiedLocalRelocation
+				? { protocol: { kind: "same_path" as const }, conflictPolicy: { mode: "remote_preserve" as const, strategy: conflictStrategy } }
+				: compileSamePathConflictContract(conflictFacts(file), conflictStrategy, allowPreferLocalWin)),
 			remoteIdentitySource: file.remoteIdentitySource, additionalRemote: file.additionalRemote, additionalLocal: file.additionalLocal,
 		};
 		let content: RenameContent;
