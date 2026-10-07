@@ -7,6 +7,7 @@ import { DEFAULT_SETTINGS } from "../settings";
 import type AirSyncPlugin from "../main";
 import type { App as ObsidianApp } from "../platform/obsidian";
 import { AirSyncSettingTab } from "./settings";
+import { deferred } from "../__mocks__/sync-test-helpers";
 
 beforeEach(() => {
  __ui.buttons = []; __ui.dropdowns = [];
@@ -62,6 +63,54 @@ describe("AirSyncSettingTab conflict strategy", () => {
 
 
 describe("M3 Shadow settings", () => {
+ it.each(["shadow", "write"] as const)("awaits %s cold observation and refreshes only after completion", async mode => {
+  const pending = deferred<void>(); const plugin = pluginFixture(); plugin.settings.syncMode = mode;
+  plugin.rescan.mockReturnValue(pending.promise);
+  const tab = new AirSyncSettingTab(new App() as unknown as ObsidianApp, plugin as unknown as AirSyncPlugin);
+  const display = vi.spyOn(tab, "renderContent"); tab.display();
+  const button = __ui.buttons.find(item => item.label === (mode === "shadow" ? "Run cold preview" : "Rescan"));
+  if (!button) throw new Error("Missing cold observation button");
+  const click = button.click(); expect(button.disabled).toBe(true); button.click();
+  expect(plugin.rescan).toHaveBeenCalledOnce(); expect(display).toHaveBeenCalledOnce();
+  pending.resolve(); await click;
+  expect(display).toHaveBeenCalledTimes(2);
+  expect(__ui.buttons.filter(item => item.label === button.label).at(-1)?.disabled).toBe(false);
+ });
+ it("renders the newly completed cold preview report", async () => {
+  const report = createShadowPreview(admitBatchObservation(captureBatchObservation([], [], [], { byEndpoint: new Map(), isConfiguredScopeCompatible: () => true }, "root")), true, true);
+  const latest = vi.fn().mockReturnValue(report);
+  const pending = deferred<void>();
+  const plugin = { ...pluginFixture(), getLatestShadowPreview: latest };
+  plugin.rescan.mockImplementation(async () => {
+   await pending.promise;
+   latest.mockReturnValue({ ...report, expectedChanges: { ...report.expectedChanges, create: { local: 2, remote: 0 } } });
+  });
+  const descriptions = vi.spyOn(Setting.prototype, "setDesc");
+  const tab = new AirSyncSettingTab(new App() as unknown as ObsidianApp, plugin as unknown as AirSyncPlugin);
+  tab.display();
+  const button = __ui.buttons.find(item => item.label === "Run cold preview");
+  if (!button) throw new Error("Missing cold preview button");
+  try {
+   const click = button.click(); button.click();
+   expect(plugin.rescan).toHaveBeenCalledOnce(); expect(button.disabled).toBe(true);
+   expect(descriptions).not.toHaveBeenCalledWith("Create 2 · Update 0 · Rename 0 · Delete 0 · Conflicts 0");
+   pending.resolve(); await click;
+   expect(descriptions).toHaveBeenCalledWith("Create 2 · Update 0 · Rename 0 · Delete 0 · Conflicts 0");
+  } finally { descriptions.mockRestore(); }
+ });
+ it("refreshes cold preview UI in finally after rejection", async () => {
+  let reject!: (error: Error) => void;
+  const pending = new Promise<void>((_resolve, rejectPromise) => { reject = rejectPromise; });
+  const plugin = pluginFixture(); plugin.rescan.mockReturnValue(pending);
+  const tab = new AirSyncSettingTab(new App() as unknown as ObsidianApp, plugin as unknown as AirSyncPlugin);
+  const display = vi.spyOn(tab, "renderContent"); tab.display();
+  const button = __ui.buttons.find(item => item.label === "Run cold preview");
+  if (!button) throw new Error("Missing cold preview button");
+  const click = button.click(); expect(button.disabled).toBe(true);
+  reject(new Error("Preview unavailable")); await expect(click).rejects.toThrow("Preview unavailable");
+  expect(display).toHaveBeenCalledTimes(2);
+  expect(__ui.buttons.filter(item => item.label === "Run cold preview").at(-1)?.disabled).toBe(false);
+ });
  it("exposes preview and cold preview with no ordinary mode toggle", () => {
   const plugin = pluginFixture(); const tab = new AirSyncSettingTab(new App() as unknown as ObsidianApp, plugin as unknown as AirSyncPlugin);
   tab.display();

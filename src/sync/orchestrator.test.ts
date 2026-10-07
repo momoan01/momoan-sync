@@ -3,6 +3,7 @@ import "fake-indexeddb/auto";
 import { SyncOrchestrator } from "./orchestrator";
 import type { SyncOrchestratorDeps } from "./orchestrator";
 import { backendError } from "../backend-api";
+import * as executor from "./plan-executor";
 import { collectChanges } from "./change-detector";
 import { createChecksumRegistry } from "../fs/modules/checksum-registry";
 import { prepareSyncCycleSnapshot } from "./sync-cycle-planning";
@@ -148,6 +149,125 @@ describe("SyncOrchestrator", () => {
 			}
 		},
 	);
+
+	it.each(["local-only", "local-and-remote", "local-and-publication"] as const)("checks non-local inputs before deferring a superseded push: %s", async scenario => {
+		const localFs = createMockLocalFs();
+		const remoteFs = createMockRemoteFs("actual_resolved");
+		addFile(localFs, "note.md", "original", 1000);
+		addFile(remoteFs, "note.md", "original", 1000).identityKey = "R";
+		const settings = baseMockSettings({ backendType: "test", vaultId: `test-${Math.random()}`, showSyncNotifications: true });
+		const commitCheckpoint = vi.fn().mockResolvedValue(undefined);
+		const abortWorkingView = vi.fn().mockResolvedValue(undefined);
+		remoteFs.checkpoint!.commitCheckpoint = commitCheckpoint;
+		remoteFs.checkpoint!.abortWorkingView = abortWorkingView;
+		let supersede = false;
+		const temperatures: unknown[] = [];
+		const info = vi.fn((message: string, context?: Record<string, unknown>) => {
+			if (message === "Change detection completed") temperatures.push(context?.temperature);
+		});
+		const deps = createDeps({ getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs,
+			logger: { enabled: () => true, debug: vi.fn(), info, warn: vi.fn(), error: vi.fn(), flush: vi.fn() } as unknown as Logger });
+		const orchestrator = new SyncOrchestrator(deps);
+		const executePlan = executor.executePlan;
+		const results: Awaited<ReturnType<typeof executor.executePlan>>[] = [];
+		const execute = vi.spyOn(executor, "executePlan").mockImplementation(async (...args) => {
+			if (supersede) {
+				supersede = false;
+				addFile(localFs, "note.md", "latest local", 3000);
+				deps.localTracker.markDirty("note.md");
+				if (scenario === "local-and-remote") remoteFs.files.get("note.md")!.entity.identityKey = "replacement";
+				if (scenario === "local-and-publication") {
+					const record = await orchestrator.state.get("note.md");
+					if (!record) throw new Error("Missing baseline");
+					await orchestrator.state.put({ ...record, syncedAt: record.syncedAt + 1 });
+				}
+			}
+			const result = await executePlan(...args); results.push(result); return result;
+		});
+		try {
+			await orchestrator.runSync();
+			commitCheckpoint.mockClear(); abortWorkingView.mockClear(); execute.mockClear(); results.length = 0;
+			vi.mocked(deps.notify).mockClear(); vi.mocked(deps.onStatusChange).mockClear(); temperatures.length = 0;
+			addFile(localFs, "note.md", "first local", 2000);
+			deps.localTracker.markDirty("note.md"); supersede = true;
+			await orchestrator.runSync();
+			expect(execute).toHaveBeenCalledOnce();
+			const result = results[0]!;
+			expect(result.blocked).toHaveLength(1);
+			expect(result.blocked[0]).toMatchObject({ classification: "precondition_changed", action: { action: "push" } });
+			expect(commitCheckpoint).not.toHaveBeenCalled(); expect(abortWorkingView).toHaveBeenCalledOnce();
+			expect(deps.localTracker.getDirtyPaths().has("note.md")).toBe(true);
+			if (scenario !== "local-only") {
+				expect(result.blocked[0]?.localSupersession).toBeUndefined();
+				expect(deps.onStatusChange).toHaveBeenCalledWith("partial_error");
+				expect(deps.notify).toHaveBeenCalledWith(expect.stringContaining("1 blocked"));
+				return;
+			}
+			expect(result.blocked[0]?.localSupersession).toBe(true);
+			expect(deps.onStatusChange).not.toHaveBeenCalledWith("partial_error"); expect(deps.notify).not.toHaveBeenCalled();
+			expect(readText(remoteFs, "note.md")).toBe("original");
+			// Only the scheduler's later request starts the next observation.
+			await orchestrator.runSync();
+			expect(execute).toHaveBeenCalledTimes(2); expect(temperatures).toEqual(["hot", "hot"]);
+			expect(readText(remoteFs, "note.md")).toBe("latest local");
+			expect(deps.localTracker.getDirtyPaths().size).toBe(0); expect(commitCheckpoint).toHaveBeenCalledOnce();
+			expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+			expect(deps.onStatusChange).not.toHaveBeenCalledWith("partial_error");
+		} finally { execute.mockRestore(); await orchestrator.close(); }
+	});
+
+	it.each(["error-then-benign", "benign-then-clean"] as const)("preserves a queued burst's final notification: %s", async scenario => {
+		const localFs = createMockLocalFs();
+		const remoteFs = createMockRemoteFs("actual_resolved");
+		addFile(localFs, "note.md", "original", 1000);
+		addFile(remoteFs, "note.md", "original", 1000).identityKey = "R";
+		const settings = baseMockSettings({ backendType: "test", vaultId: `test-${Math.random()}`, showSyncNotifications: true });
+		const deps = createDeps({ getSettings: () => settings, localFs: () => localFs, remoteFs: () => remoteFs });
+		const orchestrator = new SyncOrchestrator(deps);
+		const executePlan = executor.executePlan;
+		let burst = false;
+		let cycles = 0;
+		const results: Awaited<ReturnType<typeof executor.executePlan>>[] = [];
+		const execute = vi.spyOn(executor, "executePlan").mockImplementation(async (...args) => {
+			if (burst) {
+				cycles++;
+				if (cycles === 1) void orchestrator.runSync(); // A real trigger already queued, not a benign retry.
+				if ((scenario === "error-then-benign" && cycles === 2) ||
+					(scenario === "benign-then-clean" && cycles === 1)) {
+					addFile(localFs, "note.md", "latest local", 3000);
+					deps.localTracker.markDirty("note.md");
+				}
+			}
+			const result = await executePlan(...args);
+			if (burst) results.push(result);
+			return result;
+		});
+		try {
+			await orchestrator.runSync();
+			vi.mocked(deps.notify).mockClear(); vi.mocked(deps.onStatusChange).mockClear();
+			if (scenario === "error-then-benign") {
+				vi.spyOn(remoteFs, "write").mockRejectedValueOnce(Object.assign(new Error("denied"), { status: 403, kind: "permission" }));
+			}
+			addFile(localFs, "note.md", "first local", 2000); deps.localTracker.markDirty("note.md"); burst = true;
+			await orchestrator.runSync();
+			expect(cycles).toBe(2); expect(deps.notify).toHaveBeenCalledOnce();
+			if (scenario === "error-then-benign") {
+				expect(results[0]?.failed).toHaveLength(1);
+				expect(results[1]?.blocked[0]?.localSupersession).toBe(true);
+				expect(deps.notify).toHaveBeenCalledWith(expect.stringContaining("1 error"));
+				expect(deps.notify).not.toHaveBeenCalledWith("Everything up to date");
+				expect(deps.onStatusChange).toHaveBeenCalledWith("partial_error");
+			} else {
+				expect(results[0]?.blocked[0]?.localSupersession).toBe(true);
+				expect(results[1]?.blocked).toEqual([]); expect(results[1]?.succeeded).toHaveLength(1);
+				expect(deps.onStatusChange).not.toHaveBeenCalledWith("partial_error");
+				expect(deps.onStatusChange).toHaveBeenLastCalledWith("idle");
+				expect(deps.notify).toHaveBeenCalledWith("Sync: 1 pushed");
+				expect(readText(remoteFs, "note.md")).toBe("latest local");
+				expect(deps.localTracker.getDirtyPaths().size).toBe(0);
+			}
+		} finally { execute.mockRestore(); vi.restoreAllMocks(); await orchestrator.close(); }
+	});
 
 	it("retains an edit made during push and converges it through the next HOT push", async () => {
 		const localFs = createMockLocalFs();

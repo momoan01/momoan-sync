@@ -1,4 +1,4 @@
-/* eslint max-lines: ["error", 1070] -- the executor owns all fixed protocols, direction-specific transfer proof, immediate pre-effect observation, and proof-gated commit routing. Re-pinned from 970 for the identity-addressed namespace repair: which addressing a rename uses, and the fact that the repair route runs none of the publication machinery, must be readable against the path-addressed protocol it deliberately bypasses. Re-pinned from 1020 for the structural auth-failure normalization (a separately bundled module's AuthError class identity is not authoritative and its plain shape may arrive wrapped by ContentProofError), which adds the unwrap/normalize at each cycle-abort site. */
+/* eslint max-lines: ["error", 1087] -- the executor owns all fixed protocols, direction-specific transfer proof, immediate pre-effect observation, and proof-gated commit routing. Re-pinned from 970 for the identity-addressed namespace repair: which addressing a rename uses, and the fact that the repair route runs none of the publication machinery, must be readable against the path-addressed protocol it deliberately bypasses. Re-pinned from 1020 for the structural auth-failure normalization (a separately bundled module's AuthError class identity is not authoritative and its plain shape may arrive wrapped by ContentProofError), which adds the unwrap/normalize at each cycle-abort site. Re-pinned from 1070 to 1087 for local input proof provenance and exact non-local precondition revalidation before benign supersession certification. */
 import type { IFileSystem } from "../fs/interface";
 import type { ChecksumRegistry } from "../fs/modules/checksum-registry";
 import type { FileEntity } from "../fs/types";
@@ -45,6 +45,20 @@ export interface TerminalActionProof {
 	readonly remoteEntity: FileEntity;
 	readonly intendedContent?: ArrayBuffer;
 	readonly verifiedOutputs: readonly VerifiedConflictOutput[];
+}
+
+/** Proven origin only: emitted at a push's pre-effect local input checks. */
+class LocalInputProofError extends ContentProofError {
+	constructor(error: ContentProofError) {
+		super("proof_mismatch", error.message, { cause: error });
+	}
+}
+
+function localInputFailure(error: unknown, isLocalPushInput: boolean): never {
+	if (isLocalPushInput && error instanceof ContentProofError && error.kind === "proof_mismatch") {
+		throw new LocalInputProofError(error);
+	}
+	throw error;
 }
 
 class TerminalInvariantError extends Error {
@@ -340,7 +354,20 @@ async function executeAction(
 		}
 		if (err instanceof ContentProofError && err.kind === "proof_mismatch") {
 			ctx.logger?.warn("executePlan: action blocked", { path: action.path, action: action.action, reason: err.message });
-			result.blocked.push({ action, reason: err.message });
+			let localSupersession: true | undefined;
+			if (action.action === "push" && err instanceof LocalInputProofError) {
+				try {
+					// A local mismatch may throw first. Never hide a simultaneous remote/record change.
+					await checkPublicationInputs(action, ctx, [], true);
+					localSupersession = true;
+				} catch (nonLocalError) {
+					ctx.logger?.warn("Local supersession not proven: non-local preconditions unverifiable", {
+						path: action.path, reason: toError(nonLocalError).message,
+					});
+				}
+			}
+			result.blocked.push({ action, reason: err.message, classification: "precondition_changed",
+				...(localSupersession ? { localSupersession } : {}) });
 			return;
 		}
 		if (err instanceof ContentProofError && err.kind === "external_auth_failure") {
@@ -445,7 +472,8 @@ async function runActionIO(
 			const source = pushing ? localFs : remoteFs;
 			const target = pushing ? remoteFs : localFs;
 			const targetPath = (pushing ? action.remotePath : action.localPath) ?? path;
-			const captured = await captureContentSnapshot(source, expected.path, expected, ctx.checksumRegistry);
+			const captured = await captureContentSnapshot(source, expected.path, expected, ctx.checksumRegistry)
+				.catch((error: unknown) => localInputFailure(error, pushing));
 			const { content } = captured;
 			// Reading may yield to local edits or another writer. Revalidate the
 			// captured destination and record expectations before destructive use.
@@ -493,7 +521,9 @@ async function runActionIO(
 	}
 }
 
-async function checkPublicationInputs(action: SyncAction, ctx: ExecutionContext, completed: readonly CompletedAction[]): Promise<void> {
+async function checkPublicationInputs(
+	action: SyncAction, ctx: ExecutionContext, completed: readonly CompletedAction[], nonLocalOnly = false,
+): Promise<void> {
 	if (!action.publication && !((action.action === "rename_local" || action.action === "rename_remote") && action.descendantRecords)) {
 		throw new ContentProofError("proof_mismatch", `Admission publication inputs missing: ${action.path}`);
 	}
@@ -511,8 +541,11 @@ async function checkPublicationInputs(action: SyncAction, ctx: ExecutionContext,
 			[ctx.localFs, action.local, action.localPath ?? action.path],
 			[ctx.remoteFs, action.remote, action.remotePath ?? action.path],
 		] as const) {
-			if (expected) await unchangedEndpoint(fs, expected);
-			else if (await fs.stat(address)) {
+			if (nonLocalOnly && fs === ctx.localFs) continue;
+			if (expected) {
+				await unchangedEndpoint(fs, expected).catch((error: unknown) =>
+					localInputFailure(error, action.action === "push" && fs === ctx.localFs));
+			} else if (await fs.stat(address)) {
 				throw new ContentProofError("proof_mismatch", `Previously absent endpoint appeared: ${address}`);
 			}
 		}
@@ -920,7 +953,7 @@ async function executeConflictAction(
 		}
 		if (err instanceof ContentProofError && err.kind === "proof_mismatch") {
 			ctx.logger?.warn("executePlan: conflict blocked", { path: action.path, reason: err.message });
-			result.blocked.push({ action, reason: err.message });
+			result.blocked.push({ action, reason: err.message, classification: "precondition_changed" });
 			return;
 		}
 		if (err instanceof ContentProofError && err.kind === "external_auth_failure") {

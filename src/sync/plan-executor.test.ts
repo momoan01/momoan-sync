@@ -737,6 +737,38 @@ describe("executePlan", () => {
 	});
 
 	describe("push", () => {
+		it.each(["local-only", "remote-identity", "remote-content", "remote-appeared", "publication", "remote-io"] as const)("revalidates non-local push inputs after the first local proof failure: %s", async scenario => {
+			const ctx = makeCtx();
+			const localFs = ctx.localFs as MockFileSystem;
+			const remoteFs = ctx.remoteFs as MockFileSystem;
+			addFile(localFs, "note.md", "original", 1000);
+			if (scenario !== "remote-appeared") addFile(remoteFs, "note.md", "original", 1000).identityKey = "R";
+			const action: SyncAction = { action: "push", path: "note.md",
+				local: (await localFs.stat("note.md"))!, remote: await remoteFs.stat("note.md") ?? undefined };
+			const plan = makePlan([action]);
+			addFile(localFs, "note.md", "superseded local", 2000);
+			if (scenario === "remote-identity") remoteFs.files.get("note.md")!.entity.identityKey = "replacement";
+			if (scenario === "remote-content") addFile(remoteFs, "note.md", "remote changed", 3000).identityKey = "R";
+			if (scenario === "remote-appeared") addFile(remoteFs, "note.md", "appeared", 3000);
+			if (scenario === "publication") await ctx.committer.stateStore.put({ path: "note.md", hash: "new", localMtime: 1, remoteMtime: 1, localSize: 1, remoteSize: 1, remoteIdentityKey: "R", syncedAt: 1 });
+			if (scenario === "remote-io") vi.spyOn(remoteFs, "stat").mockRejectedValue(new Error("remote unavailable"));
+			const write = vi.spyOn(remoteFs, "write");
+			const result = await executePlan(plan, ctx);
+			expect(result.blocked).toHaveLength(1); expect(result.failed).toEqual([]); expect(write).not.toHaveBeenCalled();
+			expect(result.blocked[0]?.classification).toBe("precondition_changed");
+			expect(result.blocked[0]?.localSupersession).toBe(scenario === "local-only" ? true : undefined);
+		});
+
+		it("does not certify an unknown proof mismatch during remote mutation as local supersession", async () => {
+			const ctx = makeCtx(); const localFs = ctx.localFs as MockFileSystem;
+			addFile(localFs, "note.md", "original", 1000);
+			const plan = makePlan([{ action: "push", path: "note.md", local: (await localFs.stat("note.md"))! }]);
+			vi.spyOn(ctx.remoteFs, "write").mockRejectedValue(new ContentProofError("proof_mismatch", "opaque"));
+			const result = await executePlan(plan, ctx);
+			expect(result.blocked[0]?.classification).toBe("precondition_changed");
+			expect(result.blocked[0]?.localSupersession).toBeUndefined();
+		});
+
 		it("uploads local file to remote and commits state", async () => {
 			const ctx = makeCtx();
 			const localFs = ctx.localFs as MockFileSystem;
@@ -1016,6 +1048,8 @@ describe("executePlan", () => {
 			expect(result.blocked.map(({ reason }) => reason)).toEqual([
 				"Endpoint changed before execution: folder/a.md", "component prefix did not publish",
 			]);
+			expect(result.blocked[0]?.classification).toBe("precondition_changed");
+			expect(result.blocked[1]?.classification).toBeUndefined();
 			expect(await ctx.committer.stateStore.get("folder/a.md")).toBeUndefined();
 			expect(await ctx.committer.stateStore.get("folder/b.md")).toBeUndefined();
 		});
@@ -1946,6 +1980,16 @@ describe("executePlan", () => {
 				"Fresh resolver omitted target content",
 			);
 			expect(fatal).toHaveBeenCalledOnce();
+		});
+
+		it("classifies resolver proof mismatch without changing conflict block safety", async () => {
+			const ctx = makeCtx();
+			const { action, stateStore } = await arrangeFreshConflict(ctx);
+			ctx.conflictResolver = () => Promise.reject(new ContentProofError("proof_mismatch", "opaque"));
+			const result = await executePlan(makePlan([action]), ctx);
+			expect(result.blocked).toEqual([{ action, reason: "opaque", classification: "precondition_changed" }]);
+			expect(result.succeeded).toEqual([]);
+			expect(stateStore.records.has("new.md")).toBe(false);
 		});
 
 		it("publishes and aborts through the existing auth path for typed resolver auth failure", async () => {

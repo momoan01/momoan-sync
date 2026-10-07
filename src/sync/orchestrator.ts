@@ -39,6 +39,7 @@ import { syncOpenedFilePriority } from "./opened-file-priority";
 import { RecoveryJournal } from "../recovery/journal";
 import { evaluateMassChangeGuard, type MassChangeGuardVerdict } from "./mass-change-guard";
 import { requireMassChangeSafetySnapshot } from "./mass-change-safety-snapshot";
+import { isBenignLocalSupersession } from "./transient-reobservation";
 
 export type { SyncStatus };
 
@@ -204,6 +205,9 @@ export class SyncOrchestrator {
 			// CycleSummary): a mobile resume firing focus + visibilitychange
 			// back-to-back must not show "Everything up to date" twice.
 			const summary = new CycleSummary();
+			// A trailing local supersession waits for the scheduler; it is not a completed run.
+			let awaitingLocalDebounce = false;
+			let hasReportableProblem = false;
 			do {
 				this.syncPending = false;
 				this.deps.onStatusChange("syncing");
@@ -242,7 +246,12 @@ export class SyncOrchestrator {
 					continue; // No production history, tracker closeout, or Synced notification.
 				}
 				const { succeeded, failed, blocked, conflicts } = result;
-				if (result.outcome.completion.kind === "follow_up") {
+				awaitingLocalDebounce = isBenignLocalSupersession(result.outcome, snapshot, this.deps.localTracker);
+				if (awaitingLocalDebounce) {
+					this.deps.logger?.info("Sync cycle deferred to local change debounce", {
+						succeeded, conflicts, failed, blocked,
+					});
+				} else if (result.outcome.completion.kind === "follow_up") {
 					// Nothing failed; convergence needs one more cycle. Queue it the way any
 					// sync request is queued — one slot, consumed by this loop — and leave the
 					// status at syncing, because that cycle starts next.
@@ -262,7 +271,11 @@ export class SyncOrchestrator {
 					});
 				}
 
-				summary.add(result.outcome);
+				if (!awaitingLocalDebounce) {
+					summary.add(result.outcome);
+					hasReportableProblem ||= failed > 0 || blocked > 0 || conflicts > 0 ||
+						result.outcome.admissionFailures.length > 0 || result.outcome.completion.kind === "incomplete";
+				}
 
 				// Record this cycle's resolved conflicts to the audit history — once per
 				// cycle, and only when there were any. Writing stays separate from
@@ -291,7 +304,7 @@ export class SyncOrchestrator {
 
 			// One notice per burst, gated on its OWN setting (`enableLogging` controls
 			// only whether logs are written — it used to double as this gate).
-			if (syncExecutionMode(this.deps.getSettings()) === "write" && this.deps.getSettings().showSyncNotifications) {
+			if ((!awaitingLocalDebounce || hasReportableProblem) && syncExecutionMode(this.deps.getSettings()) === "write" && this.deps.getSettings().showSyncNotifications) {
 				this.deps.notify(summary.message);
 			}
 		});

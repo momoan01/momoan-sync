@@ -47,7 +47,7 @@ export class SecretComponent {
  * the UI renders; reset these between tests.
  */
 export const __ui: {
-	buttons: { name: string; label: string; click: () => void }[];
+	buttons: { name: string; label: string; readonly disabled: boolean; click: () => unknown }[];
 	dropdowns: {
 		name: string;
 		description: string;
@@ -126,22 +126,23 @@ export class Setting {
 		return this;
 	}
 	addButton(cb: (b: unknown) => unknown) {
-		let handler: () => void = () => {};
+		let handler: () => unknown = () => {};
 		let label = "";
+		let disabled = false;
 		const btn = {
 			setButtonText: (text: string) => {
 				label = text;
 				return btn;
 			},
 			setCta: () => btn,
-			setDisabled: () => btn,
-			onClick: (h: () => void) => {
+			setDisabled: (value: boolean) => { disabled = value; return btn; },
+			onClick: (h: () => unknown) => {
 				handler = h;
 				return btn;
 			},
 		};
 		cb(btn);
-		__ui.buttons.push({ name: this._name, label, click: () => handler() });
+		__ui.buttons.push({ name: this._name, label, get disabled() { return disabled; }, click: () => disabled ? undefined : handler() });
 		return this;
 	}
 	addText(cb: (t: unknown) => unknown) {

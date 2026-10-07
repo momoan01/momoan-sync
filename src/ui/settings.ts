@@ -150,9 +150,10 @@ export class AirSyncSettingTab extends PluginSettingTab {
 				shadow ? "Run a full observation preview without changing files or the saved checkpoint." : "Discard the remote sync checkpoint and fully reconcile against the remote on the next sync. Use this if sync seems stuck or incomplete after an interrupted sync. It compares files rather than re-downloading them, and keeps your sync history."
 			))
 			.addButton((button) =>
-				button.setButtonText(t(shadow ? "Run cold preview" : "Rescan")).onClick(() => {
+				button.setButtonText(t(shadow ? "Run cold preview" : "Rescan")).onClick(async () => {
+					button.setDisabled(true);
 					new Notice(t(shadow ? "Starting a full preview" : "Starting a full rescan"));
-					void this.plugin.rescan();
+					try { await this.plugin.rescan(); } finally { this.renderContent(); }
 				})
 			);
 

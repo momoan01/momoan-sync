@@ -35,6 +35,9 @@ export interface SupersededAction {
 export interface BlockedAction {
 	action: SyncAction;
 	reason: string;
+	classification?: "precondition_changed";
+	/** Local push input changed; exact remote and publication inputs were revalidated. */
+	localSupersession?: true;
 }
 
 export interface ResolvedConflict {
