@@ -51,6 +51,7 @@ export function logChangeDetection(
 	if (remoteOnlyEntries.length > 0) {
 		logger.debug("Remote-only paths", { paths: remoteOnlyEntries.map((entry) => entry.path) });
 	}
+	logLocalOnlyObservations(changeSet, logger);
 	logUnresolvedObservations(changeSet, logger);
 	logRenameEntryDetails(changeSet, renamePairs, logger);
 }
@@ -139,4 +140,30 @@ export function logScopeExclusions(
 		});
 	}
 	logger.debug("Excluded paths", { paths: dropped });
+}
+
+/** Diagnostic facts only: stat absence never becomes deletion authority here. */
+function logLocalOnlyObservations(changeSet: ChangeSet, logger: Logger): void {
+	const candidates = changeSet.entries.filter(entry => entry.local && !entry.remote && entry.prevSync);
+	if (candidates.length === 0) return;
+	logger.debug("Tracked local-only observations", {
+		entries: candidates.slice(0, 25).map(entry => ({
+			path: entry.path,
+			local: { path: entry.local!.path, pathAuthority: entry.local!.pathAuthority,
+				size: entry.local!.size, hashKnown: !!entry.local!.hash,
+				baselineHashMatches: entry.local!.hash && entry.prevSync!.hash
+					? entry.local!.hash === entry.prevSync!.hash : null },
+			baseline: { path: entry.prevSync!.path, remoteIdentityKey: entry.prevSync!.remoteIdentityKey },
+			currentRemotePaths: changeSet.entries.filter(candidate =>
+				candidate.remote?.identityKey === entry.prevSync!.remoteIdentityKey).map(candidate => candidate.remote!.path),
+			observations: changeSet.observations.filter(item => item.requestedPath === entry.path).map(item => ({
+				side: item.side, kind: item.kind, requestedPath: item.requestedPath,
+				...(item.kind === "absent" ? { authority: item.authority } : {}),
+				...(item.kind === "unknown" ? { reason: item.reason } : {}),
+				...(item.kind === "alias" ? { resolvedPath: item.resolvedPath } : {}),
+				...(item.kind === "present_unresolved" ? { returnedPath: item.returnedPath, source: item.source } : {}),
+			})),
+		})),
+		truncated: Math.max(0, candidates.length - 25),
+	});
 }
