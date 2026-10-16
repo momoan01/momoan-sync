@@ -362,8 +362,9 @@ export default defineConfig(
 		// C3-C passes attempt-local snapshot trigger provenance and the schema safety dependency.
 		// Re-pin 504 → 505 for the Shadow success lifecycle closeout that durably flushes preview logs.
 		// Re-pin 505 → 517 for verified local supersession and preservation of earlier burst problems.
+		// Mobile destructive batch preflight adds six lifecycle lines; re-pin 517 to 523.
 		files: ["src/sync/orchestrator.ts"],
-		rules: { "max-lines": ["error", { max: 517, skipBlankLines: true, skipComments: true }] },
+		rules: { "max-lines": ["error", { max: 523, skipBlankLines: true, skipComments: true }] },
 	},
 	{
 		// Exact action effects, commitAction, terminal result publication, and their

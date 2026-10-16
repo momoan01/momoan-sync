@@ -40,6 +40,7 @@ import { RecoveryJournal } from "../recovery/journal";
 import { evaluateMassChangeGuard, type MassChangeGuardVerdict } from "./mass-change-guard";
 import { requireMassChangeSafetySnapshot } from "./mass-change-safety-snapshot";
 import { isBenignLocalSupersession } from "./transient-reobservation";
+import { prepareMobileRecoveryCaptures } from "./mobile-recovery-preflight";
 
 export type { SyncStatus };
 
@@ -600,13 +601,22 @@ export class SyncOrchestrator {
 			}, cycleId)
 			: undefined;
 		if (recoveryCaptures) this.deps.logger?.warn("Mass Change Guard safety capture completed", { captured: recoveryCaptures.size, ...massGuard!.metrics });
+		// On mobile, no desktop snapshot store exists. For an ordinary Write,
+		// durably capture ALL destructive actions before the first effect and verify
+		// them through a separate journal READ transaction. The guarded mass-change
+		// path above still REQUIRES a desktop snapshot (and blocks mobile), by design.
+		const mobileCaptures = this.deps.isMobile() && !recoveryCaptures
+			? await prepareMobileRecoveryCaptures(admission.executable.actions, this.recoveryJournal, {
+				localFs, remoteFs, checksumRegistry: this.deps.checksumRegistry,
+			}, cycleId)
+			: undefined;
 		const ctx: ExecutionContext = {
 			localFs,
 			remoteFs,
 			checksumRegistry: this.deps.checksumRegistry,
 			recoveryJournal: this.recoveryJournal,
 			cycleId,
-			recoveryCaptures,
+			recoveryCaptures: recoveryCaptures ?? mobileCaptures,
 			requireRecoveryCapture: true,
 			committer: {
 				stateStore: this.stateStore,
