@@ -11,8 +11,6 @@ export interface BackendConnectionActions {
 	startFolderPick(): Promise<void>;
 	/** Bind the backend's default remote folder (obsidian-air-sync/<Vault Name>). */
 	bindDefaultFolder(): Promise<void>;
-	/** Bind an accessible existing folder without relaunching OAuth. */
-	bindExistingFolder(folderId: string): Promise<void>;
 }
 
 /**
