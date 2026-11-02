@@ -6,7 +6,7 @@ import { parseGoogleFolderId } from "./google-folder-id";
 export function getBackendSettingsRenderer(type: string): IBackendSettingsRenderer | undefined {
 	const provider = getBackendProvider(type);
 	const original = provider?.createSettingsRenderer?.();
-	if (!original || type !== "googledrive") return original;
+	if (!provider || !original || type !== "googledrive") return original;
 	return {
 		backendType: original.backendType,
 		render(container, settings, onSave, actions, app) {
