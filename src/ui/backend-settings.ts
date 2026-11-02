@@ -1,13 +1,30 @@
 import { getBackendProvider } from "../fs/registry";
+import { Notice, Setting } from "../platform/obsidian";
 import type { IBackendSettingsRenderer } from "../fs/settings-renderer";
+import { parseGoogleFolderId } from "./google-folder-id";
 
-/**
- * Resolve a backend's settings renderer by type. There is no separate renderer
- * registry: each backend supplies its renderer via
- * {@link IBackendProvider.createSettingsRenderer}, so the `fs/registry` provider
- * list is the single source of truth — no parallel UI-side array to keep in sync by
- * hand (the previous duplication, guarded only by an integrity test).
- */
 export function getBackendSettingsRenderer(type: string): IBackendSettingsRenderer | undefined {
-	return getBackendProvider(type)?.createSettingsRenderer?.();
+	const provider = getBackendProvider(type);
+	const original = provider?.createSettingsRenderer?.();
+	if (!provider || !original || type !== "googledrive") return original;
+	return {
+		backendType: original.backendType,
+		render(container, settings, onSave, actions, app) {
+			original.render(container, settings, onSave, actions, app);
+			if (!provider.hasCredentials() || provider.getIdentity(settings)) return;
+			let entered = "";
+			new Setting(container).setName("Drive 폴더 ID")
+				.addText((text) => text.onChange((value) => { entered = value; }))
+				.addButton((button) => button.setButtonText("폴더 연결").onClick(async () => {
+					try {
+						const id = parseGoogleFolderId(entered);
+						settings.syncMode = "shadow";
+						await onSave({ remoteVaultFolderId: id });
+						actions.refreshDisplay();
+					} catch (error) {
+						new Notice(error instanceof Error ? error.message : "Folder not configured");
+					}
+				}));
+		},
+	};
 }
