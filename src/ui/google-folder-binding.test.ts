@@ -17,9 +17,9 @@ it("binds an existing Google folder in Shadow mode", async () => {
 	const refreshDisplay = vi.fn();
 	getBackendSettingsRenderer("googledrive")!.render({} as never, settings, save,
 		{ refreshDisplay } as never, {} as never);
-	__ui.texts.find((x) => x.name === "Drive 폴더 ID")!.change("18ZEdm2CDbX2avMKqomXc-mXd8cLsFXeN");
+	__ui.texts.find((x) => x.name === "Drive 폴더 ID")!.change("1TestDriveFolder_AAAA0000");
 	await __ui.buttons.find((x) => x.label === "폴더 연결")!.click();
-	expect(save).toHaveBeenCalledWith({ remoteVaultFolderId: "18ZEdm2CDbX2avMKqomXc-mXd8cLsFXeN" });
+	expect(save).toHaveBeenCalledWith({ remoteVaultFolderId: "1TestDriveFolder_AAAA0000" });
 	expect(settings.syncMode).toBe("shadow");
 	expect(refreshDisplay).toHaveBeenCalledOnce();
 });
