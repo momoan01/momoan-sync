@@ -1,0 +1,37 @@
+name: Build installable Momoan Sync ZIP
+
+on:
+  push:
+    branches:
+      - artifact/momoan-sync-install-20261102
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+          cache: npm
+      - run: npm install -g npm@11
+      - run: npm ci
+      - run: npm run build
+      - run: npm run lint
+      - run: npm run test:coverage
+      - name: Package only installable files
+        run: |
+          mkdir -p momoan-sync
+          cp main.js manifest.json styles.css momoan-sync/
+          zip -q -r momoan-sync.zip momoan-sync
+          unzip -l momoan-sync.zip
+      - name: Upload plugin ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: momoan-sync-install
+          path: momoan-sync.zip
+          if-no-files-found: error
+          retention-days: 7
